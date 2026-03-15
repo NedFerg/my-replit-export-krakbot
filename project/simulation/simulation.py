@@ -1,4 +1,4 @@
-from agents.trader_agent import TraderAgent
+from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.market_agent import MarketAgent
 from exchange.exchange import Exchange
 from config.config import (
@@ -12,8 +12,9 @@ class Simulation:
         self.market = MarketAgent(MARKET_START_PRICE)
         self.exchange = Exchange(self.market)
         self.agents = [
-            TraderAgent("AgentA", INITIAL_BALANCE),
-            TraderAgent("AgentB", INITIAL_BALANCE)
+            ValueTrader("ValueTrader", INITIAL_BALANCE),
+            MomentumTrader("MomentumTrader", INITIAL_BALANCE),
+            RandomTrader("RandomTrader", INITIAL_BALANCE)
         ]
 
     def run(self):
@@ -23,6 +24,7 @@ class Simulation:
 
             # Each agent decides and acts
             for agent in self.agents:
+                agent.update_last_price(price)
                 action = agent.decide(price)
                 self.exchange.process_order(agent, action)
 
