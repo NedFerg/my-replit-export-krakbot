@@ -211,8 +211,12 @@ def main():
         print(f"=== Episode {episode}/{NUM_EPISODES}  [Regime: {regime_label}] ===")
         for a in agents:
             eq = a.balance + a.unrealized_pnl
-            tag = (f"  (Q-table: {len(rl_trader.q_table)} states)"
-                   if isinstance(a, ReinforcementLearningTrader) else "")
+            tag = (
+                f"  (Q-table: {len(rl_trader.q_table)} states"
+                f", ε={rl_trader.epsilon:.4f}"
+                f", buf={len(rl_trader.replay_buffer)})"
+                if isinstance(a, ReinforcementLearningTrader) else ""
+            )
             print(f"  {a.name:<18} equity: {eq:>10.2f}{tag}")
         print_risk_summary(risk_manager)
         print()

@@ -5,12 +5,26 @@ from agents.trader_agent import TraderAgent
 class ReinforcementLearningTrader(TraderAgent):
     actions = ["buy", "sell", "hold"]
 
+    # Reward shaping coefficients — class-level for easy tuning
+    INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of absolute position
+
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
-        self.q_table = {}   # rich state tuple → {action: Q-value}
+
+        # Q-table and learning hyper-parameters (persist across episodes)
+        self.q_table = {}
         self.alpha = 0.1    # learning rate
         self.gamma = 0.95   # discount factor
-        self.epsilon = 0.1  # exploration rate
+
+        # Epsilon-greedy exploration with per-episode decay
+        self.epsilon = 0.10
+        self.epsilon_decay = 0.98
+        self.min_epsilon = 0.05
+
+        # Experience replay buffer (persists across episodes)
+        self.replay_buffer = []
+        self.replay_capacity = 5000
+        self.batch_size = 32
 
         self.last_mid_price = None  # for momentum feature
 
@@ -20,24 +34,35 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prev_equity = None
 
     def reset_for_new_episode(self):
-        """Reset per-episode fields; Q-table persists across episodes."""
+        """
+        Reset per-episode fields.
+
+        Persisted across episodes: Q-table, replay buffer, epsilon
+        (epsilon decays here rather than being reset).
+        """
         super().reset_for_new_episode()
         self.last_mid_price = None
         self.prev_state = None
         self.prev_action = None
         self.prev_equity = None
+        # Decay exploration rate — more exploitation as agent matures
+        self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+
+    # ------------------------------------------------------------------
+    # State encoding
+    # ------------------------------------------------------------------
 
     def encode_state(self, market_state):
         """
         Discretize seven market features into a hashable state tuple.
 
         Features:
-          price_bucket    – mid-price in bands of 5
-          spread_bucket   – spread rounded down to nearest integer
-          regime          – string from MarketAgent
+          price_bucket     – mid-price in bands of 5
+          spread_bucket    – spread rounded down to nearest integer
+          regime           – string from MarketAgent
           imbalance_bucket – sign of (bid_size - ask_size): -1 / 0 / +1
-          vol_bucket      – volatility scaled by 10 and truncated
-          momentum_bucket – sign of price change since last step: -1 / 0 / +1
+          vol_bucket       – volatility scaled by 10 and truncated
+          momentum_bucket  – sign of price change since last step: -1 / 0 / +1
           inventory_bucket – clamped integer position in [-2, 2]
         """
         price_bucket = int(market_state.mid_price // 5)
@@ -77,6 +102,10 @@ class ReinforcementLearningTrader(TraderAgent):
             inventory_bucket,
         )
 
+    # ------------------------------------------------------------------
+    # Action selection
+    # ------------------------------------------------------------------
+
     def decide(self, market_state):
         """Epsilon-greedy action selection over the current encoded state."""
         state = self.encode_state(market_state)
@@ -92,6 +121,61 @@ class ReinforcementLearningTrader(TraderAgent):
             return random.choice(self.actions)
 
         return max(qvals, key=qvals.get)
+
+    # ------------------------------------------------------------------
+    # Reward shaping
+    # ------------------------------------------------------------------
+
+    def compute_reward(self, raw_reward, market_state):
+        """
+        Shape the raw equity-change reward before storing in the buffer.
+
+        1. Inventory penalty — discourages large directional exposure.
+           The agent pays INVENTORY_PENALTY_COEF per unit of |position|
+           regardless of PnL, nudging it toward flat positioning.
+
+        2. Volatility scaling — divides the reward by (1 + volatility).
+           In chaotic regimes the magnitude of accidental gains/losses is
+           inflated; scaling down prevents the agent from over-fitting to
+           lucky windfalls and encourages caution in noisy markets.
+        """
+        inventory_penalty = self.INVENTORY_PENALTY_COEF * abs(self.position)
+        reward = raw_reward - inventory_penalty
+        vol_scale = 1.0 / (1.0 + market_state.volatility)
+        return reward * vol_scale
+
+    # ------------------------------------------------------------------
+    # Experience replay
+    # ------------------------------------------------------------------
+
+    def add_experience(self, prev_state, action, reward, new_state):
+        """
+        Store a transition in the replay buffer.
+
+        When the buffer is full the oldest transition is evicted (FIFO).
+        The buffer is intentionally not reset between episodes so the agent
+        can learn from the full history of its interactions.
+        """
+        self.replay_buffer.append((prev_state, action, reward, new_state))
+        if len(self.replay_buffer) > self.replay_capacity:
+            self.replay_buffer.pop(0)
+
+    def replay(self):
+        """
+        Sample a random mini-batch from the buffer and apply Q-updates.
+
+        No-ops until at least batch_size transitions have been collected,
+        which avoids biased updates on a nearly-empty buffer.
+        """
+        if len(self.replay_buffer) < self.batch_size:
+            return
+        batch = random.sample(self.replay_buffer, self.batch_size)
+        for prev_state, action, reward, new_state in batch:
+            self.update_q(prev_state, action, reward, new_state)
+
+    # ------------------------------------------------------------------
+    # Q-learning core
+    # ------------------------------------------------------------------
 
     def update_q(self, prev_state, action, reward, new_state):
         """Standard Q-learning (Bellman) update."""

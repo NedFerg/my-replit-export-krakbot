@@ -129,15 +129,17 @@ class Simulation:
                     new_equity = agent.balance + agent.unrealized_pnl
 
                     if agent.prev_state is not None:
-                        # Reward already incorporates slippage + fees via
-                        # equity change — no extra shaping needed.
-                        reward = new_equity - agent.prev_equity
-                        agent.update_q(
+                        raw_reward = new_equity - agent.prev_equity
+                        # Shape reward: inventory penalty + volatility scaling
+                        reward = agent.compute_reward(raw_reward, state)
+                        # Store in replay buffer then learn from a random batch
+                        agent.add_experience(
                             agent.prev_state,
                             agent.prev_action,
                             reward,
                             new_encoded,
                         )
+                        agent.replay()
 
                     agent.prev_state = new_encoded
                     agent.prev_action = step_actions[agent]
