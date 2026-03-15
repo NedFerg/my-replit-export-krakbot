@@ -1,0 +1,107 @@
+We now have a working order book and order‑book‑aware agents.
+The next step is to add market regimes and expose regime signals to agents so they can adapt their behavior.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add Market Regimes to MarketAgent
+
+In project/agents/market_agent.py, extend the MarketAgent to support regimes:
+
+Add a new attribute:
+
+    self.regime — one of: "bull", "bear", "high_vol", "low_vol", "crash"
+
+Add a method choose_regime() that randomly selects a regime at the start of the simulation, weighted something like:
+
+    bull: 30%
+
+    bear: 30%
+
+    low_vol: 20%
+
+    high_vol: 15%
+
+    crash: 5%
+
+Add a method apply_regime_effects() inside update_price() that modifies drift and volatility based on the current regime:
+
+    bull: drift ↑, volatility normal
+
+    bear: drift ↓, volatility normal
+
+    low_vol: volatility ↓
+
+    high_vol: volatility ↑
+
+    crash: one‑time large negative shock (e.g., −10% to −30%), then revert to bear
+
+Ensure the crash regime triggers only once per selection.
+2. Add Regime Info to MarketState
+
+In project/exchange/exchange.py, update the MarketState class to include:
+
+    regime: str — the current regime name
+
+    volatility: float — the current volatility value
+
+    drift: float — the current drift value
+
+Update Exchange.get_market_state(price) to accept the regime, drift, and volatility from the MarketAgent and include them in the returned MarketState.
+3. Pass Regime Info Through the Simulation
+
+In project/simulation/simulation.py:
+
+    After calling market.update_price(), retrieve the regime, drift, and volatility from the MarketAgent.
+
+    Pass these into exchange.get_market_state(...).
+
+    Agents should now receive a MarketState that includes regime signals.
+
+4. Update Agents to Use Regime Signals
+
+In project/agents/trader_agent.py, update each strategy class to adapt behavior based on market_state.regime:
+ValueTrader
+
+    In bull markets: increase buy probability slightly.
+
+    In bear markets: decrease buy probability, increase sell probability.
+
+    In high_vol: widen thresholds (be more cautious).
+
+    In low_vol: tighten thresholds (trade more).
+
+MomentumTrader
+
+    In bull: more aggressive on upward momentum.
+
+    In bear: more aggressive on downward momentum (short‑like behavior using sells when holding).
+
+    In high_vol: increase momentum sensitivity.
+
+    In low_vol: reduce momentum sensitivity.
+
+RandomTrader
+
+    In high_vol: reduce random trading frequency.
+
+    In low_vol: increase random trading frequency.
+
+Keep the logic simple but ensure each agent reads market_state.regime.
+5. Ensure Everything Still Runs
+
+    PnL tracking should remain unchanged.
+
+    Order book logic should remain unchanged.
+
+    Simulation should run without errors.
+
+    At the end, print the regime at the start of the run in the summary.
+
+Please implement this cleanly and run project/main.py to verify that:
+
+    A regime is chosen at the start
+
+    Price behavior reflects the regime
+
+    Agents adapt their behavior based on regime signals
+
+    The simulation completes with no errors

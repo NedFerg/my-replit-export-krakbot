@@ -1,12 +1,16 @@
 class MarketState:
-    """Snapshot of the order book and market at a point in time."""
+    """Snapshot of the order book and market conditions at a point in time."""
 
-    def __init__(self, last_price, best_bid, best_ask, bid_size, ask_size):
+    def __init__(self, last_price, best_bid, best_ask, bid_size, ask_size,
+                 regime, drift, volatility):
         self.last_price = last_price
         self.best_bid = best_bid
         self.best_ask = best_ask
         self.bid_size = bid_size
         self.ask_size = ask_size
+        self.regime = regime
+        self.drift = drift
+        self.volatility = volatility
 
         if best_bid is not None and best_ask is not None:
             self.spread = round(best_ask - best_bid, 4)
@@ -62,11 +66,9 @@ class OrderBook:
             best_bid = self.bids[0]
             best_ask = self.asks[0]
 
-            # No match if bid is below ask
             if best_bid.price < best_ask.price:
                 break
 
-            # Prevent self-trading
             if best_bid.agent is best_ask.agent:
                 break
 
@@ -76,21 +78,18 @@ class OrderBook:
             buyer = best_bid.agent
             seller = best_ask.agent
 
-            # Update buyer
             buyer.balance -= trade_price * trade_qty
             buyer.position += trade_qty
             buyer.realized_pnl -= trade_price * trade_qty
             if buyer.name != "MarketMaker":
                 self.trade_log.append((buyer.name, "BUY", trade_price))
 
-            # Update seller
             seller.balance += trade_price * trade_qty
             seller.position -= trade_qty
             seller.realized_pnl += trade_price * trade_qty
             if seller.name != "MarketMaker":
                 self.trade_log.append((seller.name, "SELL", trade_price))
 
-            # Reduce quantities and remove fully filled orders
             best_bid.quantity -= trade_qty
             best_ask.quantity -= trade_qty
 
@@ -107,9 +106,8 @@ class Exchange:
         self.order_book = OrderBook(self.trade_log)
         self._mm = _MarketMaker()
 
-    def get_market_state(self, current_price) -> MarketState:
+    def get_market_state(self, current_price, regime, drift, volatility) -> MarketState:
         """Build a read-only MarketState snapshot from the current order book."""
-        # Exclude market maker orders — show only agent-submitted depth
         agent_bids = [o for o in self.order_book.bids if o.agent is not self._mm]
         agent_asks = [o for o in self.order_book.asks if o.agent is not self._mm]
 
@@ -118,7 +116,8 @@ class Exchange:
         bid_size = agent_bids[0].quantity if agent_bids else 0
         ask_size = agent_asks[0].quantity if agent_asks else 0
 
-        return MarketState(current_price, best_bid, best_ask, bid_size, ask_size)
+        return MarketState(current_price, best_bid, best_ask, bid_size, ask_size,
+                           regime, drift, volatility)
 
     def process_order(self, agent, action, market_price):
         """Submit a limit order and attempt agent-to-agent matching."""
@@ -133,17 +132,13 @@ class Exchange:
             self.order_book.match()
 
     def fill_resting_orders(self, price):
-        """After all agents have submitted, fill any unmatched orders
-        using the market maker as counterparty of last resort."""
+        """Fill any unmatched orders using the market maker as counterparty of last resort."""
         mm = self._mm
 
-        # Remove stale MM orders from previous step
         self.order_book.bids = [o for o in self.order_book.bids if o.agent is not mm]
         self.order_book.asks = [o for o in self.order_book.asks if o.agent is not mm]
 
-        # Post MM ask to fill resting agent buy orders
         has_agent_bids = any(o.agent is not mm for o in self.order_book.bids)
-        # Post MM bid to fill resting agent sell orders
         has_agent_asks = any(o.agent is not mm for o in self.order_book.asks)
 
         if has_agent_bids:

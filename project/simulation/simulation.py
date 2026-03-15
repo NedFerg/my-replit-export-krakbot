@@ -7,10 +7,12 @@ from config.config import (
     MARKET_START_PRICE
 )
 
+
 class Simulation:
     def __init__(self):
         self.market = MarketAgent(MARKET_START_PRICE)
         self.exchange = Exchange(self.market)
+        self.initial_regime = self.market.regime
         self.agents = [
             ValueTrader("ValueTrader", INITIAL_BALANCE),
             MomentumTrader("MomentumTrader", INITIAL_BALANCE),
@@ -19,13 +21,18 @@ class Simulation:
 
     def run(self):
         for step in range(SIMULATION_STEPS):
-            # Update market price
+            # Update market price (applies regime effects internally)
             price = self.exchange.update_market()
 
-            # Build order-book-aware market state for agents
-            state = self.exchange.get_market_state(price)
+            # Build order-book-aware market state including regime signals
+            state = self.exchange.get_market_state(
+                price,
+                self.market.regime,
+                self.market.drift,
+                self.market.volatility
+            )
 
-            # Each agent decides using full market state
+            # Each agent decides using the full market state
             for agent in self.agents:
                 action = agent.decide(state)
                 self.exchange.process_order(agent, action, price)

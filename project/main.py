@@ -4,7 +4,11 @@ def main():
     sim = Simulation()
     trades = sim.run()
 
-    print("Simulation complete.")
+    print(f"Market Regime: {sim.initial_regime.upper()}")
+    if sim.market.regime != sim.initial_regime:
+        print(f"  (Regime shifted to: {sim.market.regime.upper()} during simulation)")
+
+    print("\nSimulation complete.")
     print("Trades:")
     for trade in trades:
         name, side, price = trade
