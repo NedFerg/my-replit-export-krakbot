@@ -50,10 +50,16 @@ class ReinforcementLearningTrader(TraderAgent):
         self.epsilon_decay = 0.98
         self.min_epsilon = 0.05
 
-        # Experience replay buffer (persists across episodes)
+        # Experience replay buffer (persists across episodes).
+        # Each entry is a 2-tuple: (transition, priority)
+        # where transition = (prev_state, action, reward, new_state).
         self.replay_buffer = []
         self.replay_capacity = 5000
         self.batch_size = 32
+
+        # Prioritized Experience Replay (PER) hyper-parameters
+        self.prioritized_alpha = 0.6    # exponent — how strongly priority biases sampling
+        self.prioritized_epsilon = 1e-5  # floor added to |td_error| to avoid zero priority
 
         self.last_mid_price = None  # for momentum feature
 
@@ -270,33 +276,64 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def add_experience(self, prev_state, action, reward, new_state):
         """
-        Store a (state_tuple, action, reward, next_state_tuple) transition.
+        Store a transition with maximum current priority.
 
-        When the buffer is full the oldest entry is evicted (FIFO).
-        The buffer persists across episodes for cross-episode learning.
+        New transitions are assigned the highest priority in the buffer so
+        they are guaranteed to be sampled at least once before being
+        overtaken by updated priorities.  If the buffer is empty the
+        initial priority is 1.0.
+
+        Each entry in replay_buffer is a 2-tuple:
+            (transition, priority)
+        where transition = (prev_state, action, reward, new_state).
         """
-        self.replay_buffer.append((prev_state, action, reward, new_state))
+        transition = (prev_state, action, reward, new_state)
+        max_prio = max((p for (_, p) in self.replay_buffer), default=1.0)
+        self.replay_buffer.append((transition, max_prio))
         if len(self.replay_buffer) > self.replay_capacity:
             self.replay_buffer.pop(0)
 
     def replay(self):
         """
-        Sample a random mini-batch and apply linear Q(λ) weight updates.
+        Sample a priority-weighted mini-batch and apply linear Q(λ) weight updates.
+
+        Sampling is proportional to priority^alpha so transitions with larger
+        TD errors are revisited more often (Prioritized Experience Replay).
 
         For each sampled transition:
           1. update_eligibilities() — decay traces, boost current (s, a).
-          2. update_q()             — compute soft TD error and propagate
-                                      through all eligible pairs via weight
-                                      gradient descent.
+          2. update_q()             — compute soft TD error, propagate through
+                                      all eligible (s,a) pairs, return td_error.
+          3. Update the buffer entry's priority to |td_error| + ε so future
+             sampling reflects how surprising the transition still is.
 
         No-ops until batch_size transitions are available.
         """
         if len(self.replay_buffer) < self.batch_size:
             return
-        batch = random.sample(self.replay_buffer, self.batch_size)
-        for prev_state, action, reward, new_state in batch:
+
+        # Build sampling distribution from priorities
+        priorities = [p for (_, p) in self.replay_buffer]
+        probs = [p ** self.prioritized_alpha for p in priorities]
+        total = sum(probs)
+        probs = [p / total for p in probs]
+
+        # Sample indices with replacement, weighted by priority
+        indices = random.choices(range(len(self.replay_buffer)),
+                                 weights=probs,
+                                 k=self.batch_size)
+
+        for idx in indices:
+            transition, _ = self.replay_buffer[idx]
+            prev_state, action, reward, new_state = transition
+
             self.update_eligibilities(prev_state, action)
-            self.update_q(prev_state, action, reward, new_state)
+            td_error = self.update_q(prev_state, action, reward, new_state)
+
+            # Refresh priority using the latest TD-error magnitude
+            new_prio = abs(td_error) + self.prioritized_epsilon
+            self.replay_buffer[idx] = (transition, new_prio)
+
             self.replay_steps += 1
 
     # ------------------------------------------------------------------
@@ -356,3 +393,5 @@ class ReinforcementLearningTrader(TraderAgent):
             mw = self.weights[a]
             for i in range(self.feature_dim):
                 tw[i] = (1.0 - tau) * tw[i] + tau * mw[i]
+
+        return td_error  # returned so replay() can update this transition's priority

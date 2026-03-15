@@ -1,0 +1,104 @@
+    We are continuing RL improvements.
+    Next, I want to add Prioritized Replay to the ReinforcementLearningTrader.
+
+    Use proportional prioritization with TD‑error magnitude as the priority signal.
+
+    Please implement the following changes cleanly and consistently.
+    1. Add priority storage to the replay buffer
+
+    In project/agents/rl_agent.py, modify the replay buffer structure.
+
+    Instead of storing only transitions, store:
+    python
+
+    self.replay_buffer = []  # list of (transition, priority)
+
+    A transition is still:
+    python
+
+    (prev_state, action, reward, new_state)
+
+    Priority is a float.
+    2. Add hyperparameters for prioritized replay
+
+    In __init__, add:
+    python
+
+    self.prioritized_alpha = 0.6   # how strongly priorities affect sampling
+    self.prioritized_epsilon = 1e-5  # small constant to avoid zero priority
+
+    These are standard values from the PER paper.
+    3. Modify add_experience() to assign initial priority
+
+    When adding a new transition, assign it max priority so far, or 1.0 if buffer is empty:
+    python
+
+    if self.replay_buffer:
+        max_prio = max(p for (_, p) in self.replay_buffer)
+    else:
+        max_prio = 1.0
+
+    self.replay_buffer.append((transition, max_prio))
+
+    Maintain capacity by popping from the front as before.
+    4. Modify replay() to sample proportionally to priority
+
+    Replace uniform sampling with:
+    python
+
+    # extract priorities
+    priorities = [p for (_, p) in self.replay_buffer]
+
+    # compute sampling probabilities
+    probs = [p ** self.prioritized_alpha for p in priorities]
+    total = sum(probs)
+    probs = [p / total for p in probs]
+
+    # sample indices according to probs
+    indices = random.choices(range(len(self.replay_buffer)),
+                             weights=probs,
+                             k=self.batch_size)
+
+    Then retrieve transitions by index.
+    5. After each update_q(), update the priority of that transition
+
+    Inside replay(), after calling update_eligibilities() and update_q(), compute the new TD‑error magnitude and update the priority:
+    python
+
+    new_prio = abs(td_error) + self.prioritized_epsilon
+    self.replay_buffer[idx] = (transition, new_prio)
+
+    This ensures important transitions are sampled more often.
+    6. Keep everything else unchanged
+
+        Eligibility traces remain untouched
+
+        Target network logic remains untouched
+
+        Soft updates remain untouched
+
+        Double‑Q logic remains untouched
+
+        Feature engineering remains untouched
+
+    Only the replay buffer sampling and priority updates change.
+    7. Keep behavior stable
+
+    After implementing, run project/main.py and confirm:
+
+        All 10 episodes run cleanly
+
+        Replay buffer now shows non‑uniform sampling
+
+        TD‑error magnitudes influence sampling frequency
+
+        No exploding weights
+
+        Eligibility traces still work
+
+        Target network still updates smoothly
+
+        Epsilon decay still works
+
+    Please keep the code clean and consistent with the existing style.
+
