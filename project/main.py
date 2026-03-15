@@ -200,7 +200,7 @@ def main():
         trades, agents, price_history, regime_history = sim.run()
 
         # Collect stats
-        qtable_sizes.append(len(rl_trader.q_table))
+        qtable_sizes.append(len(rl_trader.replay_buffer))
         episode_equity = {a.name: round(a.balance + a.unrealized_pnl, 2) for a in agents}
         episode_summaries.append(episode_equity)
 
@@ -212,7 +212,7 @@ def main():
         for a in agents:
             eq = a.balance + a.unrealized_pnl
             tag = (
-                f"  (Q-table: {len(rl_trader.q_table)} states"
+                f"  (LFA weights: {rl_trader.feature_dim}×{len(rl_trader.actions)}"
                 f", ε={rl_trader.epsilon:.4f}"
                 f", buf={len(rl_trader.replay_buffer)})"
                 if isinstance(a, ReinforcementLearningTrader) else ""
@@ -234,7 +234,8 @@ def main():
         worst = min(equities)
         print(f"{name:<18}  avg: {avg:>9.2f}  best: {best:>9.2f}  worst: {worst:>9.2f}")
 
-    print(f"\nRLTrader final Q-table: {len(rl_trader.q_table)} unique states")
+    print(f"\nRLTrader LFA: {rl_trader.feature_dim} features × {len(rl_trader.actions)} actions"
+          f"  |  replay buffer: {len(rl_trader.replay_buffer)} transitions")
 
     print("\nFinal Episode — Performance Detail:")
     for agent in agents:

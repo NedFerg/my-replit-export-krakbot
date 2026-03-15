@@ -1,0 +1,121 @@
+    We are continuing RL improvements.
+    Next, I want to replace the tabular Q‑table with a linear function approximator of the form:
+
+>Q(s,a)=wa⊤x>
+
+    where:
+
+        x is the feature vector from featurize_state()
+
+        each action has its own weight vector wa
+
+    Please implement the following changes cleanly and consistently.
+    1. Remove the nested‑dict Q‑table
+
+    In project/agents/rl_agent.py, remove or ignore the old:
+    python
+
+    self.q_table = {}
+
+    Replace it with:
+    python
+
+    self.weights = {}  # action -> weight vector (list or numpy array)
+
+    Initialize one weight vector per action when the agent is created:
+    python
+
+    for action in self.actions:
+        self.weights[action] = [0.0] * self.feature_dim
+
+    self.feature_dim should be the length of the tuple returned by featurize_state().
+    2. Convert featurized state tuples into numeric feature vectors
+
+    Add a helper:
+    python
+
+    def state_to_vector(self, state_tuple):
+        return [float(x) if isinstance(x, (int, float)) else hash(x) % 1000 / 1000.0
+                for x in state_tuple]
+
+    This converts:
+
+        floats → floats
+
+        ints → floats
+
+        strings (regime) → stable numeric embedding
+
+    3. Rewrite Q‑value computation
+
+    Replace all uses of self.q_table[state][action] with:
+    python
+
+    def q_value(self, state_vec, action):
+        w = self.weights[action]
+        return sum(w[i] * state_vec[i] for i in range(len(w)))
+
+    In decide(), compute Q for each action using this function.
+    4. Rewrite the TD update using linear function approximation
+
+    In update_q(prev_state, action, reward, new_state):
+
+        Convert states to vectors:
+        python
+
+        s_vec = self.state_to_vector(prev_state)
+        s2_vec = self.state_to_vector(new_state)
+
+        Compute current Q and max next Q:
+        python
+
+        current_q = self.q_value(s_vec, action)
+        max_next_q = max(self.q_value(s2_vec, a) for a in self.actions)
+
+        Compute soft target (Polyak averaging):
+        python
+
+        td_target = reward + self.gamma * max_next_q
+        soft_target = (1 - self.tau) * current_q + self.tau * td_target
+        td_error = soft_target - current_q
+
+        Apply eligibility‑trace update to weights, not Q‑table:
+        python
+
+        for (s, a), e in self.eligibilities.items():
+            s_vec_e = self.state_to_vector(s)
+            for i in range(self.feature_dim):
+                self.weights[a][i] += self.alpha * td_error * e * s_vec_e[i]
+
+    This is the linear‑approximation version of Q(λ).
+    5. Update eligibility traces to use state tuples
+
+    No structural changes needed — the existing (state_tuple, action) keys work fine.
+    6. Update replay()
+
+    No structural changes needed — it should continue to:
+
+        sample transitions
+
+        call update_eligibilities()
+
+        call update_q()
+
+    The update logic now modifies weight vectors instead of table entries.
+    7. Keep behavior stable
+
+    After implementing, run project/main.py and confirm:
+
+        All 10 episodes run cleanly
+
+        No exploding weights
+
+        Epsilon decay still works
+
+        Replay buffer still works
+
+        Eligibility traces still work
+
+        Q‑values now generalize across states
+
+    Please keep the code clean and consistent with the existing style.

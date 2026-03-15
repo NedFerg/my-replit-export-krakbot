@@ -8,13 +8,25 @@ class ReinforcementLearningTrader(TraderAgent):
     # Reward shaping coefficients — class-level for easy tuning
     INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of absolute position
 
+    # Number of features produced by featurize_state().
+    # Must match the length of the tuple featurize_state() returns.
+    FEATURE_DIM = 8
+
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
 
-        # Q-table and learning hyper-parameters (persist across episodes)
-        # q_table structure: {state_tuple: {action: q_value}}
-        self.q_table = {}
-        self.alpha = 0.1    # learning rate
+        # ---------------------------------------------------------------
+        # Linear function approximator: Q(s,a) = w_a · x(s)
+        #
+        # One weight vector per action, each of length FEATURE_DIM.
+        # Weights persist across episodes — they are the "memory" that
+        # replaces the old tabular Q-table.
+        # ---------------------------------------------------------------
+        self.feature_dim = self.FEATURE_DIM
+        self.weights = {a: [0.0] * self.feature_dim for a in self.actions}
+
+        # Learning hyper-parameters
+        self.alpha = 0.01   # learning rate (smaller than tabular — LFA is noisier)
         self.gamma = 0.95   # discount factor
 
         # Eligibility traces for Q(λ)
@@ -23,7 +35,6 @@ class ReinforcementLearningTrader(TraderAgent):
         self.eligibilities = {}     # reset each episode to prevent trace leakage
 
         # Polyak averaging coefficient for soft Q-target updates
-        # τ ∈ (0, 1): smaller = slower, smoother convergence
         self.tau = 0.1
 
         # Epsilon-greedy exploration with per-episode decay
@@ -47,11 +58,10 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         Reset per-episode fields.
 
-        Persisted across episodes: Q-table, replay buffer, epsilon
-        (epsilon decays here rather than being reset).
-
-        Eligibilities are cleared per episode: traces accumulated in one
-        episode should not propagate credit into the next.
+        Persisted across episodes: weight vectors, replay buffer.
+        Epsilon decays here rather than being reset.
+        Eligibilities are cleared: traces from one episode must not
+        propagate credit into the next episode's weight updates.
         """
         super().reset_for_new_episode()
         self.last_mid_price = None
@@ -63,21 +73,14 @@ class ReinforcementLearningTrader(TraderAgent):
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
     # ------------------------------------------------------------------
-    # State encoding
+    # State encoding (legacy — retained for reference)
     # ------------------------------------------------------------------
 
     def encode_state(self, market_state):
         """
-        Discretize seven market features into a hashable state tuple.
-
-        Features:
-          price_bucket     – mid-price in bands of 5
-          spread_bucket    – spread rounded down to nearest integer
-          regime           – string from MarketAgent
-          imbalance_bucket – sign of (bid_size - ask_size): -1 / 0 / +1
-          vol_bucket       – volatility scaled by 10 and truncated
-          momentum_bucket  – sign of price change since last step: -1 / 0 / +1
-          inventory_bucket – clamped integer position in [-2, 2]
+        Legacy tabular encoding (7-tuple of integer/string buckets).
+        Superseded by featurize_state() for the LFA pipeline.
+        Retained for reference and potential diagnostics.
         """
         price_bucket = int(market_state.mid_price // 5)
         spread_bucket = int((market_state.spread or 0) // 1)
@@ -95,25 +98,15 @@ class ReinforcementLearningTrader(TraderAgent):
 
         if self.last_mid_price is not None:
             delta = market_state.mid_price - self.last_mid_price
-            if delta < 0:
-                momentum_bucket = -1
-            elif delta > 0:
-                momentum_bucket = 1
-            else:
-                momentum_bucket = 0
+            momentum_bucket = 1 if delta > 0 else (-1 if delta < 0 else 0)
         else:
             momentum_bucket = 0
 
         inventory_bucket = max(-2, min(2, self.position))
 
         return (
-            price_bucket,
-            spread_bucket,
-            regime,
-            imbalance_bucket,
-            vol_bucket,
-            momentum_bucket,
-            inventory_bucket,
+            price_bucket, spread_bucket, regime,
+            imbalance_bucket, vol_bucket, momentum_bucket, inventory_bucket,
         )
 
     # ------------------------------------------------------------------
@@ -122,27 +115,23 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def featurize_state(self, market_state, agent):
         """
-        Convert raw market_state into a normalized, discretized state tuple
-        suitable for use as a Q-table key.
+        Convert raw market_state into a normalized feature tuple (length = FEATURE_DIM).
 
         Features
         --------
-        A. price_bucket  – normalized 1-step price change, rounded to 3dp.
-                           Uses agent.last_mid_price as the previous price;
-                           0.0 when no previous price is available.
-        B. vol_bucket    – current volatility, rounded to 3dp.
-        C. drift_bucket  – current drift, rounded to 3dp.
-        D. inv_bucket    – agent's integer position (raw, unclamped).
-        E. regime        – categorical regime string from MarketAgent.
-        F. m1            – 1-step momentum if provided by MarketState, else 0.
-        G. m3            – 3-step momentum if provided by MarketState, else 0.
-        H. imbalance     – order-flow imbalance if provided, else 0.
+        A. price_bucket  – normalized 1-step price return, 3dp.
+        B. vol_bucket    – current volatility, 3dp.
+        C. drift_bucket  – current drift, 3dp.
+        D. inv_bucket    – agent's integer position (raw).
+        E. regime        – regime string (converted to float in state_to_vector).
+        F. m1            – 1-step momentum if MarketState provides it, else 0.
+        G. m3            – 3-step momentum if MarketState provides it, else 0.
+        H. imbalance     – order-flow imbalance if MarketState provides it, else 0.
 
-        Optional attributes (m1, m3, imbalance) are gated with hasattr so the
-        method works without any changes to MarketState.  When those fields are
-        added to MarketState in the future, they will be picked up automatically.
+        Optional fields (m1, m3, imbalance) are gated with hasattr so the
+        method is forward-compatible: adding those attributes to MarketState
+        will activate them automatically.
         """
-        # A. Normalized price change
         prev_price = agent.last_mid_price
         if prev_price is not None and prev_price > 0:
             price_change = (market_state.mid_price - prev_price) / max(prev_price, 1e-6)
@@ -150,23 +139,13 @@ class ReinforcementLearningTrader(TraderAgent):
             price_change = 0.0
         price_bucket = round(price_change, 3)
 
-        # B. Volatility
         vol_bucket = round(market_state.volatility, 3)
-
-        # C. Drift
         drift_bucket = round(market_state.drift, 3)
-
-        # D. Inventory
         inv_bucket = int(agent.position)
-
-        # E. Regime (categorical — used directly as a string key)
         regime = market_state.regime
 
-        # F–G. Momentum (optional)
         m1 = round(market_state.momentum_1, 3) if hasattr(market_state, "momentum_1") else 0
         m3 = round(market_state.momentum_3, 3) if hasattr(market_state, "momentum_3") else 0
-
-        # H. Order-flow imbalance (optional)
         imbalance = (
             round(market_state.order_imbalance, 3)
             if hasattr(market_state, "order_imbalance") else 0
@@ -175,12 +154,51 @@ class ReinforcementLearningTrader(TraderAgent):
         return (price_bucket, vol_bucket, drift_bucket, inv_bucket, regime, m1, m3, imbalance)
 
     # ------------------------------------------------------------------
+    # Feature vector conversion
+    # ------------------------------------------------------------------
+
+    def state_to_vector(self, state_tuple):
+        """
+        Convert a featurize_state() tuple into a numeric list for dot-product
+        computation.
+
+          - Numeric elements (int, float) → cast to float unchanged.
+          - String elements (regime) → stable hash embedding in [0, 1).
+
+        The hash embedding is deterministic within a Python process, which is
+        sufficient for learning inside a single run.
+        """
+        return [
+            float(x) if isinstance(x, (int, float))
+            else hash(x) % 1000 / 1000.0
+            for x in state_tuple
+        ]
+
+    # ------------------------------------------------------------------
+    # Q-value computation (linear approximation)
+    # ------------------------------------------------------------------
+
+    def q_value(self, state_vec, action):
+        """
+        Compute Q(s, a) = w_a · x(s) via dot product.
+
+        state_vec must be the output of state_to_vector() — a plain list of
+        floats of length self.feature_dim.
+        """
+        w = self.weights[action]
+        return sum(w[i] * state_vec[i] for i in range(self.feature_dim))
+
+    # ------------------------------------------------------------------
     # Action selection
     # ------------------------------------------------------------------
 
     def decide(self, market_state):
-        """Epsilon-greedy action selection over the featurized state."""
-        state = self.featurize_state(market_state, self)
+        """
+        Epsilon-greedy action selection using the linear Q-function.
+
+        Greedy action: argmax_a Q(s, a) = argmax_a (w_a · x(s)).
+        """
+        state_tuple = self.featurize_state(market_state, self)
 
         # Update price reference for next step's featurize_state call
         self.last_mid_price = market_state.mid_price
@@ -188,11 +206,8 @@ class ReinforcementLearningTrader(TraderAgent):
         if random.random() < self.epsilon:
             return random.choice(self.actions)
 
-        qvals = self.q_table.get(state, {})
-        if not qvals:
-            return random.choice(self.actions)
-
-        return max(qvals, key=qvals.get)
+        state_vec = self.state_to_vector(state_tuple)
+        return max(self.actions, key=lambda a: self.q_value(state_vec, a))
 
     # ------------------------------------------------------------------
     # Reward shaping
@@ -203,13 +218,7 @@ class ReinforcementLearningTrader(TraderAgent):
         Shape the raw equity-change reward before storing in the buffer.
 
         1. Inventory penalty — discourages large directional exposure.
-           The agent pays INVENTORY_PENALTY_COEF per unit of |position|
-           regardless of PnL, nudging it toward flat positioning.
-
-        2. Volatility scaling — divides the reward by (1 + volatility).
-           In chaotic regimes the magnitude of accidental gains/losses is
-           inflated; scaling down prevents the agent from over-fitting to
-           lucky windfalls and encourages caution in noisy markets.
+        2. Volatility scaling — reduces reward magnitude in chaotic regimes.
         """
         inventory_penalty = self.INVENTORY_PENALTY_COEF * abs(self.position)
         reward = raw_reward - inventory_penalty
@@ -222,17 +231,10 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def update_eligibilities(self, state, action):
         """
-        Maintain accumulating eligibility traces for Q(λ).
+        Maintain accumulating eligibility traces (state tuples as keys).
 
-        Step 1 — decay all existing traces by γλ; prune those that have
-        fallen below a negligible threshold to keep the dict compact.
-
-        Step 2 — increment the trace for the (state, action) pair that
-        was just visited (accumulating-trace variant).
-
-        This means recently visited pairs receive a stronger update when
-        the TD error is back-propagated in update_q(), giving the agent
-        multi-step credit assignment without storing full trajectories.
+        Decays all existing traces by γλ, prunes negligible ones,
+        then increments the current (state, action) pair by 1.
         """
         decay = self.gamma * self.lambda_
         for key in list(self.eligibilities.keys()):
@@ -249,11 +251,10 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def add_experience(self, prev_state, action, reward, new_state):
         """
-        Store a transition in the replay buffer.
+        Store a (state_tuple, action, reward, next_state_tuple) transition.
 
-        When the buffer is full the oldest transition is evicted (FIFO).
-        The buffer is intentionally not reset between episodes so the agent
-        can learn from the full history of its interactions.
+        When the buffer is full the oldest entry is evicted (FIFO).
+        The buffer persists across episodes for cross-episode learning.
         """
         self.replay_buffer.append((prev_state, action, reward, new_state))
         if len(self.replay_buffer) > self.replay_capacity:
@@ -261,16 +262,15 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def replay(self):
         """
-        Sample a random mini-batch and apply Q(λ) updates.
+        Sample a random mini-batch and apply linear Q(λ) weight updates.
 
         For each sampled transition:
-          1. update_eligibilities() — decay existing traces and boost the
-             visited (state, action) pair.
-          2. update_q() — compute one TD error and propagate it through
-             all currently eligible (state, action) pairs.
+          1. update_eligibilities() — decay traces, boost current (s, a).
+          2. update_q()             — compute soft TD error and propagate
+                                      through all eligible pairs via weight
+                                      gradient descent.
 
-        No-ops until at least batch_size transitions have been collected,
-        which avoids biased updates on a nearly-empty buffer.
+        No-ops until batch_size transitions are available.
         """
         if len(self.replay_buffer) < self.batch_size:
             return
@@ -280,41 +280,47 @@ class ReinforcementLearningTrader(TraderAgent):
             self.update_q(prev_state, action, reward, new_state)
 
     # ------------------------------------------------------------------
-    # Q(λ) core update
+    # Linear Q(λ) weight update
     # ------------------------------------------------------------------
 
     def update_q(self, prev_state, action, reward, new_state):
         """
-        Q(λ) update with Polyak-averaged soft targets.
+        Linear function-approximation Q(λ) update with Polyak-averaged targets.
 
-        Standard TD target:
-            td_target = reward + γ · max_a Q(new_state, a)
+        1. Convert state tuples to numeric feature vectors.
 
-        Soft target (Polyak averaging):
-            soft_target = (1 − τ) · Q(prev_state, action) + τ · td_target
+        2. Compute current Q and best next Q using the weight vectors:
+               current_q  = w_action · x(prev_state)
+               max_next_q = max_a  w_a · x(new_state)
 
-        This replaces the hard target with a weighted blend of the current
-        Q-value and the Bellman target.  Smaller τ keeps updates smooth and
-        prevents large sudden Q-value shifts, improving stability when
-        eligibility traces amplify updates across many state-action pairs.
+        3. Soft TD target (Polyak averaging):
+               td_target  = reward + γ · max_next_q
+               soft_target = (1 − τ) · current_q + τ · td_target
+               td_error   = soft_target − current_q
+                           ≡ τ · (td_target − current_q)
 
-        Effective TD error used for the Q(λ) broadcast:
-            δ = soft_target − Q(prev_state, action)
-              = τ · (td_target − Q(prev_state, action))
+        4. Gradient update for every eligible (s, a) pair, weighted by
+           the pair's eligibility trace e(s, a):
+               w_a[i] += α · td_error · e(s,a) · x_i(s)
 
-        Update rule for every eligible pair (s, a):
-            Q(s, a) += α · δ · e(s, a)
+        This is the semi-gradient TD(λ) update for linear Q-functions.
+        Using Polyak averaging on the target damps instability when many
+        (s, a) pairs are updated simultaneously through the traces.
         """
-        current_q = self.q_table.get(prev_state, {}).get(action, 0.0)
-        next_qvals = self.q_table.get(new_state, {})
-        best_next = max(next_qvals.values()) if next_qvals else 0.0
+        s_vec = self.state_to_vector(prev_state)
+        s2_vec = self.state_to_vector(new_state)
 
-        td_target = reward + self.gamma * best_next
+        current_q = self.q_value(s_vec, action)
+        max_next_q = max(self.q_value(s2_vec, a) for a in self.actions)
+
+        td_target = reward + self.gamma * max_next_q
         soft_target = (1.0 - self.tau) * current_q + self.tau * td_target
-        td_error = soft_target - current_q  # equivalent to τ · (td_target − current_q)
+        td_error = soft_target - current_q  # ≡ τ · (td_target − current_q)
 
-        # Propagate soft TD error to all eligible (state, action) pairs
+        # Propagate through all eligible (state, action) pairs
         for (s, a), e in self.eligibilities.items():
-            if s not in self.q_table:
-                self.q_table[s] = {act: 0.0 for act in self.actions}
-            self.q_table[s][a] += self.alpha * td_error * e
+            s_vec_e = self.state_to_vector(s)
+            w = self.weights[a]
+            step = self.alpha * td_error * e
+            for i in range(self.feature_dim):
+                w[i] += step * s_vec_e[i]
