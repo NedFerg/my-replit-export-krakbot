@@ -100,6 +100,42 @@ class Simulation:
         self.sell_volume_history = []
         self.volume_window = 20
 
+        # --- Microstructure parameters (tunable) -------------------------
+        # All values in basis points (1 bp = 0.01%).
+        self.spread_bps  = 10   # 0.10% half-spread each side
+        self.slippage_bps = 5   # 0.05% market impact per trade
+        self.txn_cost_bps = 2   # 0.02% flat fee per trade
+
+    # ------------------------------------------------------------------
+    # Microstructure helper
+    # ------------------------------------------------------------------
+
+    def apply_microstructure(self, mid_price, side):
+        """
+        Compute the realistic execution price and flat transaction cost
+        for a single RL-agent exposure adjustment.
+
+        Parameters
+        ----------
+        mid_price : float  — current mid market price
+        side      : 'buy' or 'sell'
+
+        Returns
+        -------
+        exec_price : float — price at which the trade executes (mid ± spread/2 ± slippage)
+        txn_cost   : float — flat fee charged regardless of direction
+        """
+        spread    = mid_price * (self.spread_bps  / 10_000)
+        slippage  = mid_price * (self.slippage_bps / 10_000)
+        txn_cost  = mid_price * (self.txn_cost_bps / 10_000)
+
+        if side == "buy":
+            exec_price = mid_price + spread / 2 + slippage
+        else:
+            exec_price = mid_price - spread / 2 - slippage
+
+        return exec_price, txn_cost
+
     def run(self):
         # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
@@ -236,9 +272,15 @@ class Simulation:
             self.broker.fill_resting_orders(price)
 
             # --- RL agent: ramp exposure toward target -------------------
+            # execute_exposure() returns the transaction cost it charged so
+            # the reward calculation can subtract it in the same step.
+            rl_txn_costs = {}
             for agent in self.agents:
                 if isinstance(agent, ReinforcementLearningTrader):
-                    self.broker.execute_exposure(agent, price)
+                    cost = self.broker.execute_exposure(
+                        agent, price, self.apply_microstructure
+                    )
+                    rl_txn_costs[agent] = cost
 
             # --- Tracking + Q-learning update ----------------------------
             for agent in self.agents:
@@ -280,14 +322,16 @@ class Simulation:
                         state.equity_vol = 0.0
 
                     if agent.prev_state is not None:
-                        # Risk-aware reward: raw PnL minus drawdown and
-                        # equity-volatility penalties.
+                        # Risk-aware reward: raw PnL minus drawdown,
+                        # equity-volatility, and transaction-cost penalties.
                         # Coefficients (0.1, 0.05) are tunable starting points.
                         pnl_reward = new_equity - agent.prev_equity
+                        step_txn_cost = rl_txn_costs.get(agent, 0.0)
                         reward = (
                             pnl_reward
                             - 0.1 * state.drawdown
                             - 0.05 * state.equity_vol
+                            - step_txn_cost
                         )
                         # Store in replay buffer then learn from a random batch
                         done = (current_step == SIMULATION_STEPS - 1)

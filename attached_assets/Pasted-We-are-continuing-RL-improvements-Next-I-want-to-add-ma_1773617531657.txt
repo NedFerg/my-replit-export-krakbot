@@ -1,0 +1,123 @@
+We are continuing RL improvements.
+Next, I want to add market microstructure realism to the environment:
+
+    Bid/ask spread
+
+    Slippage
+
+    Transaction costs
+
+These should affect:
+
+    execution price
+
+    balance
+
+    realized PnL
+
+    unrealized PnL
+
+    reward
+
+All RL logic (C51, Dueling, PER, NoisyNets, N‑step, etc.) stays unchanged.
+
+Make the following edits:
+1. Add spread + slippage parameters to the simulation
+
+In simulation.py, inside the simulation class __init__, add:
+python
+
+# --- Microstructure parameters ---
+self.spread_bps = 10        # 10 basis points = 0.10% spread
+self.slippage_bps = 5       # 5 basis points = 0.05% slippage
+self.txn_cost_bps = 2       # 2 basis points per trade
+
+These are tunable.
+2. Add helper to compute execution price
+
+Still in simulation.py, add this method:
+python
+
+def apply_microstructure(self, mid_price, side):
+    """
+    side: 'buy' or 'sell'
+    Returns execution_price, total_cost
+    """
+    spread = mid_price * (self.spread_bps / 10000)
+    slippage = mid_price * (self.slippage_bps / 10000)
+    txn_cost = mid_price * (self.txn_cost_bps / 10000)
+
+    if side == "buy":
+        exec_price = mid_price + spread/2 + slippage
+    else:
+        exec_price = mid_price - spread/2 - slippage
+
+    return exec_price, txn_cost
+
+This gives a realistic execution price and a per‑trade cost.
+3. Modify broker’s exposure execution to include microstructure
+
+In broker.py, inside execute_exposure():
+
+Replace the direct position update with:
+python
+
+# Determine trade direction
+side = "buy" if delta > 0 else "sell"
+
+# Compute execution price + cost
+exec_price, txn_cost = self.simulation.apply_microstructure(price, side)
+
+# Exposure change per step
+exposure_change = steps * (1.0 / max_steps)
+
+# Update exposure
+if delta > 0:
+    agent.position = min(1.0, agent.position + exposure_change)
+else:
+    agent.position = max(-1.0, agent.position - exposure_change)
+
+# Apply transaction cost to balance
+agent.balance -= txn_cost
+
+This ensures:
+
+    exposure changes happen at realistic prices
+
+    every adjustment costs money
+
+    equity reflects execution friction
+
+4. Update unrealized PnL to use mid‑price (not execution price)
+
+In trader_agent.py, keep:
+python
+
+self.unrealized_pnl = self.position * market_price
+
+This is correct: unrealized PnL should use the mid price, not the execution price.
+5. Update reward to include transaction costs
+
+In the reward calculation (where you compute reward = ...):
+
+Add:
+python
+
+reward -= txn_cost  # penalize trading costs
+
+If multiple trades occur in a step, sum their costs.
+6. Sanity checks
+
+After implementing, run main.py and confirm:
+
+    No NaNs
+
+    No crashes
+
+    RLTrader’s balance decreases slightly when adjusting exposure
+
+    Realized PnL is now non‑zero
+
+    Equity curve becomes smoother and more disciplined
+
+    Reward reflects trading friction

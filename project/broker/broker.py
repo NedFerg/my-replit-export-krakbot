@@ -29,11 +29,22 @@ class Broker(ABC):
         Returns a list of Fill objects from the final match."""
 
     @abstractmethod
-    def execute_exposure(self, agent, price) -> None:
+    def execute_exposure(self, agent, price, microstructure_fn=None) -> float:
         """
-        For exposure-based agents: ramp agent.position toward
-        agent.target_exposure and update it directly.
-        No-ops for classical (non-RL) agents.
+        Ramp agent.position toward agent.target_exposure and update directly.
+        Applies microstructure costs (spread + slippage + fee) when
+        microstructure_fn is supplied.
+
+        Parameters
+        ----------
+        agent            : TraderAgent subclass with IS_RL_AGENT = True
+        price            : float — current mid market price
+        microstructure_fn: callable(mid_price, side) → (exec_price, txn_cost)
+                           or None for zero-cost mode
+
+        Returns
+        -------
+        float — transaction cost charged this step (0.0 if no trade or no fn)
         """
 
     @property
@@ -67,23 +78,38 @@ class SimulatedBroker(Broker):
     def fill_resting_orders(self, price) -> list:
         return self._exchange.fill_resting_orders(price)
 
-    def execute_exposure(self, agent, price) -> None:
+    def execute_exposure(self, agent, price, microstructure_fn=None) -> float:
         """
         Ramp agent.position (exposure float in [-1, +1]) toward
         agent.target_exposure using up to max_steps increments of 1/max_steps.
 
-        No exchange order book is involved — the position is updated directly.
-        This keeps the exposure model clean and independent of the order-book
-        integer semantics used by classical agents.
+        When microstructure_fn is provided the execution price includes the
+        bid/ask spread and slippage, and the flat transaction fee is deducted
+        from agent.balance.  The fee is returned so the caller can subtract
+        it from the RL reward signal.
 
+        No exchange order book is involved — position is updated directly.
         Idempotent when abs(delta) < 0.05 (dead-band to avoid churning).
+
+        Returns
+        -------
+        float — transaction cost charged this step (0.0 if no trade).
         """
         delta = agent.target_exposure - agent.position
         if abs(delta) < 0.05:
-            return
+            return 0.0
+
+        side = "buy" if delta > 0 else "sell"
+
+        # Apply microstructure friction when a pricing function is available.
+        # exec_price is recorded on the agent for reference; the flat txn_cost
+        # is deducted from balance and returned for the reward shaping.
+        if microstructure_fn is not None:
+            exec_price, txn_cost = microstructure_fn(price, side)
+        else:
+            exec_price, txn_cost = price, 0.0
 
         max_steps = 3
-        # Number of unit steps to take this call (proportional to delta)
         steps = int(round(abs(delta) * max_steps))
         exposure_change = steps * (1.0 / max_steps)
 
@@ -91,6 +117,14 @@ class SimulatedBroker(Broker):
             agent.position = min(1.0, agent.position + exposure_change)
         else:
             agent.position = max(-1.0, agent.position - exposure_change)
+
+        # Deduct the flat transaction fee from the agent's cash balance.
+        # This is distinct from slippage (which affects exec_price) and
+        # makes the balance decrease visibly when the agent trades.
+        agent.balance  -= txn_cost
+        agent.realized_pnl -= txn_cost   # fee reduces realised book too
+
+        return txn_cost
 
     @property
     def trade_log(self):
