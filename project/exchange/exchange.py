@@ -10,6 +10,7 @@ class Exchange:
             if agent.balance >= price:
                 agent.balance -= price
                 agent.position += 1
+                agent.realized_pnl -= price  # cost of buying
                 self.trade_log.append((agent.name, "BUY", price))
         elif action == "sell":
             if agent.position > 0:
