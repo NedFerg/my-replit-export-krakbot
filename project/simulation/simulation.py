@@ -1,7 +1,7 @@
-from project.agents.trader_agent import TraderAgent
-from project.agents.market_agent import MarketAgent
-from project.exchange.exchange import Exchange
-from project.config.config import (
+from agents.trader_agent import TraderAgent
+from agents.market_agent import MarketAgent
+from exchange.exchange import Exchange
+from config.config import (
     SIMULATION_STEPS,
     INITIAL_BALANCE,
     MARKET_START_PRICE
