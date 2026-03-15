@@ -6,6 +6,7 @@ import matplotlib.patches as mpatches
 from simulation.simulation import Simulation
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
+from risk.risk_manager import RiskManager
 from config.config import INITIAL_BALANCE
 
 NUM_EPISODES = 10
@@ -116,12 +117,34 @@ def plot_rl_qtable_growth(qtable_sizes):
     print("Saved: rl_qtable_growth.png")
 
 
+def print_risk_summary(episode, risk_manager):
+    """Print a concise risk report for one episode."""
+    summary = risk_manager.episode_summary()
+    rejected = summary["rejected_per_agent"]
+    locked = summary["drawdown_locked"]
+    gks = summary["global_kill_switch"]
+
+    total_blocked = sum(rejected.values())
+    if total_blocked == 0 and not locked and not gks:
+        print(f"  [Risk] No limits hit this episode.")
+        return
+
+    print(f"  [Risk] Orders blocked: ", end="")
+    parts = [f"{name}={n}" for name, n in rejected.items() if n > 0]
+    print(", ".join(parts) if parts else "none")
+
+    if locked:
+        print(f"  [Risk] Drawdown-locked agents: {', '.join(locked)}")
+    if gks:
+        print(f"  [Risk] *** GLOBAL KILL-SWITCH triggered ***")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main():
-    # Create agents once — RLTrader's Q-table will accumulate across episodes
+    # Create agents once — RLTrader's Q-table accumulates across episodes
     agents = [
         ValueTrader("ValueTrader", INITIAL_BALANCE),
         MomentumTrader("MomentumTrader", INITIAL_BALANCE),
@@ -130,22 +153,30 @@ def main():
     ]
     rl_trader = agents[-1]
 
-    episode_summaries = []  # list of {name: final_equity} per episode
-    qtable_sizes = []       # Q-table size after each episode
+    # Single RiskManager instance — reused across episodes (register_agents
+    # resets per-episode state at the start of each run)
+    risk_manager = RiskManager(
+        max_position=10,
+        max_notional_per_order=1_000,
+        max_drawdown=0.20,
+        global_max_drawdown=0.30,
+    )
 
+    episode_summaries = []
+    qtable_sizes = []
     price_history = []
     regime_history = []
 
     for episode in range(1, NUM_EPISODES + 1):
-        # Reset per-episode state; Q-table is preserved on RLTrader
+        # Reset per-episode agent state; Q-table is preserved on RLTrader
         for agent in agents:
             agent.reset_for_new_episode()
 
-        # Fresh market + exchange, same agents
-        sim = Simulation(agents=agents)
+        # Fresh market + exchange, same agents and risk manager
+        sim = Simulation(agents=agents, risk_manager=risk_manager)
         trades, agents, price_history, regime_history = sim.run()
 
-        # Per-episode stats
+        # Collect stats
         qtable_sizes.append(len(rl_trader.q_table))
         episode_equity = {a.name: round(a.balance + a.unrealized_pnl, 2) for a in agents}
         episode_summaries.append(episode_equity)
@@ -157,12 +188,14 @@ def main():
         print(f"=== Episode {episode}/{NUM_EPISODES}  [Regime: {regime_label}] ===")
         for a in agents:
             eq = a.balance + a.unrealized_pnl
-            tag = f"  (Q-table: {len(rl_trader.q_table)} states)" if isinstance(a, ReinforcementLearningTrader) else ""
+            tag = (f"  (Q-table: {len(rl_trader.q_table)} states)"
+                   if isinstance(a, ReinforcementLearningTrader) else "")
             print(f"  {a.name:<18} equity: {eq:>10.2f}{tag}")
+        print_risk_summary(episode, risk_manager)
         print()
 
     # ---------------------------------------------------------------------------
-    # Final summary across all episodes
+    # Final cross-episode summary
     # ---------------------------------------------------------------------------
     print("=" * 60)
     print(f"MULTI-EPISODE SUMMARY  ({NUM_EPISODES} episodes)")

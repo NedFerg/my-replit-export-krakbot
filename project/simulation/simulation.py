@@ -2,6 +2,7 @@ from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
 from exchange.exchange import Exchange
+from risk.risk_manager import RiskManager, OrderIntent
 from config.config import (
     SIMULATION_STEPS,
     INITIAL_BALANCE,
@@ -10,7 +11,7 @@ from config.config import (
 
 
 class Simulation:
-    def __init__(self, agents=None):
+    def __init__(self, agents=None, risk_manager=None):
         # Fresh market and exchange each episode
         self.market = MarketAgent(MARKET_START_PRICE)
         self.exchange = Exchange(self.market)
@@ -30,7 +31,14 @@ class Simulation:
                 ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE),
             ]
 
+        # Accept an externally-managed RiskManager or create a default one
+        self.risk_manager = risk_manager if risk_manager is not None else RiskManager()
+
     def run(self):
+        # Register agents with the risk manager so it can track starting equity
+        # and reset per-episode counters (drawdown locks, rejection log, etc.)
+        self.risk_manager.register_agents(self.agents)
+
         for step in range(SIMULATION_STEPS):
             # Update market price (applies regime effects internally)
             price = self.exchange.update_market()
@@ -43,13 +51,18 @@ class Simulation:
                 self.market.volatility
             )
 
-            # All agents decide and submit orders.
-            # Capture each agent's action so RL can use it in the Q-update below.
+            # All agents decide.  For non-hold actions the order is submitted
+            # only if the risk manager approves it.
             step_actions = {}
             for agent in self.agents:
                 action = agent.decide(state)
-                step_actions[agent] = action
-                self.exchange.process_order(agent, action, price)
+                step_actions[agent] = action  # record intent regardless of approval
+
+                if action != "hold":
+                    intent = OrderIntent(side=action, quantity=1, price=price)
+                    if self.risk_manager.approve_order(agent, intent, state):
+                        self.exchange.process_order(agent, action, price)
+                    # else: order silently blocked by risk manager
 
             # Fill any unmatched resting orders via market maker
             self.exchange.fill_resting_orders(price)
@@ -78,6 +91,9 @@ class Simulation:
                     agent.prev_state = new_encoded
                     agent.prev_action = step_actions[agent]
                     agent.prev_equity = new_equity
+
+            # Check global risk after all equity is updated
+            self.risk_manager.check_global_risk(self.agents)
 
             # Record price and regime history
             self.price_history.append(price)

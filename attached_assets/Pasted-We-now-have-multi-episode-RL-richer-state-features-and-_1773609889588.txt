@@ -1,0 +1,105 @@
+We now have multi‑episode RL, richer state features, and a stable multi‑agent environment.
+The next step is to add a risk manager so that agents can only trade within defined limits.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add a RiskManager class
+
+Create a new file: project/risk/risk_manager.py (or another appropriate location).
+
+Implement a RiskManager class with:
+
+    Constructor parameters like:
+
+        max_position_per_agent (e.g. 10 units)
+
+        max_notional_per_order (e.g. 1,000 in currency units)
+
+        max_drawdown_per_agent (fraction, e.g. 0.2 for 20%)
+
+        global_max_drawdown (optional, across all agents)
+
+    Internal tracking of:
+
+        each agent’s starting equity per episode
+
+        current equity (you can read from the agent)
+
+Add a method:
+python
+
+def approve_order(self, agent, order, market_state) -> bool:
+    """
+    Returns True if the order is allowed under risk limits, False otherwise.
+    """
+
+Inside approve_order, enforce at least:
+
+    Position limit:
+
+        If order is a buy and agent.position + order.quantity > max_position_per_agent → reject.
+
+        If order is a sell and agent.position - order.quantity < -max_position_per_agent → reject.
+
+    Notional limit:
+
+        notional = order.quantity * market_state.mid_price
+
+        If notional > max_notional_per_order → reject.
+
+    Per‑agent drawdown limit:
+
+        Compute equity = agent.balance + agent.position * market_state.mid_price
+
+        Compare to starting equity for the episode.
+
+        If drawdown exceeds max_drawdown_per_agent → reject all further orders from that agent (you can mark a flag like agent.risk_locked = True).
+
+Optionally, add a check_global_risk() method that can trigger a global kill‑switch if total equity across agents falls below a threshold.
+2. Wire RiskManager into the simulation
+
+In project/simulation/simulation.py:
+
+    Instantiate a RiskManager in the Simulation constructor (or accept one as an argument).
+
+    When agents decide on an action and you build an order object, call the risk manager before sending the order to the exchange:
+    python
+
+    if self.risk_manager.approve_order(agent, order, state):
+        exchange.process_order(order)
+    else:
+        # optionally log that the order was blocked for risk reasons
+        pass
+
+    Ensure this applies to all agents, including RLTrader.
+
+At the start of each episode, tell the risk manager the starting equity per agent (or let it infer it from the agents).
+3. Track and report risk events
+
+Add simple logging for risk events:
+
+    In RiskManager.approve_order, when an order is rejected, record:
+
+        agent name
+
+        reason (position limit, notional limit, drawdown limit, etc.)
+
+        current equity and position
+
+    At the end of each episode (in main.py), print a short risk summary:
+
+        how many orders were blocked per agent
+
+        whether any agent hit its drawdown limit
+
+        whether any global kill‑switch would have been triggered (if implemented)
+
+This doesn’t need to be fancy—just enough to see that risk controls are actually doing something.
+4. Keep behavior otherwise unchanged
+
+    If no risk limits are hit, the simulation should behave exactly as before.
+
+    RLTrader should still learn and trade, but now within position and drawdown constraints.
+
+    Charts (price, equity, drawdown, Q‑table growth) should still generate as before.
+
+Please implement this cleanly and keep the code consistent with the existing style.
