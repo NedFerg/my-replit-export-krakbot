@@ -1,0 +1,123 @@
+We’re upgrading the exchange to use a real order book instead of instant fills.
+
+Goal: Add a basic limit‑order book with bids, asks, and matching logic, and integrate it with the existing agents and simulation.
+
+Context:
+
+    We already have: MarketAgent, TraderAgent (with subclasses), Exchange, Simulation, and PnL tracking.
+
+    Right now, Exchange.process_order(agent, action) just buys/sells at the current market price with no order book.
+
+    We want to replace that with a simple but realistic order book.
+
+1. Update exchange.py to add an OrderBook
+
+In project/exchange/exchange.py, do the following:
+
+    Add an Order data structure (can be a simple class or namedtuple) with:
+
+        agent (the trader submitting the order)
+
+        side ("buy" or "sell")
+
+        price (float)
+
+        quantity (int, default 1 for now)
+
+        id or sequence number (for FIFO within price level)
+
+    Add an OrderBook class with:
+
+        bids: list of buy orders, sorted by price descending, then FIFO
+
+        asks: list of sell orders, sorted by price ascending, then FIFO
+
+        Methods:
+
+            add_order(order)
+
+            match() — matches best bid vs best ask while best_bid >= best_ask
+
+            get_best_bid() and get_best_ask() (return price or None)
+
+    Matching logic in OrderBook.match() should:
+
+        Take the top bid and top ask
+
+        Trade at the ask price (or mid; pick one and be consistent—use ask for now)
+
+        Reduce quantities, remove fully filled orders
+
+        For each fill, update:
+
+            buyer’s position and balance
+
+            seller’s position and balance
+
+            both agents’ realized_pnl (use the same logic we already use: buying reduces realized PnL by trade price, selling increases it)
+
+            append to self.trade_log as (agent_name, "BUY"/"SELL", price) for both sides
+
+    In the Exchange class:
+
+        Add an OrderBook instance: self.order_book = OrderBook()
+
+        Replace the old process_order(agent, action) logic with:
+
+            If action is "buy":
+
+                Create a limit buy order slightly below or at current market price (e.g., price = market_price * 0.999 or just market_price)
+
+            If action is "sell":
+
+                Create a limit sell order slightly above or at current market price (e.g., price = market_price * 1.001 or just market_price)
+
+            Add the order to the order book via add_order()
+
+            Call self.order_book.match() to execute any possible trades
+
+    Keep self.trade_log behavior compatible with the rest of the system (same tuple format).
+
+2. Integrate with the simulation
+
+In project/simulation/simulation.py:
+
+    Make sure the Exchange has access to the current market_price when processing orders. If needed, update process_order to accept market_price as a parameter and pass it from the simulation loop.
+
+    The simulation loop should:
+
+        Get the current price from MarketAgent
+
+        For each agent:
+
+            Update last_price
+
+            Get action = agent.decide(price)
+
+            Call exchange.process_order(agent, action, price) (or similar)
+
+        After all orders are submitted, the exchange’s order book match() will already have been called inside process_order.
+
+3. Keep PnL and performance summary working
+
+    Ensure that all PnL updates (realized and unrealized) still work correctly with the new order book.
+
+    unrealized_pnl should still be based on position * market_price.
+
+    The performance summary in main.py should not need major changes; just make sure trade_log, balances, positions, and PnL are updated correctly by the new matching logic.
+
+4. After implementing
+
+    Run project/main.py.
+
+    Confirm that:
+
+        Trades now occur via the order book (bids/asks)
+
+        Agents can have resting orders that don’t immediately fill
+
+        The performance summary still prints correctly
+
+        The system runs without errors
+
+Please implement this in a clean, readable way, reusing as much of the existing PnL and logging logic as possible.
