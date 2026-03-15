@@ -1,3 +1,4 @@
+import collections
 import random
 
 import math
@@ -216,6 +217,13 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prioritized_alpha = 0.6    # how strongly priority biases sampling
         self.prioritized_epsilon = 1e-5  # floor added to |td_error|
 
+        # N-step return accumulation
+        # n_step_buffer collects raw 1-step transitions; once N are gathered
+        # (or the episode ends) they are collapsed into a single N-step
+        # transition (s_0, a_0, R_n, s_n) and pushed to replay_buffer.
+        self.n_step = 3
+        self.n_step_buffer = collections.deque(maxlen=self.n_step)
+
         self.last_mid_price = None  # for momentum feature
 
         # Set by the simulation loop each step
@@ -238,6 +246,7 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prev_action = None
         self.prev_equity = None
         self.eligibilities.clear()
+        self.n_step_buffer.clear()   # prevent transitions leaking across episodes
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
     # ------------------------------------------------------------------
@@ -430,20 +439,53 @@ class ReinforcementLearningTrader(TraderAgent):
     # Experience replay (Prioritized)
     # ------------------------------------------------------------------
 
-    def add_experience(self, prev_state, action, reward, new_state):
+    def add_experience(self, prev_state, action, reward, new_state, done=False):
         """
-        Store a transition with maximum current priority.
+        Accumulate a raw 1-step transition into the N-step buffer, then
+        collapse and push to the replay buffer once N steps are available
+        (or the episode ends).
 
-        New transitions start at max priority so they are sampled at
-        least once before being re-scored by actual TD error.
-        Each entry: (transition, priority)  where
-        transition = (prev_state, action, reward, new_state).
+        N-step return
+        -------------
+        R_n = Σ_{k=0}^{N-1} γ^k · r_{t+k}   (sum stops early if done=True)
+        s_n = state reached after N steps (or at episode end)
+
+        The collapsed transition (s_0, a_0, R_n, s_n) is stored in
+        replay_buffer exactly like a 1-step transition, so replay() and
+        update_q() require no changes — they simply receive a richer reward
+        signal and a further-ahead bootstrap state.
+
+        Priority
+        --------
+        New entries receive the current maximum priority so they are sampled
+        at least once before being re-scored by actual TD error.
         """
-        transition = (prev_state, action, reward, new_state)
+        self.n_step_buffer.append((prev_state, action, reward, new_state, done))
+
+        # Wait until the buffer is full (or the episode is done)
+        if len(self.n_step_buffer) < self.n_step and not done:
+            return
+
+        # Compute discounted N-step return, stopping at any terminal step
+        R = 0.0
+        gamma_pow = 1.0
+        for (_, _, r, _, d) in self.n_step_buffer:
+            R += gamma_pow * r
+            if d:
+                break
+            gamma_pow *= self.gamma
+
+        s0, a0, _, _, _ = self.n_step_buffer[0]
+        s_n = self.n_step_buffer[-1][3]  # state after the last collected step
+
+        transition = (s0, a0, R, s_n)
         max_prio = max((p for (_, p) in self.replay_buffer), default=1.0)
         self.replay_buffer.append((transition, max_prio))
         if len(self.replay_buffer) > self.replay_capacity:
             self.replay_buffer.pop(0)
+
+        if done:
+            self.n_step_buffer.clear()
 
     def replay(self):
         """

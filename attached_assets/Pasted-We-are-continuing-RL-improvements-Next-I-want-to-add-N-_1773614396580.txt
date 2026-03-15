@@ -1,0 +1,116 @@
+We are continuing RL improvements.
+Next, I want to add N‑step returns to the ReinforcementLearningTrader, while keeping:
+
+    Dueling DQN
+
+    Double‑Q
+
+    PER
+
+    NoisyNets
+
+    target network + Polyak
+    exactly as they are.
+
+Use a small N (e.g. 3).
+1. Add N‑step hyperparameters and buffer
+
+In __init__ of ReinforcementLearningTrader, add:
+python
+
+import collections  # at top of file if not present
+
+self.n_step = 3
+self.n_step_buffer = collections.deque(maxlen=self.n_step)
+
+This buffer will hold recent transitions before they are collapsed into a single N‑step transition for replay.
+2. Change the transition format to include done flag
+
+Wherever a transition is created (in add_experience / caller), ensure it includes a done flag:
+python
+
+transition = (prev_state, action, reward, new_state, done)
+
+The replay buffer will still ultimately store 4‑tuples (s0, a0, R_n, s_n), but the N‑step buffer needs done.
+3. Rewrite add_experience to build N‑step transitions
+
+In add_experience, instead of pushing directly into self.replay_buffer, do:
+python
+
+def add_experience(self, prev_state, action, reward, new_state, done):
+    # Push raw 1-step transition into N-step buffer
+    self.n_step_buffer.append((prev_state, action, reward, new_state, done))
+
+    # If we don't yet have N steps and episode not done, wait
+    if len(self.n_step_buffer) < self.n_step and not done:
+        return
+
+    # Build N-step return from buffer
+    R = 0.0
+    gamma_pow = 1.0
+    for (_, _, r, _, d) in self.n_step_buffer:
+        R += gamma_pow * r
+        if d:
+            break
+        gamma_pow *= self.gamma
+
+    s0, a0, _, _, _ = self.n_step_buffer[0]
+    s_n = self.n_step_buffer[-1][3]
+
+    n_step_transition = (s0, a0, R, s_n)
+
+    # Prioritized replay: assign initial max priority
+    if self.replay_buffer:
+        max_prio = max(p for (_, p) in self.replay_buffer)
+    else:
+        max_prio = 1.0
+
+    self.replay_buffer.append((n_step_transition, max_prio))
+
+    # Maintain capacity as before
+    if len(self.replay_buffer) > self.replay_capacity:
+        self.replay_buffer.pop(0)
+
+    # If episode ended, clear N-step buffer
+    if done:
+        self.n_step_buffer.clear()
+
+This way, replay_buffer still stores (prev_state, action, reward, new_state) (now with N‑step reward and N‑step next state), so replay() and update_q() signatures remain unchanged.
+4. Clear N‑step buffer on episode reset
+
+In reset_for_new_episode() (or equivalent), add:
+python
+
+self.n_step_buffer.clear()
+
+to avoid leaking transitions across episodes.
+5. Keep replay(), PER, and update_q() unchanged
+
+    replay() should continue to:
+
+        sample transitions from self.replay_buffer
+
+        unpack (prev_state, action, reward, new_state)
+
+        call update_q()
+
+        use the returned td_error to update priority
+
+    update_q() continues to compute the TD target using reward and new_state — it now simply sees an N‑step reward and N‑step next state instead of 1‑step.
+
+No changes to update_q() or PER logic are required.
+6. Sanity check
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes run cleanly
+
+    No NaNs or exploding losses
+
+    Replay buffer still fills and samples correctly
+
+    PER still updates priorities
+
+    Double‑Q, Dueling, NoisyNets, and target network behavior are unchanged
+
+Please keep the code clean and consistent with the existing style.

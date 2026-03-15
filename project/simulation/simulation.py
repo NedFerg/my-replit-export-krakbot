@@ -133,11 +133,13 @@ class Simulation:
                         # Shape reward: inventory penalty + volatility scaling
                         reward = agent.compute_reward(raw_reward, state)
                         # Store in replay buffer then learn from a random batch
+                        done = (current_step == SIMULATION_STEPS - 1)
                         agent.add_experience(
                             agent.prev_state,
                             agent.prev_action,
                             reward,
                             new_encoded,
+                            done,
                         )
                         agent.replay()
 
