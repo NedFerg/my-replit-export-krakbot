@@ -8,6 +8,8 @@ from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
 from market_data.data_source import SimulatedDataSource
+from broker.broker import SimulatedBroker
+from exchange.exchange import Exchange
 from risk.risk_manager import RiskManager
 from config.config import INITIAL_BALANCE, MARKET_START_PRICE
 
@@ -176,16 +178,18 @@ def main():
         # --- Data source: mode switch ------------------------------------
         if MODE == "sim":
             data_source = SimulatedDataSource(MarketAgent(MARKET_START_PRICE))
+            broker = SimulatedBroker(Exchange())
         else:
             raise NotImplementedError(
                 f"MODE={MODE!r} is not implemented. "
-                "Add a MarketDataSource subclass for live or paper trading."
+                "Add a MarketDataSource and Broker subclass for live or paper trading."
             )
 
         # --- Fresh simulation with shared agents and risk manager --------
         sim = Simulation(
             agents=agents,
             market_data_source=data_source,
+            broker=broker,
             risk_manager=risk_manager,
         )
         trades, agents, price_history, regime_history = sim.run()

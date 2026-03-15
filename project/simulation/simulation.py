@@ -1,7 +1,7 @@
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
-from exchange.exchange import Exchange
+from broker.broker import SimulatedBroker
 from market_data.data_source import SimulatedDataSource
 from risk.risk_manager import RiskManager, OrderIntent
 from config.config import (
@@ -15,15 +15,13 @@ class Simulation:
     """
     Orchestrates one episode of the multi-agent market simulation.
 
-    Price generation is fully delegated to a MarketDataSource, so the
-    simulation loop only consumes Tick objects — it has no knowledge of
-    how prices are produced. Swapping SimulatedDataSource for a live or
-    paper-trading source requires no changes here.
+    All market data flows in through a MarketDataSource (Tick objects).
+    All order execution flows out through a Broker.
+    The simulation has no direct knowledge of Exchange internals.
     """
 
-    def __init__(self, agents=None, market_data_source=None, risk_manager=None):
+    def __init__(self, agents=None, market_data_source=None, broker=None, risk_manager=None):
         # --- Market data source ------------------------------------------
-        # Create a default SimulatedDataSource if none is provided.
         if market_data_source is not None:
             self.market_data_source = market_data_source
         else:
@@ -31,12 +29,10 @@ class Simulation:
                 MarketAgent(MARKET_START_PRICE)
             )
 
-        # Record the initial regime before any ticks are produced
         self.initial_regime = self.market_data_source.initial_regime
 
-        # --- Order book --------------------------------------------------
-        # Exchange no longer drives price; it only manages the order book.
-        self.exchange = Exchange()
+        # --- Broker (order execution) ------------------------------------
+        self.broker = broker if broker is not None else SimulatedBroker()
 
         # --- Agents -------------------------------------------------------
         if agents is not None:
@@ -57,8 +53,7 @@ class Simulation:
         self.regime_history = []
 
     def run(self):
-        # Register agents with the risk manager: records starting equity and
-        # clears per-episode counters (drawdown locks, rejection log, etc.)
+        # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
 
         for _step in range(SIMULATION_STEPS):
@@ -66,8 +61,8 @@ class Simulation:
             tick = self.market_data_source.get_next_tick()
             price = tick.price
 
-            # --- Build MarketState from the live order book + tick data --
-            state = self.exchange.get_market_state(
+            # --- Build MarketState via the broker ------------------------
+            state = self.broker.get_market_state(
                 price,
                 tick.regime,
                 tick.drift,
@@ -83,11 +78,11 @@ class Simulation:
                 if action != "hold":
                     intent = OrderIntent(side=action, quantity=1, price=price)
                     if self.risk_manager.approve_order(agent, intent, state):
-                        self.exchange.process_order(agent, action, price)
+                        self.broker.submit_order(agent, intent, state)
                     # else: silently blocked by risk manager
 
-            # --- Fill any unmatched resting orders via market maker ------
-            self.exchange.fill_resting_orders(price)
+            # --- End-of-step settlement via broker -----------------------
+            self.broker.fill_resting_orders(price)
 
             # --- Tracking + Q-learning update ----------------------------
             for agent in self.agents:
@@ -119,4 +114,4 @@ class Simulation:
             self.price_history.append(price)
             self.regime_history.append(tick.regime)
 
-        return self.exchange.trade_log, self.agents, self.price_history, self.regime_history
+        return self.broker.trade_log, self.agents, self.price_history, self.regime_history

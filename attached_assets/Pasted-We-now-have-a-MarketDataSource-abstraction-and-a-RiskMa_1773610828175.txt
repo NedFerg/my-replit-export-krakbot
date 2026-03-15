@@ -1,0 +1,105 @@
+We now have a MarketDataSource abstraction and a RiskManager.
+Next, I want to add a Broker abstraction so agents route orders through a broker instead of directly into the Exchange.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add a Broker abstraction and SimulatedBroker
+
+Create a new file, e.g. project/broker/broker.py, with:
+python
+
+from abc import ABC, abstractmethod
+
+class Broker(ABC):
+    @abstractmethod
+    def submit_order(self, agent, order_intent, market_state):
+        """
+        Route an order intent to the underlying execution venue.
+        Returns whatever the exchange currently returns (e.g. trades, updated book, etc.).
+        """
+        pass
+
+Then implement a SimulatedBroker(Broker) that wraps the existing Exchange class:
+python
+
+from project.exchange.exchange import Exchange
+
+class SimulatedBroker(Broker):
+    def __init__(self, exchange: Exchange | None = None):
+        self.exchange = exchange or Exchange()
+
+    def submit_order(self, agent, order_intent, market_state):
+        # For now, just delegate to the exchange's existing process_order logic.
+        # Keep the return type consistent with current usage.
+        return self.exchange.process_order(order_intent)
+
+The goal: all agent orders go through a Broker, not directly to Exchange.
+2. Update Simulation to use Broker instead of calling Exchange directly
+
+In project/simulation/simulation.py:
+
+    Add a broker parameter to Simulation.__init__ (instead of, or in addition to, exchange).
+
+    Store it as self.broker.
+
+    Wherever the simulation currently does something like:
+    python
+
+    # previously:
+    self.exchange.process_order(order_intent)
+
+    replace it with:
+    python
+
+    # risk check should still happen before this call
+    self.broker.submit_order(agent, order_intent, state)
+
+    Keep the existing RiskManager flow:
+
+        build order_intent
+
+        call risk_manager.approve_order(...)
+
+        if approved → call broker.submit_order(...)
+
+        if rejected → skip
+
+The simulation should no longer depend directly on Exchange—only on Broker.
+3. Wire SimulatedBroker in main.py
+
+In project/main.py:
+
+    Import SimulatedBroker from the new broker module.
+
+    When constructing the Simulation inside the episode loop, create a SimulatedBroker and pass it in:
+    python
+
+    from project.broker.broker import SimulatedBroker
+    from project.exchange.exchange import Exchange
+
+    # inside the episode loop, after creating agents and data_source:
+    exchange = Exchange()
+    broker = SimulatedBroker(exchange)
+
+    sim = Simulation(
+        agents=agents,
+        market_data_source=data_source,
+        broker=broker,
+        # ...any other existing args
+    )
+
+    Ensure nothing else in main.py depends directly on Exchange.
+
+This mirrors the MarketDataSource pattern and prepares for a future KrakenBroker.
+4. Keep behavior identical
+
+    All 10 episodes should still run cleanly.
+
+    Charts should still generate.
+
+    RiskManager should still block orders as before.
+
+    RLTrader’s Q‑table should still grow.
+
+After implementing, run project/main.py and confirm behavior is unchanged.
+
+Please keep the code clean and consistent with the existing style.
