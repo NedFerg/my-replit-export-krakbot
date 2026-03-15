@@ -28,4 +28,7 @@ class Simulation:
                 action = agent.decide(price)
                 self.exchange.process_order(agent, action)
 
+            for agent in self.agents:
+                agent.update_unrealized_pnl(price)
+
         return self.exchange.trade_log
