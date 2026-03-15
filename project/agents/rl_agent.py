@@ -22,6 +22,10 @@ class ReinforcementLearningTrader(TraderAgent):
         self.lambda_ = 0.8          # trace decay — higher = longer credit assignment
         self.eligibilities = {}     # reset each episode to prevent trace leakage
 
+        # Polyak averaging coefficient for soft Q-target updates
+        # τ ∈ (0, 1): smaller = slower, smoother convergence
+        self.tau = 0.1
+
         # Epsilon-greedy exploration with per-episode decay
         self.epsilon = 0.10
         self.epsilon_decay = 0.98
@@ -223,26 +227,35 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def update_q(self, prev_state, action, reward, new_state):
         """
-        Q(λ) update: compute one TD error and broadcast it across all
-        currently eligible (state, action) pairs weighted by their trace.
+        Q(λ) update with Polyak-averaged soft targets.
 
-        TD error:
-            δ = (reward + γ · max_a Q(new_state, a)) − Q(prev_state, action)
+        Standard TD target:
+            td_target = reward + γ · max_a Q(new_state, a)
+
+        Soft target (Polyak averaging):
+            soft_target = (1 − τ) · Q(prev_state, action) + τ · td_target
+
+        This replaces the hard target with a weighted blend of the current
+        Q-value and the Bellman target.  Smaller τ keeps updates smooth and
+        prevents large sudden Q-value shifts, improving stability when
+        eligibility traces amplify updates across many state-action pairs.
+
+        Effective TD error used for the Q(λ) broadcast:
+            δ = soft_target − Q(prev_state, action)
+              = τ · (td_target − Q(prev_state, action))
 
         Update rule for every eligible pair (s, a):
             Q(s, a) += α · δ · e(s, a)
-
-        The q_table is a nested dict {state: {action: value}} so that
-        decide() and encode_state() require no changes.  Entries for
-        states not yet in the table are initialised to zero on first write.
         """
-        # Compute the TD error from this specific transition
         current_q = self.q_table.get(prev_state, {}).get(action, 0.0)
         next_qvals = self.q_table.get(new_state, {})
         best_next = max(next_qvals.values()) if next_qvals else 0.0
-        td_error = (reward + self.gamma * best_next) - current_q
 
-        # Propagate TD error to all eligible (state, action) pairs
+        td_target = reward + self.gamma * best_next
+        soft_target = (1.0 - self.tau) * current_q + self.tau * td_target
+        td_error = soft_target - current_q  # equivalent to τ · (td_target − current_q)
+
+        # Propagate soft TD error to all eligible (state, action) pairs
         for (s, a), e in self.eligibilities.items():
             if s not in self.q_table:
                 self.q_table[s] = {act: 0.0 for act in self.actions}
