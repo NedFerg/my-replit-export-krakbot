@@ -212,7 +212,7 @@ def main():
         for a in agents:
             eq = a.balance + a.unrealized_pnl
             tag = (
-                f"  (LFA weights: {rl_trader.feature_dim}×{len(rl_trader.actions)}"
+                f"  (C51 {rl_trader.feature_dim}feat×{len(rl_trader.actions)}act×{rl_trader.num_atoms}atoms"
                 f", ε={rl_trader.epsilon:.4f}"
                 f", buf={len(rl_trader.replay_buffer)})"
                 if isinstance(a, ReinforcementLearningTrader) else ""
@@ -234,8 +234,8 @@ def main():
         worst = min(equities)
         print(f"{name:<18}  avg: {avg:>9.2f}  best: {best:>9.2f}  worst: {worst:>9.2f}")
 
-    print(f"\nRLTrader LFA: {rl_trader.feature_dim} features × {len(rl_trader.actions)} actions"
-          f"  |  replay buffer: {len(rl_trader.replay_buffer)} transitions")
+    print(f"\nRLTrader C51: {rl_trader.feature_dim} features × {len(rl_trader.actions)} actions"
+          f" × {rl_trader.num_atoms} atoms  |  replay buffer: {len(rl_trader.replay_buffer)} transitions")
 
     print("\nFinal Episode — Performance Detail:")
     for agent in agents:

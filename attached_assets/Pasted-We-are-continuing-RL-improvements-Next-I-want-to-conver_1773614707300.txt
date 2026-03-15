@@ -1,0 +1,263 @@
+We are continuing RL improvements.
+Next, I want to convert the current Dueling DQN into a C51‑style distributional DQN (categorical distribution over returns), while keeping:
+
+    Dueling architecture
+
+    Double‑Q
+
+    PER
+
+    NoisyNets
+
+    N‑step returns
+
+    target network + Polyak
+    exactly as they are conceptually.
+
+The main changes are:
+
+    the network outputs a distribution over atoms per action
+
+    q_value becomes the expectation of that distribution
+
+    update_q trains on a projected target distribution with cross‑entropy loss.
+
+1. Add C51 hyperparameters and support
+
+In ReinforcementLearningTrader.__init__, after existing RL hyperparameters, add:
+python
+
+self.num_atoms = 51
+self.v_min = -20.0
+self.v_max = 20.0
+self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+
+# Will be moved to device after self.device is set
+self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms)
+
+After self.device is defined, move the support to the device:
+python
+
+self.support = self.support.to(self.device)
+
+(You can tune v_min / v_max later based on observed return scales.)
+2. Change DuelingQNetwork to output distributions
+
+Replace the current DuelingQNetwork with a distributional dueling network that outputs logits of shape [batch, num_actions, num_atoms].
+python
+
+class DuelingQNetwork(nn.Module):
+    def __init__(self, input_dim, num_actions, num_atoms):
+        super().__init__()
+
+        self.num_actions = num_actions
+        self.num_atoms = num_atoms
+
+        self.feature = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+
+        # Value stream: outputs [batch, 1, num_atoms]
+        self.value = nn.Sequential(
+            NoisyLinear(64, 32),
+            nn.ReLU(),
+            NoisyLinear(32, num_atoms),
+        )
+
+        # Advantage stream: outputs [batch, num_actions, num_atoms]
+        self.advantage = nn.Sequential(
+            NoisyLinear(64, 32),
+            nn.ReLU(),
+            NoisyLinear(32, num_actions * num_atoms),
+        )
+
+    def forward(self, x):
+        f = self.feature(x)
+
+        V = self.value(f)                          # [batch, num_atoms]
+        V = V.view(-1, 1, self.num_atoms)          # [batch, 1, num_atoms]
+
+        A = self.advantage(f)                      # [batch, num_actions * num_atoms]
+        A = A.view(-1, self.num_actions, self.num_atoms)  # [batch, num_actions, num_atoms]
+
+        A_mean = A.mean(dim=1, keepdim=True)       # [batch, 1, num_atoms]
+        Q_logits = V + (A - A_mean)                # [batch, num_actions, num_atoms]
+        return Q_logits
+
+    def reset_noise(self):
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
+
+In __init__, update the instantiation to:
+python
+
+self.q_net = DuelingQNetwork(self.feature_dim, len(self.actions), self.num_atoms).to(self.device)
+self.target_q_net = DuelingQNetwork(self.feature_dim, len(self.actions), self.num_atoms).to(self.device)
+self.target_q_net.load_state_dict(self.q_net.state_dict())
+self.target_q_net.eval()
+
+3. Update q_value and target_q_value to use expectations
+
+Replace the scalar versions with ones that:
+
+    run the network
+
+    apply softmax over atoms to get probabilities
+
+    compute the expectation using self.support.
+
+python
+
+def _dist_to_q_values(self, logits):
+    # logits: [batch, num_actions, num_atoms]
+    probs = torch.softmax(logits, dim=-1)                  # same shape
+    # support: [num_atoms] → [1, 1, num_atoms]
+    support = self.support.view(1, 1, -1)
+    q_vals = (probs * support).sum(dim=-1)                 # [batch, num_actions]
+    return q_vals
+
+def q_value(self, state_vec, action):
+    idx = self.action_to_index[action]
+    x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+    with torch.no_grad():
+        logits = self.q_net(x)                             # [1, num_actions, num_atoms]
+        q_vals = self._dist_to_q_values(logits)            # [1, num_actions]
+    return q_vals[0, idx].item()
+
+def target_q_value(self, state_vec, action):
+    idx = self.action_to_index[action]
+    x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+    with torch.no_grad():
+        logits = self.target_q_net(x)
+        q_vals = self._dist_to_q_values(logits)
+    return q_vals[0, idx].item()
+
+decide() can keep using q_value as before.
+4. Rewrite update_q() to use C51 projection and cross‑entropy
+
+Keep the signature of update_q(prev_state, action, reward, new_state) and the fact that it returns td_error for PER.
+
+Inside update_q:
+
+    Build tensors as before:
+
+python
+
+s_vec = self.state_to_vector(prev_state)
+s2_vec = self.state_to_vector(new_state)
+
+x = torch.tensor(s_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+x2 = torch.tensor(s2_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+a_idx = torch.tensor([self.action_to_index[action]], device=self.device)
+r = torch.tensor([reward], dtype=torch.float32, device=self.device)
+
+    Get current logits and probabilities for the chosen action:
+
+python
+
+logits = self.q_net(x)                                   # [1, num_actions, num_atoms]
+log_probs = torch.log_softmax(logits, dim=-1)            # [1, num_actions, num_atoms]
+log_probs_a = log_probs[0, a_idx]                        # [1, num_atoms]
+
+    Double‑Q action selection on the expectation of the live net, but target distribution from the target net:
+
+python
+
+with torch.no_grad():
+    next_logits_live = self.q_net(x2)                     # [1, num_actions, num_atoms]
+    next_q_vals_live = self._dist_to_q_values(next_logits_live)  # [1, num_actions]
+    best_next_idx = next_q_vals_live.argmax(dim=1)        # [1]
+
+    next_logits_target = self.target_q_net(x2)            # [1, num_actions, num_atoms]
+    next_probs_target = torch.softmax(next_logits_target, dim=-1)  # [1, num_actions, num_atoms]
+    next_probs_best = next_probs_target[0, best_next_idx]         # [1, num_atoms]
+
+    Build the C51 target distribution with N‑step returns (use self.n_step and self.gamma):
+
+python
+
+# Tz = r + gamma^n * z, then clipped to [v_min, v_max]
+gamma_n = self.gamma ** self.n_step
+Tz = r.unsqueeze(1) + gamma_n * self.support.view(1, -1)   # [1, num_atoms]
+Tz = Tz.clamp(self.v_min, self.v_max)
+
+b = (Tz - self.v_min) / self.delta_z                       # [1, num_atoms]
+l = b.floor().long()
+u = b.ceil().long()
+
+# Initialize projected distribution
+target_dist = torch.zeros(1, self.num_atoms, device=self.device)
+
+for j in range(self.num_atoms):
+    lj = l[0, j].item()
+    uj = u[0, j].item()
+    pj = next_probs_best[0, j]
+
+    if lj == uj:
+        target_dist[0, lj] += pj
+    else:
+        target_dist[0, lj] += pj * (uj - b[0, j])
+        target_dist[0, uj] += pj * (b[0, j] - lj)
+
+    Use cross‑entropy loss between target_dist and the current log‑probs for the chosen action:
+
+python
+
+loss = -(target_dist * log_probs_a).sum()
+
+self.optimizer.zero_grad()
+loss.backward()
+self.optimizer.step()
+
+self.q_net.reset_noise()
+self.target_q_net.reset_noise()
+
+with torch.no_grad():
+    for param, target_param in zip(self.q_net.parameters(), self.target_q_net.parameters()):
+        target_param.data.mul_(1 - self.target_update_tau)
+        target_param.data.add_(self.target_update_tau * param.data)
+
+    Define td_error for PER as the difference in expected Q before and after the update (approximate):
+
+python
+
+with torch.no_grad():
+    # current expectation before update (using old logits)
+    q_vals_before = self._dist_to_q_values(logits)        # [1, num_actions]
+    q_sa_before = q_vals_before[0, a_idx]
+
+    # recompute after update
+    logits_after = self.q_net(x)
+    q_vals_after = self._dist_to_q_values(logits_after)
+    q_sa_after = q_vals_after[0, a_idx]
+
+td_error = (q_sa_after - q_sa_before).abs().item()
+
+return td_error
+
+(This is a pragmatic PER signal; if you prefer, you can instead use the KL divergence between target_dist and the current distribution as a priority proxy.)
+5. Keep replay(), PER, N‑step, and epsilon logic unchanged
+
+    replay() still samples transitions, calls update_q(), and updates priorities with the returned td_error.
+
+    N‑step returns still feed (prev_state, action, R_n, new_state) into replay.
+
+    Epsilon‑greedy can remain for now alongside NoisyNets.
+
+6. Sanity check
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes run cleanly
+
+    No NaNs or exploding losses
+
+    Q‑values (expectations) remain finite and stable
+
+    PER still updates priorities
+
+    Double‑Q, Dueling, NoisyNets, N‑step, and target network behavior are intact.

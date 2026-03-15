@@ -76,32 +76,37 @@ class NoisyLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Dueling Q-Network (with NoisyLinear value/advantage heads)
+# Distributional Dueling Q-Network (C51 + Dueling + NoisyNets)
 # ---------------------------------------------------------------------------
 
 class DuelingQNetwork(nn.Module):
     """
-    Dueling DQN architecture: shared feature extractor splits into a Value
-    stream V(s) and an Advantage stream A(s, a), recombined as:
+    Distributional Dueling DQN.
 
-        Q(s, a) = V(s) + A(s, a) − mean_a A(s, a)
+    Instead of outputting a scalar Q(s,a) per action, the network outputs a
+    probability distribution over num_atoms return atoms for every action:
 
-    Subtracting the mean advantage centres A around zero and removes the
-    ambiguity between V and A (identifiability).  The result is more stable
-    training: V learns the general worth of a state independently from A,
-    which only needs to capture relative action quality.
+        output shape: [batch, num_actions, num_atoms]   (raw logits)
+
+    The dueling decomposition is applied atom-wise:
+        Q_logits(s,a,z) = V(s,z) + A(s,a,z) − mean_a A(s,a,z)
+
+    After softmax across atoms the expected Q-value is:
+        Q(s,a) = Σ_z  softmax(Q_logits)[a,z] · support[z]
 
     Architecture
     ------------
     Shared:    Linear(input_dim, 64) → ReLU → Linear(64, 64) → ReLU
-    Value:     Linear(64, 32) → ReLU → Linear(32, 1)
-    Advantage: Linear(64, 32) → ReLU → Linear(32, output_dim)
+    Value:     NoisyLinear(64, 32) → ReLU → NoisyLinear(32, num_atoms)
+    Advantage: NoisyLinear(64, 32) → ReLU → NoisyLinear(32, num_actions * num_atoms)
     """
 
-    def __init__(self, input_dim, output_dim):
+    def __init__(self, input_dim, num_actions, num_atoms):
         super().__init__()
+        self.num_actions = num_actions
+        self.num_atoms = num_atoms
 
-        # Shared feature extractor
+        # Shared feature extractor (standard Linear — noise only in heads)
         self.feature = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
@@ -109,26 +114,31 @@ class DuelingQNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # Value stream V(s) — scalar per state (NoisyLinear heads)
+        # Value stream — one atom-vector per state: [batch, num_atoms]
         self.value = nn.Sequential(
             NoisyLinear(64, 32),
             nn.ReLU(),
-            NoisyLinear(32, 1),
+            NoisyLinear(32, num_atoms),
         )
 
-        # Advantage stream A(s, a) — one value per action (NoisyLinear heads)
+        # Advantage stream — one atom-vector per (state, action): [batch, num_actions * num_atoms]
         self.advantage = nn.Sequential(
             NoisyLinear(64, 32),
             nn.ReLU(),
-            NoisyLinear(32, output_dim),
+            NoisyLinear(32, num_actions * num_atoms),
         )
 
     def forward(self, x):
         f = self.feature(x)
-        V = self.value(f)                          # (batch, 1)
-        A = self.advantage(f)                      # (batch, n_actions)
-        A_mean = A.mean(dim=1, keepdim=True)       # (batch, 1)
-        return V + (A - A_mean)                    # (batch, n_actions)
+
+        V = self.value(f)                                            # [batch, num_atoms]
+        V = V.view(-1, 1, self.num_atoms)                           # [batch, 1, num_atoms]
+
+        A = self.advantage(f)                                        # [batch, num_actions * num_atoms]
+        A = A.view(-1, self.num_actions, self.num_atoms)            # [batch, num_actions, num_atoms]
+
+        A_mean = A.mean(dim=1, keepdim=True)                        # [batch, 1, num_atoms]
+        return V + (A - A_mean)                                      # [batch, num_actions, num_atoms]
 
     def reset_noise(self):
         """Resample noise buffers in every NoisyLinear layer."""
@@ -170,21 +180,41 @@ class ReinforcementLearningTrader(TraderAgent):
         #                used exclusively for bootstrap targets to keep
         #                them stable across consecutive updates (DQN idea)
         # ---------------------------------------------------------------
-        self.device = torch.device("cpu")
+        # C51 distributional RL hyper-parameters
+        # The support is 51 evenly-spaced return atoms in [v_min, v_max].
+        # v_min / v_max should bracket the realistic range of shaped rewards;
+        # these can be tuned once observed return scales are known.
+        # ---------------------------------------------------------------
+        self.num_atoms = 51
+        self.v_min = -20.0
+        self.v_max = 20.0
+        self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms)
 
-        self.q_net = DuelingQNetwork(self.feature_dim, len(self.actions)).to(self.device)
-        self.target_q_net = DuelingQNetwork(self.feature_dim, len(self.actions)).to(self.device)
+        self.device = torch.device("cpu")
+        self.support = self.support.to(self.device)
+
+        self.q_net = DuelingQNetwork(
+            self.feature_dim, len(self.actions), self.num_atoms
+        ).to(self.device)
+        self.target_q_net = DuelingQNetwork(
+            self.feature_dim, len(self.actions), self.num_atoms
+        ).to(self.device)
         self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.target_q_net.eval()
 
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=1e-3)
-        self.loss_fn = nn.MSELoss()
 
         # Polyak rate for soft target-network updates (applied each replay step)
         self.target_update_tau = 0.01
 
         # Cumulative replay step counter (useful for diagnostics / future extensions)
         self.replay_steps = 0
+
+        # How many times replay() has been called; used to throttle updates
+        # to once every replay_freq calls (standard DQN practice).
+        self._replay_call_count = 0
+        self.replay_freq = 4          # run one gradient batch every 4 env steps
 
         # ---------------------------------------------------------------
         # Learning hyper-parameters
@@ -347,31 +377,45 @@ class ReinforcementLearningTrader(TraderAgent):
     # Q-value helpers — neural network inference
     # ------------------------------------------------------------------
 
+    def _dist_to_q_values(self, logits):
+        """
+        Convert raw distribution logits to expected Q-values.
+
+        logits : [batch, num_actions, num_atoms]  (raw network output)
+        Returns : [batch, num_actions]  (expected Q per action)
+
+        Softmax across atoms gives probabilities; dot-product with the
+        support gives the expectation E[Z] = Σ_z p(z) · z.
+        """
+        probs = torch.softmax(logits, dim=-1)           # [batch, num_actions, num_atoms]
+        support = self.support.view(1, 1, -1)           # [1, 1, num_atoms]
+        return (probs * support).sum(dim=-1)            # [batch, num_actions]
+
     def q_value(self, state_vec, action):
         """
-        Compute Q(s, a) using the live network (inference only, no grad).
+        Expected Q(s, a) from the live network (no grad, inference only).
 
-        state_vec — output of state_to_vector(), list of floats.
         Returns a plain Python float.
         """
         idx = self.action_to_index[action]
         x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            q_vals = self.q_net(x)
+            logits = self.q_net(x)                      # [1, num_actions, num_atoms]
+            q_vals = self._dist_to_q_values(logits)     # [1, num_actions]
         return q_vals[0, idx].item()
 
     def target_q_value(self, state_vec, action):
         """
-        Compute Q(s, a) using the target network (inference only, no grad).
+        Expected Q(s, a) from the target network (no grad, inference only).
 
-        Used exclusively inside update_q() to build stable TD targets —
-        the target network lags the live network via Polyak averaging so
-        the bootstrap value is not chasing a moving target.
+        Used exclusively for action evaluation in update_q() so that the
+        bootstrap signal comes from a stable, slowly-updated copy.
         """
         idx = self.action_to_index[action]
         x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            q_vals = self.target_q_net(x)
+            logits = self.target_q_net(x)
+            q_vals = self._dist_to_q_values(logits)
         return q_vals[0, idx].item()
 
     # ------------------------------------------------------------------
@@ -497,8 +541,11 @@ class ReinforcementLearningTrader(TraderAgent):
           2. update_q()             — one backprop step; returns td_error.
           3. Refresh buffer priority to |td_error| + ε.
 
-        No-ops until batch_size transitions are available.
+        No-ops until batch_size transitions are available or on non-update steps.
         """
+        self._replay_call_count += 1
+        if self._replay_call_count % self.replay_freq != 0:
+            return
         if len(self.replay_buffer) < self.batch_size:
             return
 
@@ -532,66 +579,84 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def update_q(self, prev_state, action, reward, new_state):
         """
-        One gradient step on the live Q-network for a single transition.
+        C51 distributional update with Double-Q, NoisyNets, N-step returns,
+        and Polyak target-network update.
 
         Algorithm
         ---------
-        1. Build input tensors from state vectors.
+        1. Build state tensors.
 
-        2. Current Q-value (live network, with gradient):
-               current_q = q_net(x)[action]
+        2. Live network forward (with gradient):
+               logits     → [1, num_actions, num_atoms]
+               log_probs  → log_softmax over atoms
+               log_probs_a → log-probs for the taken action: [1, num_atoms]
 
-        3. Double-Q bootstrap target (no gradient):
-               best_next_action = argmax_a  q_net(x2)      # live selects
-               max_next_q       = target_q_net(x2)[best_next_action]  # target evaluates
+        3. Double-Q next-action selection (no gradient):
+               live net  → expected Q per action → argmax → best_next_idx
+               target net → probability distribution for best_next_idx
 
-        4. Soft TD target (Polyak blend of current and Bellman target):
-               td_target  = reward + γ · max_next_q
-               soft_target = (1 − τ) · current_q.detach() + τ · td_target
-               td_error   = (soft_target − current_q).detach()
+        4. C51 distributional projection (N-step Bellman):
+               Tz_j = clamp(r + γ^n · z_j, v_min, v_max)
+               b_j  = (Tz_j − v_min) / δz
+               Spread p(z_j) proportionally to floor(b_j) and ceil(b_j)
 
-        5. MSE loss on (current_q, soft_target) → backprop → Adam step.
+        5. Cross-entropy loss: −Σ_j target_dist_j · log_probs_a_j
+           Backprop → Adam step.
 
-        6. Soft-update target network parameters toward live network:
-               θ_target ← (1 − τ_target) · θ_target + τ_target · θ_live
+        6. Resample NoisyNet noise, then soft-update target network (Polyak).
 
-        Returns td_error (float) so replay() can update PER priorities.
+        7. Return |ΔQ| as the PER priority signal.
         """
         s_vec = self.state_to_vector(prev_state)
         s2_vec = self.state_to_vector(new_state)
 
-        x = torch.tensor(s_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        x  = torch.tensor(s_vec,  dtype=torch.float32, device=self.device).unsqueeze(0)
         x2 = torch.tensor(s2_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
         a_idx = torch.tensor([self.action_to_index[action]], device=self.device)
         r = torch.tensor([reward], dtype=torch.float32, device=self.device)
 
-        # Current Q(s, a) — live network, gradient flows through this
-        q_vals = self.q_net(x)
-        current_q = q_vals.gather(1, a_idx.unsqueeze(1)).squeeze(1)
+        # --- Live network forward (gradient tracked) ---
+        logits = self.q_net(x)                                     # [1, num_actions, num_atoms]
+        log_probs   = torch.log_softmax(logits, dim=-1)            # [1, num_actions, num_atoms]
+        log_probs_a = log_probs[0, a_idx[0]]                       # [num_atoms]
 
-        # Double-Q: live network selects next action, target network evaluates it
+        # --- Double-Q: live selects action, target evaluates distribution ---
         with torch.no_grad():
-            next_q_live = self.q_net(x2)
-            best_next_idx = next_q_live.argmax(dim=1, keepdim=True)
-            next_q_target = self.target_q_net(x2)
-            max_next_q = next_q_target.gather(1, best_next_idx).squeeze(1)
+            next_logits_live  = self.q_net(x2)                     # [1, num_actions, num_atoms]
+            next_q_vals_live  = self._dist_to_q_values(next_logits_live)   # [1, num_actions]
+            best_next_idx     = next_q_vals_live.argmax(dim=1)     # [1]
 
-        # Soft TD target (Polyak blend)
-        td_target = r + self.gamma * max_next_q
-        soft_target = (1.0 - self.tau) * current_q.detach() + self.tau * td_target
-        td_error = (soft_target - current_q).detach().item()
+            next_logits_target = self.target_q_net(x2)             # [1, num_actions, num_atoms]
+            next_probs_target  = torch.softmax(next_logits_target, dim=-1)
+            next_probs_best    = next_probs_target[0, best_next_idx[0]]    # [num_atoms]
 
-        # Backprop on MSE(current_q, soft_target)
-        loss = self.loss_fn(current_q, soft_target)
+        # --- C51 distributional projection (N-step Bellman operator) ---
+        # Vectorised: no Python loop over atoms.
+        gamma_n = self.gamma ** self.n_step
+        Tz = r.unsqueeze(1) + gamma_n * self.support.view(1, -1)  # [1, num_atoms]
+        Tz = Tz.clamp(self.v_min, self.v_max)
+
+        b  = (Tz - self.v_min) / self.delta_z                     # [1, num_atoms]
+        l  = b.floor().long().view(-1)                             # [num_atoms]
+        u  = b.ceil().long().view(-1)                              # [num_atoms]
+        b  = b.view(-1)                                            # [num_atoms]
+
+        # Split next_probs_best mass between the two surrounding atoms.
+        # index_add_ accumulates into duplicate indices correctly.
+        target_dist = torch.zeros(self.num_atoms, device=self.device)
+        target_dist.index_add_(0, l, next_probs_best * (u.float() - b))
+        target_dist.index_add_(0, u, next_probs_best * (b - l.float()))
+
+        # --- Cross-entropy loss and backprop ---
+        loss = -(target_dist * log_probs_a).sum()
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
-        # Resample noise in both networks so exploration varies each step
+        # --- Resample noise and soft-update target network ---
         self.q_net.reset_noise()
         self.target_q_net.reset_noise()
 
-        # Soft-update target network toward live network (Polyak)
         with torch.no_grad():
             for param, target_param in zip(
                 self.q_net.parameters(), self.target_q_net.parameters()
@@ -599,4 +664,6 @@ class ReinforcementLearningTrader(TraderAgent):
                 target_param.data.mul_(1.0 - self.target_update_tau)
                 target_param.data.add_(self.target_update_tau * param.data)
 
-        return td_error  # used by replay() to refresh PER priorities
+        # Cross-entropy loss is the natural C51 priority signal:
+        # high loss ↔ large surprise ↔ should be revisited (replaces |ΔQ|).
+        return loss.item()  # used by replay() to refresh PER priorities
