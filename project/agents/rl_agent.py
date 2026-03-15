@@ -1,6 +1,44 @@
 import random
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
 from agents.trader_agent import TraderAgent
 
+
+# ---------------------------------------------------------------------------
+# Q-Network: small two-hidden-layer MLP
+# ---------------------------------------------------------------------------
+
+class QNetwork(nn.Module):
+    """
+    Feedforward network mapping state features → Q-values for each action.
+
+    Architecture: Linear(input_dim, 64) → ReLU → Linear(64, 64) → ReLU
+                  → Linear(64, output_dim)
+
+    output_dim == number of actions; the caller indexes into the output to
+    obtain Q(s, a) for a specific action.
+    """
+
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+# Reinforcement-learning trader
+# ---------------------------------------------------------------------------
 
 class ReinforcementLearningTrader(TraderAgent):
     actions = ["buy", "sell", "hold"]
@@ -15,51 +53,68 @@ class ReinforcementLearningTrader(TraderAgent):
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
 
-        # ---------------------------------------------------------------
-        # Linear function approximator: Q(s,a) = w_a · x(s)
-        #
-        # One weight vector per action, each of length FEATURE_DIM.
-        # Weights persist across episodes — they are the "memory" that
-        # replaces the old tabular Q-table.
-        # ---------------------------------------------------------------
         self.feature_dim = self.FEATURE_DIM
-        self.weights = {a: [0.0] * self.feature_dim for a in self.actions}
 
-        # Target network — same shape as main weights, updated slowly.
-        # TD targets are computed from target_weights so they are stable
-        # across consecutive updates (core DQN idea).
-        self.target_weights = {a: w[:] for a, w in self.weights.items()}
-        self.target_update_tau = 0.01       # Polyak rate for target network
-        self.target_update_interval = 1     # update every N replay steps
-        self.replay_steps = 0               # cumulative replay step counter
+        # ---------------------------------------------------------------
+        # Action ↔ index mappings (needed for tensor indexing)
+        # ---------------------------------------------------------------
+        self.action_to_index = {a: i for i, a in enumerate(self.actions)}
+        self.index_to_action = {i: a for a, i in self.action_to_index.items()}
 
+        # ---------------------------------------------------------------
+        # Neural Q-networks (live and target)
+        #
+        # q_net     — trained every replay step via backprop
+        # target_q_net — slowly tracks q_net via Polyak averaging;
+        #                used exclusively for bootstrap targets to keep
+        #                them stable across consecutive updates (DQN idea)
+        # ---------------------------------------------------------------
+        self.device = torch.device("cpu")
+
+        self.q_net = QNetwork(self.feature_dim, len(self.actions)).to(self.device)
+        self.target_q_net = QNetwork(self.feature_dim, len(self.actions)).to(self.device)
+        self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.target_q_net.eval()
+
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=1e-3)
+        self.loss_fn = nn.MSELoss()
+
+        # Polyak rate for soft target-network updates (applied each replay step)
+        self.target_update_tau = 0.01
+
+        # Cumulative replay step counter (useful for diagnostics / future extensions)
+        self.replay_steps = 0
+
+        # ---------------------------------------------------------------
         # Learning hyper-parameters
-        self.alpha = 0.01   # learning rate (smaller than tabular — LFA is noisier)
+        # ---------------------------------------------------------------
         self.gamma = 0.95   # discount factor
 
-        # Eligibility traces for Q(λ)
-        # Stored as {(state_tuple, action): eligibility_value}
-        self.lambda_ = 0.8          # trace decay — higher = longer credit assignment
-        self.eligibilities = {}     # reset each episode to prevent trace leakage
-
-        # Polyak averaging coefficient for soft Q-target updates
+        # Polyak averaging coefficient for soft Q-target blending inside update_q
         self.tau = 0.1
+
+        # Eligibility traces for Q(λ) — kept for structural consistency;
+        # with a neural network the update is per-transition (see update_q).
+        self.lambda_ = 0.8
+        self.eligibilities = {}     # reset each episode
 
         # Epsilon-greedy exploration with per-episode decay
         self.epsilon = 0.10
         self.epsilon_decay = 0.98
         self.min_epsilon = 0.05
 
-        # Experience replay buffer (persists across episodes).
-        # Each entry is a 2-tuple: (transition, priority)
-        # where transition = (prev_state, action, reward, new_state).
+        # ---------------------------------------------------------------
+        # Experience replay buffer (persists across episodes)
+        # Each entry: (transition, priority)
+        # transition = (prev_state, action, reward, new_state)
+        # ---------------------------------------------------------------
         self.replay_buffer = []
         self.replay_capacity = 5000
         self.batch_size = 32
 
         # Prioritized Experience Replay (PER) hyper-parameters
-        self.prioritized_alpha = 0.6    # exponent — how strongly priority biases sampling
-        self.prioritized_epsilon = 1e-5  # floor added to |td_error| to avoid zero priority
+        self.prioritized_alpha = 0.6    # how strongly priority biases sampling
+        self.prioritized_epsilon = 1e-5  # floor added to |td_error|
 
         self.last_mid_price = None  # for momentum feature
 
@@ -72,10 +127,10 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         Reset per-episode fields.
 
-        Persisted across episodes: weight vectors, replay buffer.
+        Persisted across episodes: network weights, replay buffer.
         Epsilon decays here rather than being reset.
-        Eligibilities are cleared: traces from one episode must not
-        propagate credit into the next episode's weight updates.
+        Eligibilities are cleared: traces must not propagate across episode
+        boundaries.
         """
         super().reset_for_new_episode()
         self.last_mid_price = None
@@ -83,17 +138,16 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prev_action = None
         self.prev_equity = None
         self.eligibilities.clear()
-        # Decay exploration rate — more exploitation as agent matures
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
     # ------------------------------------------------------------------
-    # State encoding (legacy — retained for reference)
+    # State encoding (legacy — retained for reference / diagnostics)
     # ------------------------------------------------------------------
 
     def encode_state(self, market_state):
         """
         Legacy tabular encoding (7-tuple of integer/string buckets).
-        Superseded by featurize_state() for the LFA pipeline.
+        Superseded by featurize_state() + state_to_vector() for the DQN pipeline.
         Retained for reference and potential diagnostics.
         """
         price_bucket = int(market_state.mid_price // 5)
@@ -141,10 +195,6 @@ class ReinforcementLearningTrader(TraderAgent):
         F. m1            – 1-step momentum if MarketState provides it, else 0.
         G. m3            – 3-step momentum if MarketState provides it, else 0.
         H. imbalance     – order-flow imbalance if MarketState provides it, else 0.
-
-        Optional fields (m1, m3, imbalance) are gated with hasattr so the
-        method is forward-compatible: adding those attributes to MarketState
-        will activate them automatically.
         """
         prev_price = agent.last_mid_price
         if prev_price is not None and prev_price > 0:
@@ -173,14 +223,10 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def state_to_vector(self, state_tuple):
         """
-        Convert a featurize_state() tuple into a numeric list for dot-product
-        computation.
+        Convert a featurize_state() tuple into a numeric list.
 
           - Numeric elements (int, float) → cast to float unchanged.
           - String elements (regime) → stable hash embedding in [0, 1).
-
-        The hash embedding is deterministic within a Python process, which is
-        sufficient for learning inside a single run.
         """
         return [
             float(x) if isinstance(x, (int, float))
@@ -189,29 +235,35 @@ class ReinforcementLearningTrader(TraderAgent):
         ]
 
     # ------------------------------------------------------------------
-    # Q-value computation (linear approximation)
+    # Q-value helpers — neural network inference
     # ------------------------------------------------------------------
 
     def q_value(self, state_vec, action):
         """
-        Compute Q(s, a) = w_a · x(s) via dot product (live network).
+        Compute Q(s, a) using the live network (inference only, no grad).
 
-        state_vec must be the output of state_to_vector() — a plain list of
-        floats of length self.feature_dim.
+        state_vec — output of state_to_vector(), list of floats.
+        Returns a plain Python float.
         """
-        w = self.weights[action]
-        return sum(w[i] * state_vec[i] for i in range(self.feature_dim))
+        idx = self.action_to_index[action]
+        x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            q_vals = self.q_net(x)
+        return q_vals[0, idx].item()
 
     def target_q_value(self, state_vec, action):
         """
-        Compute Q(s, a) using the target network weights.
+        Compute Q(s, a) using the target network (inference only, no grad).
 
-        Used exclusively for building TD targets in update_q() so that the
-        bootstrap value is not moving during the weight update — this is the
-        stabilisation mechanism from DQN.
+        Used exclusively inside update_q() to build stable TD targets —
+        the target network lags the live network via Polyak averaging so
+        the bootstrap value is not chasing a moving target.
         """
-        w = self.target_weights[action]
-        return sum(w[i] * state_vec[i] for i in range(self.feature_dim))
+        idx = self.action_to_index[action]
+        x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            q_vals = self.target_q_net(x)
+        return q_vals[0, idx].item()
 
     # ------------------------------------------------------------------
     # Action selection
@@ -219,9 +271,9 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def decide(self, market_state):
         """
-        Epsilon-greedy action selection using the linear Q-function.
+        Epsilon-greedy action selection using the live Q-network.
 
-        Greedy action: argmax_a Q(s, a) = argmax_a (w_a · x(s)).
+        Greedy action: argmax_a Q(s, a) via live network.
         """
         state_tuple = self.featurize_state(market_state, self)
 
@@ -240,7 +292,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def compute_reward(self, raw_reward, market_state):
         """
-        Shape the raw equity-change reward before storing in the buffer.
+        Shape the raw equity-change reward.
 
         1. Inventory penalty — discourages large directional exposure.
         2. Volatility scaling — reduces reward magnitude in chaotic regimes.
@@ -251,7 +303,7 @@ class ReinforcementLearningTrader(TraderAgent):
         return reward * vol_scale
 
     # ------------------------------------------------------------------
-    # Eligibility traces
+    # Eligibility traces (structural — not used in neural weight update)
     # ------------------------------------------------------------------
 
     def update_eligibilities(self, state, action):
@@ -260,6 +312,10 @@ class ReinforcementLearningTrader(TraderAgent):
 
         Decays all existing traces by γλ, prunes negligible ones,
         then increments the current (state, action) pair by 1.
+
+        Note: traces are tracked for structural consistency and future use.
+        The neural network update in update_q() currently updates only the
+        current (s, a) via backprop (full TD(λ) with backprop is non-trivial).
         """
         decay = self.gamma * self.lambda_
         for key in list(self.eligibilities.keys()):
@@ -271,21 +327,17 @@ class ReinforcementLearningTrader(TraderAgent):
         self.eligibilities[key] = self.eligibilities.get(key, 0.0) + 1.0
 
     # ------------------------------------------------------------------
-    # Experience replay
+    # Experience replay (Prioritized)
     # ------------------------------------------------------------------
 
     def add_experience(self, prev_state, action, reward, new_state):
         """
         Store a transition with maximum current priority.
 
-        New transitions are assigned the highest priority in the buffer so
-        they are guaranteed to be sampled at least once before being
-        overtaken by updated priorities.  If the buffer is empty the
-        initial priority is 1.0.
-
-        Each entry in replay_buffer is a 2-tuple:
-            (transition, priority)
-        where transition = (prev_state, action, reward, new_state).
+        New transitions start at max priority so they are sampled at
+        least once before being re-scored by actual TD error.
+        Each entry: (transition, priority)  where
+        transition = (prev_state, action, reward, new_state).
         """
         transition = (prev_state, action, reward, new_state)
         max_prio = max((p for (_, p) in self.replay_buffer), default=1.0)
@@ -295,24 +347,20 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def replay(self):
         """
-        Sample a priority-weighted mini-batch and apply linear Q(λ) weight updates.
+        Sample a priority-weighted mini-batch and train the Q-network.
 
-        Sampling is proportional to priority^alpha so transitions with larger
-        TD errors are revisited more often (Prioritized Experience Replay).
-
-        For each sampled transition:
-          1. update_eligibilities() — decay traces, boost current (s, a).
-          2. update_q()             — compute soft TD error, propagate through
-                                      all eligible (s,a) pairs, return td_error.
-          3. Update the buffer entry's priority to |td_error| + ε so future
-             sampling reflects how surprising the transition still is.
+        Sampling is proportional to priority^alpha (Prioritized Experience
+        Replay).  For each sampled transition:
+          1. update_eligibilities() — bookkeeping; traces decay as usual.
+          2. update_q()             — one backprop step; returns td_error.
+          3. Refresh buffer priority to |td_error| + ε.
 
         No-ops until batch_size transitions are available.
         """
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        # Build sampling distribution from priorities
+        # Build priority-weighted sampling distribution
         priorities = [p for (_, p) in self.replay_buffer]
         probs = [p ** self.prioritized_alpha for p in priorities]
         total = sum(probs)
@@ -330,68 +378,79 @@ class ReinforcementLearningTrader(TraderAgent):
             self.update_eligibilities(prev_state, action)
             td_error = self.update_q(prev_state, action, reward, new_state)
 
-            # Refresh priority using the latest TD-error magnitude
+            # Refresh priority from latest TD-error magnitude
             new_prio = abs(td_error) + self.prioritized_epsilon
             self.replay_buffer[idx] = (transition, new_prio)
 
             self.replay_steps += 1
 
     # ------------------------------------------------------------------
-    # Linear Q(λ) weight update
+    # DQN training step (Double-Q + soft Q-target + Polyak target update)
     # ------------------------------------------------------------------
 
     def update_q(self, prev_state, action, reward, new_state):
         """
-        Linear function-approximation Q(λ) update with Polyak-averaged targets.
+        One gradient step on the live Q-network for a single transition.
 
-        1. Convert state tuples to numeric feature vectors.
+        Algorithm
+        ---------
+        1. Build input tensors from state vectors.
 
-        2. Compute current Q and best next Q using the weight vectors:
-               current_q  = w_action · x(prev_state)
-               max_next_q = max_a  w_a · x(new_state)
+        2. Current Q-value (live network, with gradient):
+               current_q = q_net(x)[action]
 
-        3. Soft TD target (Polyak averaging):
+        3. Double-Q bootstrap target (no gradient):
+               best_next_action = argmax_a  q_net(x2)      # live selects
+               max_next_q       = target_q_net(x2)[best_next_action]  # target evaluates
+
+        4. Soft TD target (Polyak blend of current and Bellman target):
                td_target  = reward + γ · max_next_q
-               soft_target = (1 − τ) · current_q + τ · td_target
-               td_error   = soft_target − current_q
-                           ≡ τ · (td_target − current_q)
+               soft_target = (1 − τ) · current_q.detach() + τ · td_target
+               td_error   = (soft_target − current_q).detach()
 
-        4. Gradient update for every eligible (s, a) pair, weighted by
-           the pair's eligibility trace e(s, a):
-               w_a[i] += α · td_error · e(s,a) · x_i(s)
+        5. MSE loss on (current_q, soft_target) → backprop → Adam step.
 
-        This is the semi-gradient TD(λ) update for linear Q-functions.
-        Using Polyak averaging on the target damps instability when many
-        (s, a) pairs are updated simultaneously through the traces.
+        6. Soft-update target network parameters toward live network:
+               θ_target ← (1 − τ_target) · θ_target + τ_target · θ_live
+
+        Returns td_error (float) so replay() can update PER priorities.
         """
         s_vec = self.state_to_vector(prev_state)
         s2_vec = self.state_to_vector(new_state)
 
-        current_q = self.q_value(s_vec, action)
+        x = torch.tensor(s_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        x2 = torch.tensor(s2_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        a_idx = torch.tensor([self.action_to_index[action]], device=self.device)
+        r = torch.tensor([reward], dtype=torch.float32, device=self.device)
 
-        # Double-Q: live network selects the action, target network evaluates it.
-        # This decouples selection from evaluation, reducing overestimation bias.
-        best_next_action = max(self.actions, key=lambda a: self.q_value(s2_vec, a))
-        max_next_q = self.target_q_value(s2_vec, best_next_action)
+        # Current Q(s, a) — live network, gradient flows through this
+        q_vals = self.q_net(x)
+        current_q = q_vals.gather(1, a_idx.unsqueeze(1)).squeeze(1)
 
-        td_target = reward + self.gamma * max_next_q
-        soft_target = (1.0 - self.tau) * current_q + self.tau * td_target
-        td_error = soft_target - current_q  # ≡ τ · (td_target − current_q)
+        # Double-Q: live network selects next action, target network evaluates it
+        with torch.no_grad():
+            next_q_live = self.q_net(x2)
+            best_next_idx = next_q_live.argmax(dim=1, keepdim=True)
+            next_q_target = self.target_q_net(x2)
+            max_next_q = next_q_target.gather(1, best_next_idx).squeeze(1)
 
-        # Propagate through all eligible (state, action) pairs
-        for (s, a), e in self.eligibilities.items():
-            s_vec_e = self.state_to_vector(s)
-            w = self.weights[a]
-            step = self.alpha * td_error * e
-            for i in range(self.feature_dim):
-                w[i] += step * s_vec_e[i]
+        # Soft TD target (Polyak blend)
+        td_target = r + self.gamma * max_next_q
+        soft_target = (1.0 - self.tau) * current_q.detach() + self.tau * td_target
+        td_error = (soft_target - current_q).detach().item()
 
-        # Soft-update target network toward main network (Polyak averaging)
-        tau = self.target_update_tau
-        for a in self.actions:
-            tw = self.target_weights[a]
-            mw = self.weights[a]
-            for i in range(self.feature_dim):
-                tw[i] = (1.0 - tau) * tw[i] + tau * mw[i]
+        # Backprop on MSE(current_q, soft_target)
+        loss = self.loss_fn(current_q, soft_target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-        return td_error  # returned so replay() can update this transition's priority
+        # Soft-update target network toward live network (Polyak)
+        with torch.no_grad():
+            for param, target_param in zip(
+                self.q_net.parameters(), self.target_q_net.parameters()
+            ):
+                target_param.data.mul_(1.0 - self.target_update_tau)
+                target_param.data.add_(self.target_update_tau * param.data)
+
+        return td_error  # used by replay() to refresh PER priorities
