@@ -1,0 +1,119 @@
+    We are continuing RL improvements.
+    Next, I want to upgrade the DQN to a Dueling DQN architecture.
+
+    This means the Q‑network splits into two streams:
+
+        a Value stream V(s)
+
+        an Advantage stream A(s,a)
+
+    and recombines them into Q‑values via:
+
+>Q(s,a)=V(s)+A(s,a)−meanaA(s,a)>
+
+    Please implement the following changes cleanly and consistently.
+    1. Replace QNetwork with a DuelingQNetwork
+
+    In project/agents/rl_agent.py, replace the old QNetwork class with:
+    python
+
+    class DuelingQNetwork(nn.Module):
+        def __init__(self, input_dim, output_dim):
+            super().__init__()
+
+            # Shared feature extractor
+            self.feature = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 64),
+                nn.ReLU(),
+            )
+
+            # Value stream
+            self.value = nn.Sequential(
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+            )
+
+            # Advantage stream
+            self.advantage = nn.Sequential(
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, output_dim),
+            )
+
+        def forward(self, x):
+            f = self.feature(x)
+            V = self.value(f)
+            A = self.advantage(f)
+            A_mean = A.mean(dim=1, keepdim=True)
+            Q = V + (A - A_mean)
+            return Q
+
+    This keeps the network small, stable, and fast.
+    2. Update init to use DuelingQNetwork
+
+    Replace:
+    python
+
+    self.q_net = QNetwork(...)
+    self.target_q_net = QNetwork(...)
+
+    with:
+    python
+
+    self.q_net = DuelingQNetwork(self.feature_dim, len(self.actions)).to(self.device)
+    self.target_q_net = DuelingQNetwork(self.feature_dim, len(self.actions)).to(self.device)
+    self.target_q_net.load_state_dict(self.q_net.state_dict())
+    self.target_q_net.eval()
+
+    No other changes needed in __init__.
+    3. q_value and target_q_value remain unchanged
+
+    They should continue to:
+
+        convert the state vector to a tensor
+
+        run it through the network
+
+        index the correct action
+
+    No modifications required.
+    4. update_q() remains unchanged
+
+    The dueling architecture does not change:
+
+        Double‑Q logic
+
+        PER priority updates
+
+        target network soft updates
+
+        loss computation
+
+    The only difference is that the network now internally computes Q(s, a) using the dueling formula.
+
+    No code changes needed inside update_q().
+    5. replay(), PER, epsilon‑greedy, and target updates remain unchanged
+
+    The dueling architecture is a drop‑in replacement for the old QNetwork.
+    6. Keep behavior stable
+
+    After implementing, run project/main.py and confirm:
+
+        All 10 episodes run cleanly
+
+        No exploding losses
+
+        Q‑values remain stable
+
+        PER still works
+
+        Double‑Q still works
+
+        Target network updates smoothly
+
+        Epsilon decay still works
+
+    Please keep the code clean and consistent with the existing style.

@@ -8,32 +8,59 @@ from agents.trader_agent import TraderAgent
 
 
 # ---------------------------------------------------------------------------
-# Q-Network: small two-hidden-layer MLP
+# Dueling Q-Network
 # ---------------------------------------------------------------------------
 
-class QNetwork(nn.Module):
+class DuelingQNetwork(nn.Module):
     """
-    Feedforward network mapping state features → Q-values for each action.
+    Dueling DQN architecture: shared feature extractor splits into a Value
+    stream V(s) and an Advantage stream A(s, a), recombined as:
 
-    Architecture: Linear(input_dim, 64) → ReLU → Linear(64, 64) → ReLU
-                  → Linear(64, output_dim)
+        Q(s, a) = V(s) + A(s, a) − mean_a A(s, a)
 
-    output_dim == number of actions; the caller indexes into the output to
-    obtain Q(s, a) for a specific action.
+    Subtracting the mean advantage centres A around zero and removes the
+    ambiguity between V and A (identifiability).  The result is more stable
+    training: V learns the general worth of a state independently from A,
+    which only needs to capture relative action quality.
+
+    Architecture
+    ------------
+    Shared:    Linear(input_dim, 64) → ReLU → Linear(64, 64) → ReLU
+    Value:     Linear(64, 32) → ReLU → Linear(32, 1)
+    Advantage: Linear(64, 32) → ReLU → Linear(32, output_dim)
     """
 
     def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.net = nn.Sequential(
+
+        # Shared feature extractor
+        self.feature = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
-            nn.Linear(64, output_dim),
+        )
+
+        # Value stream V(s) — scalar per state
+        self.value = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+        # Advantage stream A(s, a) — one value per action
+        self.advantage = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, output_dim),
         )
 
     def forward(self, x):
-        return self.net(x)
+        f = self.feature(x)
+        V = self.value(f)                          # (batch, 1)
+        A = self.advantage(f)                      # (batch, n_actions)
+        A_mean = A.mean(dim=1, keepdim=True)       # (batch, 1)
+        return V + (A - A_mean)                    # (batch, n_actions)
 
 
 # ---------------------------------------------------------------------------
@@ -71,8 +98,8 @@ class ReinforcementLearningTrader(TraderAgent):
         # ---------------------------------------------------------------
         self.device = torch.device("cpu")
 
-        self.q_net = QNetwork(self.feature_dim, len(self.actions)).to(self.device)
-        self.target_q_net = QNetwork(self.feature_dim, len(self.actions)).to(self.device)
+        self.q_net = DuelingQNetwork(self.feature_dim, len(self.actions)).to(self.device)
+        self.target_q_net = DuelingQNetwork(self.feature_dim, len(self.actions)).to(self.device)
         self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.target_q_net.eval()
 
