@@ -15,6 +15,7 @@ class Exchange:
             if agent.position > 0:
                 agent.balance += price
                 agent.position -= 1
+                agent.realized_pnl += price  # profit from selling
                 self.trade_log.append((agent.name, "SELL", price))
 
     def update_market(self):
