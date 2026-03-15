@@ -101,17 +101,21 @@ class SimulatedBroker(Broker):
 
         side = "buy" if delta > 0 else "sell"
 
+        max_steps = 3
+        steps = int(round(abs(delta) * max_steps))
+        exposure_change = steps * (1.0 / max_steps)
+
+        # Signed exposure change this step — passed into apply_microstructure
+        # so the dynamic slippage model can scale with trade size.
+        delta_exposure = exposure_change if delta > 0 else -exposure_change
+
         # Apply microstructure friction when a pricing function is available.
         # exec_price is recorded on the agent for reference; the flat txn_cost
         # is deducted from balance and returned for the reward shaping.
         if microstructure_fn is not None:
-            exec_price, txn_cost = microstructure_fn(price, side)
+            exec_price, txn_cost = microstructure_fn(price, side, delta_exposure)
         else:
             exec_price, txn_cost = price, 0.0
-
-        max_steps = 3
-        steps = int(round(abs(delta) * max_steps))
-        exposure_change = steps * (1.0 / max_steps)
 
         if delta > 0:
             agent.position = min(1.0, agent.position + exposure_change)

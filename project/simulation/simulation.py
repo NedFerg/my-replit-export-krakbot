@@ -103,31 +103,77 @@ class Simulation:
         # --- Microstructure parameters (tunable) -------------------------
         # All values in basis points (1 bp = 0.01%).
         self.spread_bps  = 10   # 0.10% half-spread each side
-        self.slippage_bps = 5   # 0.05% market impact per trade
         self.txn_cost_bps = 2   # 0.02% flat fee per trade
+
+        # --- Market impact parameters (tunable) --------------------------
+        # Dynamic slippage depends on volatility, order-flow pressure,
+        # trade size, and a liquidity proxy (rolling volume).
+        self.impact_vol_coeff  = 0.5   # slippage grows with equity volatility
+        self.impact_flow_coeff = 0.3   # slippage grows with order-flow imbalance
+        self.impact_size_coeff = 1.0   # slippage grows with exposure-change size
+        self.min_liquidity     = 1e-6  # floor to avoid division-by-zero
+
+        # Populated in run() so apply_microstructure() can read it.
+        self.current_state = None
 
     # ------------------------------------------------------------------
     # Microstructure helper
     # ------------------------------------------------------------------
 
-    def apply_microstructure(self, mid_price, side):
+    def apply_microstructure(self, mid_price, side, delta_exposure):
         """
         Compute the realistic execution price and flat transaction cost
         for a single RL-agent exposure adjustment.
 
+        Slippage is now dynamic and state-dependent:
+          - grows with current equity volatility
+          - grows with order-flow pressure (bid/sell imbalance)
+          - grows with the size of the exposure change
+          - grows when rolling volume (liquidity proxy) is thin
+
         Parameters
         ----------
-        mid_price : float  — current mid market price
-        side      : 'buy' or 'sell'
+        mid_price      : float  — current mid market price
+        side           : 'buy' or 'sell'
+        delta_exposure : float  — signed exposure change this step
 
         Returns
         -------
-        exec_price : float — price at which the trade executes (mid ± spread/2 ± slippage)
+        exec_price : float — price at which the trade executes
         txn_cost   : float — flat fee charged regardless of direction
         """
-        spread    = mid_price * (self.spread_bps  / 10_000)
-        slippage  = mid_price * (self.slippage_bps / 10_000)
-        txn_cost  = mid_price * (self.txn_cost_bps / 10_000)
+        state = self.current_state
+
+        # --- Static components -----------------------------------------
+        spread   = mid_price * (self.spread_bps  / 10_000)
+        txn_cost = mid_price * (self.txn_cost_bps / 10_000)
+
+        # --- Dynamic market impact slippage ----------------------------
+        # Volatility-based impact: higher realized vol → wider impact.
+        # Uses equity_vol from the previous step (lagged by one step because
+        # execute_exposure runs before the tracking section updates it).
+        equity_vol = getattr(state, "equity_vol", 0.0) if state else 0.0
+        vol_impact = equity_vol * self.impact_vol_coeff
+
+        # Order-flow imbalance impact: strong directional flow costs more.
+        pressure    = getattr(state, "pressure",    0.0) if state else 0.0
+        flow_impact = abs(pressure) * self.impact_flow_coeff
+
+        # Trade-size impact: larger exposure changes move the market more.
+        size_impact = abs(delta_exposure) * self.impact_size_coeff
+
+        # Liquidity adjustment: thin markets amplify all components.
+        # rolling_vol is the 20-bar average synthetic volume (raw, un-normalised).
+        rolling_vol = getattr(state, "rolling_vol", 0.0) if state else 0.0
+        liquidity   = max(rolling_vol, self.min_liquidity)
+        liq_factor  = 1.0 / liquidity
+
+        # Total impact (capped at 2% to prevent blow-up in the first 20 bars
+        # before rolling_vol has accumulated and liq_factor is still very large).
+        impact  = (vol_impact + flow_impact + size_impact) * liq_factor
+        impact  = min(impact, 0.02)
+
+        slippage = mid_price * impact
 
         if side == "buy":
             exec_price = mid_price + spread / 2 + slippage
@@ -272,6 +318,10 @@ class Simulation:
             self.broker.fill_resting_orders(price)
 
             # --- RL agent: ramp exposure toward target -------------------
+            # Store the current state so apply_microstructure() can read
+            # state.equity_vol / pressure / rolling_vol via self.current_state.
+            self.current_state = state
+
             # execute_exposure() returns the transaction cost it charged so
             # the reward calculation can subtract it in the same step.
             rl_txn_costs = {}

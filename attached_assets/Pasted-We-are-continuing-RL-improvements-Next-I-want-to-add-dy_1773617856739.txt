@@ -1,0 +1,124 @@
+We are continuing RL improvements.
+Next, I want to add dynamic market impact slippage to the environment.
+This slippage should increase when:
+
+    volatility is high
+
+    volume is low
+
+    the agent changes exposure aggressively
+
+    order‑flow imbalance is large
+
+This replaces the fixed slippage_bps with a dynamic, state‑dependent slippage model.
+
+All RL logic (C51, Dueling, PER, NoisyNets, N‑step, etc.) stays unchanged.
+
+Make the following edits:
+1. Add market‑impact parameters to simulation
+
+In simulation.py, inside __init__, add:
+python
+
+# --- Market impact parameters ---
+self.impact_vol_coeff = 0.5     # impact grows with volatility
+self.impact_flow_coeff = 0.3    # impact grows with order-flow imbalance
+self.impact_size_coeff = 1.0    # impact grows with exposure change size
+self.min_liquidity = 1e-6       # avoid division by zero
+
+These coefficients are tunable.
+2. Replace fixed slippage with dynamic slippage
+
+In simulation.py, update apply_microstructure() to compute slippage dynamically.
+
+Replace the old slippage calculation with:
+python
+
+# --- Dynamic market impact slippage ---
+# volatility-based impact
+vol_impact = state.equity_vol * self.impact_vol_coeff
+
+# order-flow imbalance impact
+flow_impact = abs(state.pressure) * self.impact_flow_coeff
+
+# trade-size impact (delta_exposure passed in by broker)
+size_impact = abs(delta_exposure) * self.impact_size_coeff
+
+# liquidity adjustment (rolling_vol is a proxy for liquidity)
+liquidity = max(state.rolling_vol, self.min_liquidity)
+liq_factor = 1.0 / liquidity
+
+# total impact multiplier
+impact = (vol_impact + flow_impact + size_impact) * liq_factor
+
+# convert to price impact
+slippage = mid_price * impact
+
+Then compute execution price as before:
+python
+
+if side == "buy":
+    exec_price = mid_price + spread/2 + slippage
+else:
+    exec_price = mid_price - spread/2 - slippage
+
+Return (exec_price, txn_cost) as before.
+3. Update broker to pass delta_exposure into apply_microstructure
+
+In broker.py, inside execute_exposure():
+
+Before calling the microstructure function, compute:
+python
+
+delta_exposure = exposure_change if delta > 0 else -exposure_change
+
+Then call:
+python
+
+exec_price, txn_cost = microstructure_fn(price, side, delta_exposure)
+
+(Modify the signature of apply_microstructure to accept delta_exposure.)
+4. Update apply_microstructure signature
+
+In simulation.py, change:
+python
+
+def apply_microstructure(self, mid_price, side):
+
+to:
+python
+
+def apply_microstructure(self, mid_price, side, delta_exposure):
+
+5. Keep reward logic unchanged except for txn_cost
+
+The dynamic slippage affects:
+
+    execution price
+
+    balance
+
+    realized PnL
+
+    equity
+
+    reward (via txn_cost subtraction already implemented)
+
+No additional reward changes are needed.
+6. Sanity checks
+
+After implementing, run main.py and confirm:
+
+    No NaNs
+
+    No crashes
+
+    Slippage increases when volatility spikes
+
+    Slippage increases when exposure changes are large
+
+    Slippage increases when volume is low
+
+    RLTrader becomes more conservative in thin markets
+
+    Reward reflects higher trading friction in stressed conditions
