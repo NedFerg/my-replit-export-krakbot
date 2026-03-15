@@ -1,3 +1,6 @@
+import collections
+import math
+
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
@@ -72,6 +75,13 @@ class Simulation:
         self.price_history = []
         self.regime_history = []
 
+        # --- Rolling volatility tracking ----------------------------------
+        # 1-step log-returns are stored; vols are computed from these each step.
+        self.short_vol_window = 5
+        self.long_vol_window = 20
+        self.return_history = collections.deque(maxlen=self.long_vol_window)
+        self._prev_price = None   # tracks last price for return computation
+
     def run(self):
         # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
@@ -88,6 +98,34 @@ class Simulation:
                 tick.drift,
                 tick.volatility,
             )
+
+            # --- Rolling realized volatility -----------------------------
+            # Compute 1-step return and update the rolling return history.
+            # Then attach short_vol and long_vol as extra state attributes
+            # so agents can consume them without changing the broker or
+            # MarketState class.
+            if self._prev_price is not None and self._prev_price > 0:
+                price_return = (price - self._prev_price) / self._prev_price
+            else:
+                price_return = 0.0
+            self.return_history.append(price_return)
+            self._prev_price = price
+
+            if len(self.return_history) >= self.short_vol_window:
+                short_slice = list(self.return_history)[-self.short_vol_window:]
+                short_mean = sum(short_slice) / len(short_slice)
+                short_var = sum((r - short_mean) ** 2 for r in short_slice) / max(len(short_slice) - 1, 1)
+                state.short_vol = math.sqrt(short_var)
+            else:
+                state.short_vol = 0.0
+
+            if len(self.return_history) >= self.long_vol_window:
+                long_slice = list(self.return_history)
+                long_mean = sum(long_slice) / len(long_slice)
+                long_var = sum((r - long_mean) ** 2 for r in long_slice) / max(len(long_slice) - 1, 1)
+                state.long_vol = math.sqrt(long_var)
+            else:
+                state.long_vol = 0.0
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order

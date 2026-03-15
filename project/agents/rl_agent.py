@@ -159,7 +159,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
-    FEATURE_DIM = 8
+    FEATURE_DIM = 10   # 8 base + 2 rolling volatility features (short_vol, long_vol)
 
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
@@ -327,13 +327,15 @@ class ReinforcementLearningTrader(TraderAgent):
         Features
         --------
         A. price_bucket  – normalized 1-step price return, 3dp.
-        B. vol_bucket    – current volatility, 3dp.
+        B. vol_bucket    – current regime volatility parameter, 3dp.
         C. drift_bucket  – current drift, 3dp.
         D. inv_bucket    – agent's integer position (raw).
         E. regime        – regime string (converted to float in state_to_vector).
         F. m1            – 1-step momentum if MarketState provides it, else 0.
         G. m3            – 3-step momentum if MarketState provides it, else 0.
         H. imbalance     – order-flow imbalance if MarketState provides it, else 0.
+        I. short_vol     – 5-step realized volatility from return history, capped at 0.1.
+        J. long_vol      – 20-step realized volatility from return history, capped at 0.1.
         """
         prev_price = agent.last_mid_price
         if prev_price is not None and prev_price > 0:
@@ -354,7 +356,17 @@ class ReinforcementLearningTrader(TraderAgent):
             if hasattr(market_state, "order_imbalance") else 0
         )
 
-        return (price_bucket, vol_bucket, drift_bucket, inv_bucket, regime, m1, m3, imbalance)
+        # Rolling realized volatility injected by the simulation each step.
+        # Capped at 0.1 to keep the feature in a consistent magnitude range
+        # regardless of extreme price moves.
+        short_vol = round(min(getattr(market_state, "short_vol", 0.0), 0.1), 5)
+        long_vol  = round(min(getattr(market_state, "long_vol",  0.0), 0.1), 5)
+
+        return (
+            price_bucket, vol_bucket, drift_bucket, inv_bucket, regime,
+            m1, m3, imbalance,
+            short_vol, long_vol,
+        )
 
     # ------------------------------------------------------------------
     # Feature vector conversion

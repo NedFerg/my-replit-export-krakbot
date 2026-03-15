@@ -1,0 +1,117 @@
+    We are continuing RL improvements.
+    Next, I want to enhance the environment state with volatility features and feed them into the RL agent.
+
+    Goal: add short‑term and long‑term realized volatility as features, while keeping all RL machinery (Dueling, C51, PER, NoisyNets, N‑step, etc.) unchanged.
+    1. Add rolling volatility tracking in the simulator
+
+    In simulation.py (or the main environment file where price steps are generated and the state is built):
+
+        Add imports and buffers near the top of the simulation class:
+
+    python
+
+    import collections
+    import math
+
+    In the simulator’s __init__, add:
+    python
+
+    self.short_vol_window = 5
+    self.long_vol_window = 20
+    self.return_history = collections.deque(maxlen=self.long_vol_window)
+
+        On each step, after you compute the new price and before you build the state dict, compute the 1‑step return and update the history:
+
+    python
+
+    price_return = (current_price - prev_price) / prev_price if prev_price != 0 else 0.0
+    self.return_history.append(price_return)
+
+        Compute short‑ and long‑term realized volatility (if enough data, else 0.0):
+
+    python
+
+    if len(self.return_history) >= self.short_vol_window:
+        short_slice = list(self.return_history)[-self.short_vol_window:]
+        short_mean = sum(short_slice) / len(short_slice)
+        short_var = sum((r - short_mean) ** 2 for r in short_slice) / max(len(short_slice) - 1, 1)
+        short_vol = math.sqrt(short_var)
+    else:
+        short_vol = 0.0
+
+    if len(self.return_history) >= self.long_vol_window:
+        long_slice = list(self.return_history)
+        long_mean = sum(long_slice) / len(long_slice)
+        long_var = sum((r - long_mean) ** 2 for r in long_slice) / max(len(long_slice) - 1, 1)
+        long_vol = math.sqrt(long_var)
+    else:
+        long_vol = 0.0
+
+        Add these to the state dict that is passed to the agent, e.g.:
+
+    python
+
+    state["short_vol"] = short_vol
+    state["long_vol"] = long_vol
+
+    Keep all existing state fields unchanged.
+    2. Wire volatility into the agent’s feature vector
+
+    In project/agents/rl_agent.py, update the RL agent’s feature engineering:
+
+        Increase feature_dim in ReinforcementLearningTrader.__init__ by 2 (e.g., from 8 → 10):
+
+    python
+
+    self.feature_dim = 10  # old value + 2 for short_vol, long_vol
+
+    Make sure this matches the actual number of features you build in state_to_vector.
+
+        Update state_to_vector (or equivalent) to append the new volatility features in a consistent order. For example, if you currently build something like:
+
+    python
+
+    features = [
+        state["price_norm"],
+        state["position"],
+        state["cash_norm"],
+        ...  # existing features
+    ]
+
+    extend it to:
+    python
+
+    short_vol = state.get("short_vol", 0.0)
+    long_vol = state.get("long_vol", 0.0)
+
+    # Optional: simple scaling to keep magnitudes reasonable
+    short_vol_scaled = min(short_vol, 0.1)
+    long_vol_scaled = min(long_vol, 0.1)
+
+    features = [
+        ...  # existing features, unchanged order
+        short_vol_scaled,
+        long_vol_scaled,
+    ]
+
+    Ensure the length of features matches self.feature_dim.
+    3. Keep all RL logic unchanged
+
+        Do not change replay, PER, N‑step, C51, NoisyNets, or the network architecture beyond the new input dimension.
+
+        The only structural change is that the input layer now sees 2 extra features.
+
+    4. Sanity check
+
+    After implementing, run project/main.py and confirm:
+
+        All 10 episodes run cleanly
+
+        No NaNs or exploding losses
+
+        Feature vector length matches feature_dim
+
+        Volatility values are finite and non‑crazy (log a few states if needed)
+
+    Please keep the code clean and consistent with the existing style.
+
