@@ -82,6 +82,12 @@ class Simulation:
         self.return_history = collections.deque(maxlen=self.long_vol_window)
         self._prev_price = None   # tracks last price for return computation
 
+        # --- Risk-aware reward: RL-agent equity tracking -----------------
+        # equity_peak and equity_history are reset each episode because a
+        # fresh Simulation is constructed per episode in main.py.
+        self.equity_peak = None
+        self.equity_history = []
+
     def run(self):
         # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
@@ -166,10 +172,45 @@ class Simulation:
                     new_encoded = agent.featurize_state(state, agent)
                     new_equity = agent.balance + agent.unrealized_pnl
 
+                    # --- Equity peak / drawdown ---------------------------
+                    self.equity_history.append(new_equity)
+                    if self.equity_peak is None:
+                        self.equity_peak = new_equity
+                    if new_equity > self.equity_peak:
+                        self.equity_peak = new_equity
+                    state.drawdown = max(0.0, self.equity_peak - new_equity)
+
+                    # --- Rolling equity-return volatility -----------------
+                    # Computed over the last vol_window 1-step equity returns.
+                    # Returns < 2 data points → vol is zero (no variance yet).
+                    _vol_window = 20
+                    if len(self.equity_history) >= 2:
+                        _returns = []
+                        for _i in range(1, len(self.equity_history)):
+                            _prev = self.equity_history[_i - 1]
+                            _curr = self.equity_history[_i]
+                            if _prev != 0:
+                                _returns.append((_curr - _prev) / _prev)
+                        if len(_returns) >= _vol_window:
+                            _slice = _returns[-_vol_window:]
+                            _mean = sum(_slice) / len(_slice)
+                            _var  = sum((r - _mean) ** 2 for r in _slice) / max(len(_slice) - 1, 1)
+                            state.equity_vol = math.sqrt(_var)
+                        else:
+                            state.equity_vol = 0.0
+                    else:
+                        state.equity_vol = 0.0
+
                     if agent.prev_state is not None:
-                        raw_reward = new_equity - agent.prev_equity
-                        # Shape reward: inventory penalty + volatility scaling
-                        reward = agent.compute_reward(raw_reward, state)
+                        # Risk-aware reward: raw PnL minus drawdown and
+                        # equity-volatility penalties.
+                        # Coefficients (0.1, 0.05) are tunable starting points.
+                        pnl_reward = new_equity - agent.prev_equity
+                        reward = (
+                            pnl_reward
+                            - 0.1 * state.drawdown
+                            - 0.05 * state.equity_vol
+                        )
                         # Store in replay buffer then learn from a random batch
                         done = (current_step == SIMULATION_STEPS - 1)
                         agent.add_experience(

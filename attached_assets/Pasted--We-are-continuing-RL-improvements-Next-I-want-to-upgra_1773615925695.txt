@@ -1,0 +1,101 @@
+    We are continuing RL improvements.
+    Next, I want to upgrade the reward function to be risk‑aware, while keeping all RL machinery (C51, Dueling, PER, NoisyNets, N‑step, Double‑Q, Polyak, replay throttling) unchanged.
+
+    The new reward should penalize drawdowns and equity volatility, not just reward raw PnL.
+    1. Add drawdown tracking in the simulator
+
+    In simulation.py, inside the simulation class __init__, add:
+    python
+
+    self.equity_peak = None
+    self.equity_history = []
+
+    Then, inside the main step loop (where equity is computed each step), after computing current equity:
+    python
+
+    # Track equity history
+    self.equity_history.append(equity)
+
+    # Initialize peak
+    if self.equity_peak is None:
+        self.equity_peak = equity
+
+    # Update peak
+    if equity > self.equity_peak:
+        self.equity_peak = equity
+
+    # Compute drawdown
+    drawdown = max(0.0, self.equity_peak - equity)
+    state.drawdown = drawdown
+
+    This attaches drawdown to the state object so the reward function can use it.
+    2. Add rolling equity volatility
+
+    Still inside the step loop, after updating equity_history:
+    python
+
+    vol_window = 20
+    if len(self.equity_history) >= 2:
+        returns = []
+        for i in range(1, len(self.equity_history)):
+            prev = self.equity_history[i-1]
+            curr = self.equity_history[i]
+            if prev != 0:
+                returns.append((curr - prev) / prev)
+
+        if len(returns) >= vol_window:
+            slice_r = returns[-vol_window:]
+            mean_r = sum(slice_r) / len(slice_r)
+            var_r = sum((r - mean_r)**2 for r in slice_r) / max(len(slice_r)-1, 1)
+            equity_vol = math.sqrt(var_r)
+        else:
+            equity_vol = 0.0
+    else:
+        equity_vol = 0.0
+
+    state.equity_vol = equity_vol
+
+    3. Replace the reward function with a risk‑aware version
+
+    In the place where reward is computed (usually inside simulation.py or wherever the environment returns reward), replace the old reward with:
+    python
+
+    # Base reward: change in equity
+    pnl_reward = equity - prev_equity
+
+    # Risk penalties
+    drawdown_penalty = 0.1 * state.drawdown
+    vol_penalty = 0.05 * state.equity_vol
+
+    reward = pnl_reward - drawdown_penalty - vol_penalty
+
+    Notes:
+
+        0.1 and 0.05 are reasonable starting coefficients.
+
+        You can tune them later.
+
+        This keeps reward scalar, so all RL code remains unchanged.
+
+    4. Keep the agent unchanged
+
+        No changes to rl_agent.py
+
+        No changes to C51, PER, N‑step, NoisyNets, or Dueling
+
+        The agent simply receives a better reward signal
+
+    5. Sanity check
+
+    After implementing, run project/main.py and confirm:
+
+        All 10 episodes run cleanly
+
+        No NaNs or exploding losses
+
+        Drawdown and equity_vol appear in state
+
+        Reward values remain finite
+
+        Behavior becomes smoother (less whiplash trading)
+
