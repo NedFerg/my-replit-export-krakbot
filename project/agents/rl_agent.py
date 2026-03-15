@@ -164,7 +164,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
-    FEATURE_DIM = 16   # 8 base + 2 rolling vol + 3 trend + 3 volume/order-flow
+    FEATURE_DIM = 56   # 16 SOL-only + 40 cross-asset (8 features × 5 assets)
 
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
@@ -327,8 +327,8 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         Convert raw market_state into a normalized feature tuple (length = FEATURE_DIM).
 
-        Features
-        --------
+        SOL-specific features (16)
+        --------------------------
         A. price_bucket  – normalized 1-step price return, 3dp.
         B. vol_bucket    – current regime volatility parameter, 3dp.
         C. drift_bucket  – current drift, 3dp.
@@ -337,14 +337,19 @@ class ReinforcementLearningTrader(TraderAgent):
         F. m1            – 1-step momentum if MarketState provides it, else 0.
         G. m3            – 3-step momentum if MarketState provides it, else 0.
         H. imbalance     – order-flow imbalance if MarketState provides it, else 0.
-        I. short_vol     – 5-step realized volatility from return history, capped at 0.1.
-        J. long_vol      – 20-step realized volatility from return history, capped at 0.1.
+        I. short_vol     – 5-step realized volatility, capped at 0.1.
+        J. long_vol      – 20-step realized volatility, capped at 0.1.
         K. mom_5         – 5-bar price momentum, clipped to ±0.2.
         L. mom_20        – 20-bar price momentum, clipped to ±0.2.
         M. mom_50        – 50-bar price momentum, clipped to ±0.2.
-        N. rolling_vol   – 20-bar avg synthetic volume, normalised by /1000, capped at 1.
-        O. vol_imbalance – per-step buy−sell volume, normalised by /1000, clipped to ±1.
-        P. pressure      – vol_imbalance / total_volume, naturally in (−1, +1).
+        N. rolling_vol   – 20-bar avg synthetic volume, normalised /1000, capped 1.
+        O. vol_imbalance – buy−sell volume, normalised /1000, clipped ±1.
+        P. pressure      – vol_imbalance / total_volume, in (−1, +1).
+
+        Cross-asset features (40 = 8 × 5 assets: SOL, XRP, LINK, ETH, BTC)
+        -----------------------------------------------------------------------
+        Per asset: price/1000, vol, mom_5/100, mom_20/100, mom_50/100,
+                   rolling_vol/1000, vol_imbalance/1000, pressure.
         """
         prev_price = agent.last_mid_price
         if prev_price is not None and prev_price > 0:
@@ -365,31 +370,41 @@ class ReinforcementLearningTrader(TraderAgent):
             if hasattr(market_state, "order_imbalance") else 0
         )
 
-        # Rolling realized volatility injected by the simulation each step.
-        # Capped at 0.1 to keep the feature in a consistent magnitude range
-        # regardless of extreme price moves.
         short_vol = round(min(getattr(market_state, "short_vol", 0.0), 0.1), 5)
         long_vol  = round(min(getattr(market_state, "long_vol",  0.0), 0.1), 5)
 
-        # Multi-timeframe trend momentum injected by the simulation each step.
-        # Clipped to ±0.2 so extreme short-term moves don't dominate the input.
         mom_5  = max(min(getattr(market_state, "mom_5",  0.0), 0.2), -0.2)
         mom_20 = max(min(getattr(market_state, "mom_20", 0.0), 0.2), -0.2)
         mom_50 = max(min(getattr(market_state, "mom_50", 0.0), 0.2), -0.2)
 
-        # Volume and order-flow features injected by the simulation.
-        # Normalised so magnitudes stay in the same range as other features.
         rolling_vol   = min(getattr(market_state, "rolling_vol",   0.0) / 1000.0, 1.0)
         vol_imbalance = max(min(getattr(market_state, "vol_imbalance", 0.0) / 1000.0, 1.0), -1.0)
         pressure      = max(min(getattr(market_state, "pressure",   0.0), 1.0), -1.0)
 
-        return (
+        # Base 16 SOL-specific features
+        features = [
             price_bucket, vol_bucket, drift_bucket, inv_bucket, regime,
             m1, m3, imbalance,
             short_vol, long_vol,
             mom_5, mom_20, mom_50,
             rolling_vol, vol_imbalance, pressure,
-        )
+        ]
+
+        # Cross-asset features: 8 per asset × 5 assets = 40 additional features.
+        # Normalisations mirror the SOL features to keep all inputs in similar ranges.
+        for a in ["SOL", "XRP", "LINK", "ETH", "BTC"]:
+            features.extend([
+                getattr(market_state, f"{a}_price",        0.0) / 1000.0,
+                getattr(market_state, f"{a}_vol",          0.0),
+                getattr(market_state, f"{a}_mom_5",        0.0) / 100.0,
+                getattr(market_state, f"{a}_mom_20",       0.0) / 100.0,
+                getattr(market_state, f"{a}_mom_50",       0.0) / 100.0,
+                getattr(market_state, f"{a}_rolling_vol",  0.0) / 1000.0,
+                getattr(market_state, f"{a}_vol_imbalance",0.0) / 1000.0,
+                getattr(market_state, f"{a}_pressure",     0.0),
+            ])
+
+        return tuple(features)
 
     # ------------------------------------------------------------------
     # Feature vector conversion

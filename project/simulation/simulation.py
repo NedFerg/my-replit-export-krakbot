@@ -2,6 +2,8 @@ import collections
 import math
 import random
 
+import numpy as np
+
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
@@ -115,6 +117,24 @@ class Simulation:
 
         # Populated in run() so apply_microstructure() can read it.
         self.current_state = None
+
+        # --- Multi-asset support (observation only) -----------------------
+        # The RL agent trades SOL exclusively; the other four assets are
+        # included in the state vector to give the agent cross-asset context.
+        self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC"]
+
+        self.asset_prices             = {a: [] for a in self.assets}
+        self.asset_returns            = {a: [] for a in self.assets}
+        self.asset_vol                = {a: 0.0 for a in self.assets}
+        self.asset_mom_5              = {a: 0.0 for a in self.assets}
+        self.asset_mom_20             = {a: 0.0 for a in self.assets}
+        self.asset_mom_50             = {a: 0.0 for a in self.assets}
+        self.asset_volume_history     = {a: [] for a in self.assets}
+        self.asset_buy_volume_history = {a: [] for a in self.assets}
+        self.asset_sell_volume_history= {a: [] for a in self.assets}
+        self.asset_rolling_vol        = {a: 0.0 for a in self.assets}
+        self.asset_vol_imbalance      = {a: 0.0 for a in self.assets}
+        self.asset_pressure           = {a: 0.0 for a in self.assets}
 
     # ------------------------------------------------------------------
     # Microstructure helper
@@ -283,6 +303,85 @@ class Simulation:
             state.rolling_vol   = rolling_vol
             state.vol_imbalance = vol_imbalance
             state.pressure      = pressure
+
+            # --- Multi-asset price updates --------------------------------
+            # SOL: map current tick price into asset_prices so the per-asset
+            # feature loops below can treat all assets uniformly.
+            self.asset_prices["SOL"].append(price)
+
+            # Non-SOL assets: generate correlated synthetic prices.
+            # Ordering matters: BTC first → ETH follows BTC → LINK & XRP
+            # follow ETH.  This ensures same-step correlation references are
+            # always populated before they are read.
+            for a in ["BTC", "ETH", "LINK", "XRP"]:
+                prev_a = self.asset_prices[a][-1] if self.asset_prices[a] else 100.0
+                if a == "BTC":
+                    a_drift = random.uniform(-0.002, 0.002)
+                elif a == "ETH":
+                    a_drift = (random.uniform(-0.003, 0.003)
+                               + 0.3 * (self.asset_prices["BTC"][-1] - prev_a) / prev_a)
+                else:  # LINK, XRP follow ETH
+                    a_drift = (random.uniform(-0.004, 0.004)
+                               + 0.2 * (self.asset_prices["ETH"][-1] - prev_a) / prev_a)
+                self.asset_prices[a].append(max(0.1, prev_a * (1 + a_drift)))
+
+            # --- Per-asset returns, volatility and momentum ---------------
+            for a in self.assets:
+                a_prices = self.asset_prices[a]
+                if len(a_prices) < 2:
+                    continue
+                a_ret = (a_prices[-1] - a_prices[-2]) / a_prices[-2]
+                self.asset_returns[a].append(a_ret)
+
+                a_rets = self.asset_returns[a]
+                self.asset_vol[a]    = float(np.std(a_rets[-20:])) if len(a_rets) >= 20 else 0.0
+                self.asset_mom_5[a]  = a_prices[-1] - a_prices[-5]  if len(a_prices) >= 5  else 0.0
+                self.asset_mom_20[a] = a_prices[-1] - a_prices[-20] if len(a_prices) >= 20 else 0.0
+                self.asset_mom_50[a] = a_prices[-1] - a_prices[-50] if len(a_prices) >= 50 else 0.0
+
+            # --- Per-asset synthetic volume and order-flow features -------
+            for a in self.assets:
+                if len(self.asset_prices[a]) < 2:
+                    continue
+                prev_ap = self.asset_prices[a][-2]
+                curr_ap = self.asset_prices[a][-1]
+
+                base_vol_a = max(1.0, abs(curr_ap - prev_ap) * 1000)
+                volume_a   = base_vol_a * random.uniform(0.8, 1.2)
+
+                if curr_ap > prev_ap:
+                    buy_a  = volume_a * random.uniform(0.55, 0.75)
+                    sell_a = volume_a - buy_a
+                elif curr_ap < prev_ap:
+                    sell_a = volume_a * random.uniform(0.55, 0.75)
+                    buy_a  = volume_a - sell_a
+                else:
+                    buy_a = sell_a = volume_a * 0.5
+
+                self.asset_volume_history[a].append(volume_a)
+                self.asset_buy_volume_history[a].append(buy_a)
+                self.asset_sell_volume_history[a].append(sell_a)
+
+                hist_a = self.asset_volume_history[a]
+                self.asset_rolling_vol[a] = sum(hist_a[-20:]) / 20 if len(hist_a) >= 20 else 0.0
+
+                imb_a   = buy_a - sell_a
+                denom_a = buy_a + sell_a
+                self.asset_vol_imbalance[a] = imb_a
+                self.asset_pressure[a]      = imb_a / denom_a if denom_a > 0 else 0.0
+
+            # --- Attach per-asset features to the state object -----------
+            for a in self.assets:
+                if not self.asset_prices[a]:
+                    continue
+                setattr(state, f"{a}_price",        self.asset_prices[a][-1])
+                setattr(state, f"{a}_vol",           self.asset_vol[a])
+                setattr(state, f"{a}_mom_5",         self.asset_mom_5[a])
+                setattr(state, f"{a}_mom_20",        self.asset_mom_20[a])
+                setattr(state, f"{a}_mom_50",        self.asset_mom_50[a])
+                setattr(state, f"{a}_rolling_vol",   self.asset_rolling_vol[a])
+                setattr(state, f"{a}_vol_imbalance", self.asset_vol_imbalance[a])
+                setattr(state, f"{a}_pressure",      self.asset_pressure[a])
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order
