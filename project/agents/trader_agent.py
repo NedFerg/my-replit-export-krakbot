@@ -1,15 +1,19 @@
+import random
+
 class TraderAgent:
     def __init__(self, name, balance):
         self.name = name
         self.balance = balance
-        self.position = 0  # positive = long, negative = short
+        self.position = 0
 
     def decide(self, market_price):
-        # Placeholder decision logic
-        # Later we can replace this with real strategy
-        if market_price < 100:
+        # 20% chance to buy if price is low
+        if market_price < 100 and random.random() < 0.2:
             return "buy"
-        elif market_price > 110:
+
+        # 20% chance to sell if price is high
+        if market_price > 110 and self.position > 0 and random.random() < 0.2:
             return "sell"
-        else:
-            return "hold"
+
+        # Otherwise hold
+        return "hold"
