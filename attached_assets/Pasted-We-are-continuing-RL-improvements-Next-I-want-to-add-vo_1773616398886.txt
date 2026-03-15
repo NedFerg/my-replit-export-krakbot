@@ -1,0 +1,134 @@
+We are continuing RL improvements.
+Next, I want to add volume and order‑flow features to the environment state and wire them into the RL agent’s feature vector.
+
+These features should be:
+
+    rolling volume (20‑bar)
+
+    volume imbalance (buy vs sell volume)
+
+    buy/sell pressure (normalized imbalance)
+
+All RL machinery (C51, Dueling, PER, NoisyNets, N‑step, etc.) stays unchanged.
+1. Add volume buffers in the simulator
+
+In simulation.py, inside the simulation class __init__, add:
+python
+
+self.volume_history = []
+self.buy_volume_history = []
+self.sell_volume_history = []
+self.volume_window = 20
+
+These track raw volume and directional flow.
+2. Generate synthetic buy/sell volume each step
+
+Inside the main step loop (same place where volatility and momentum are computed), after you compute the new price and before agents see the state, add:
+python
+
+# --- Volume and order-flow simulation ---
+# If your data already has volume, use it here. Otherwise generate synthetic volume.
+
+# Base volume proportional to volatility (more vol → more activity)
+base_vol = max(1.0, abs(price - prev_price) * 1000)
+
+# Random microstructure noise
+noise = random.uniform(0.8, 1.2)
+volume = base_vol * noise
+
+# Split into buy/sell volume using price movement direction
+if price > prev_price:
+    buy_vol = volume * random.uniform(0.55, 0.75)
+    sell_vol = volume - buy_vol
+elif price < prev_price:
+    sell_vol = volume * random.uniform(0.55, 0.75)
+    buy_vol = volume - sell_vol
+else:
+    # Flat price → balanced flow
+    buy_vol = volume * 0.5
+    sell_vol = volume * 0.5
+
+# Append to histories
+self.volume_history.append(volume)
+self.buy_volume_history.append(buy_vol)
+self.sell_volume_history.append(sell_vol)
+
+If you already have real volume data, replace the synthetic logic with your real values.
+3. Compute rolling volume + imbalance + pressure
+
+Still inside the step loop, after updating the histories:
+python
+
+# Rolling total volume
+if len(self.volume_history) >= self.volume_window:
+    vol_slice = self.volume_history[-self.volume_window:]
+    rolling_vol = sum(vol_slice) / len(vol_slice)
+else:
+    rolling_vol = 0.0
+
+# Volume imbalance: buy - sell
+vol_imbalance = buy_vol - sell_vol
+
+# Buy/sell pressure: normalized imbalance
+denom = buy_vol + sell_vol
+if denom > 0:
+    pressure = vol_imbalance / denom
+else:
+    pressure = 0.0
+
+# Attach to state
+state.rolling_vol = rolling_vol
+state.vol_imbalance = vol_imbalance
+state.pressure = pressure
+
+4. Update the agent’s feature vector
+
+In rl_agent.py, increase the feature dimension by 3 (for the three new volume features).
+
+If you currently have:
+python
+
+FEATURE_DIM = 13
+
+change it to:
+python
+
+FEATURE_DIM = 16
+
+Then update featurize_state to append the new features:
+python
+
+rolling_vol   = getattr(market_state, "rolling_vol", 0.0)
+vol_imbalance = getattr(market_state, "vol_imbalance", 0.0)
+pressure      = getattr(market_state, "pressure", 0.0)
+
+# Optional normalization / clipping
+rolling_vol   = min(rolling_vol / 1000.0, 1.0)
+vol_imbalance = max(min(vol_imbalance / 1000.0, 1.0), -1.0)
+pressure      = max(min(pressure, 1.0), -1.0)
+
+features.extend([rolling_vol, vol_imbalance, pressure])
+
+Keep the existing feature order unchanged — just append these at the end.
+5. Keep all RL logic unchanged
+
+    No changes to the neural network except the new input dimension
+
+    No changes to C51, PER, N‑step, NoisyNets, or Dueling
+
+    No changes to reward logic
+
+The agent simply receives richer state information.
+6. Sanity check
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes run cleanly
+
+    No NaNs or exploding losses
+
+    Feature vector length = 16
+
+    Volume and pressure values appear in state
+
+    Behavior becomes more liquidity‑aware

@@ -1,5 +1,6 @@
 import collections
 import math
+import random
 
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
@@ -93,6 +94,12 @@ class Simulation:
         # price_history (defined in __init__ above) stores raw prices per step
         # and is reused here for momentum lookback.
 
+        # --- Volume and order-flow tracking ------------------------------
+        self.volume_history = []
+        self.buy_volume_history = []
+        self.sell_volume_history = []
+        self.volume_window = 20
+
     def run(self):
         # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
@@ -149,6 +156,51 @@ class Simulation:
                 else:
                     mom = 0.0
                 setattr(state, f"mom_{w}", mom)
+
+            # --- Volume and order-flow simulation -------------------------
+            # prev_price: use the last entry in price_history (current price
+            # is not appended until end of loop, so [-1] is one step back).
+            _prev_p = self.price_history[-1] if self.price_history else price
+            _price_move = abs(price - _prev_p)
+
+            # Base volume proportional to absolute price move
+            # (more volatility → more microstructure activity).
+            base_vol = max(1.0, _price_move * 1000)
+            volume   = base_vol * random.uniform(0.8, 1.2)
+
+            # Split directionally: whichever side drove the move gets
+            # a majority share (55–75%); the other side absorbs the rest.
+            if price > _prev_p:
+                buy_vol  = volume * random.uniform(0.55, 0.75)
+                sell_vol = volume - buy_vol
+            elif price < _prev_p:
+                sell_vol = volume * random.uniform(0.55, 0.75)
+                buy_vol  = volume - sell_vol
+            else:
+                buy_vol  = volume * 0.5
+                sell_vol = volume * 0.5
+
+            self.volume_history.append(volume)
+            self.buy_volume_history.append(buy_vol)
+            self.sell_volume_history.append(sell_vol)
+
+            # Rolling average volume over the window
+            if len(self.volume_history) >= self.volume_window:
+                vol_slice   = self.volume_history[-self.volume_window:]
+                rolling_vol = sum(vol_slice) / len(vol_slice)
+            else:
+                rolling_vol = 0.0
+
+            # Imbalance: signed difference between buy and sell pressure
+            vol_imbalance = buy_vol - sell_vol
+
+            # Pressure: imbalance normalised to [−1, +1]
+            _denom   = buy_vol + sell_vol
+            pressure = vol_imbalance / _denom if _denom > 0 else 0.0
+
+            state.rolling_vol   = rolling_vol
+            state.vol_imbalance = vol_imbalance
+            state.pressure      = pressure
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order
