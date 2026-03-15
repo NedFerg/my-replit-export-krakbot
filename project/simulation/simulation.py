@@ -88,6 +88,11 @@ class Simulation:
         self.equity_peak = None
         self.equity_history = []
 
+        # --- Multi-timeframe trend windows --------------------------------
+        self.trend_windows = [5, 20, 50]
+        # price_history (defined in __init__ above) stores raw prices per step
+        # and is reused here for momentum lookback.
+
     def run(self):
         # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
@@ -132,6 +137,18 @@ class Simulation:
                 state.long_vol = math.sqrt(long_var)
             else:
                 state.long_vol = 0.0
+
+            # --- Multi-timeframe momentum ---------------------------------
+            # price_history does NOT yet contain the current price (it is
+            # appended at the end of the loop), so self.price_history[-w]
+            # is exactly the price w steps ago — no off-by-one adjustment.
+            for w in self.trend_windows:
+                if len(self.price_history) >= w:
+                    past_price = self.price_history[-w]
+                    mom = (price - past_price) / past_price if past_price != 0 else 0.0
+                else:
+                    mom = 0.0
+                setattr(state, f"mom_{w}", mom)
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order

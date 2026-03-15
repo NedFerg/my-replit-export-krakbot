@@ -1,0 +1,99 @@
+We are continuing RL improvements.
+Next, I want to add multi‑timeframe trend features to the environment state and wire them into the RL agent’s feature vector.
+
+These trend features should be:
+
+    5‑bar momentum
+
+    20‑bar momentum
+
+    50‑bar momentum
+
+All RL machinery (C51, Dueling, PER, NoisyNets, N‑step, etc.) stays unchanged.
+1. Add rolling price history in the simulator
+
+In simulation.py, inside the simulation class __init__, add:
+python
+
+self.trend_windows = [5, 20, 50]
+self.price_history = []
+
+(If price_history already exists, reuse it — just ensure it stores raw prices each step.)
+2. Compute multi‑timeframe momentum each step
+
+Inside the main step loop (the same place where volatility and drawdown are computed), after updating the current price, add:
+python
+
+# Track raw prices
+self.price_history.append(current_price)
+
+# Compute multi-timeframe momentum
+momentums = {}
+for w in self.trend_windows:
+    if len(self.price_history) > w:
+        past_price = self.price_history[-w-1]
+        if past_price != 0:
+            mom = (current_price - past_price) / past_price
+        else:
+            mom = 0.0
+    else:
+        mom = 0.0
+    momentums[w] = mom
+
+# Attach to state
+state.mom_5 = momentums[5]
+state.mom_20 = momentums[20]
+state.mom_50 = momentums[50]
+
+These are simple percentage‑change momentums over different horizons.
+3. Update the agent’s feature vector
+
+In rl_agent.py, increase the feature dimension by 3 (for the three new trend features).
+
+If you currently have:
+python
+
+FEATURE_DIM = 10
+
+change it to:
+python
+
+FEATURE_DIM = 13
+
+Then update featurize_state to append the new trend features:
+python
+
+mom_5  = getattr(market_state, "mom_5", 0.0)
+mom_20 = getattr(market_state, "mom_20", 0.0)
+mom_50 = getattr(market_state, "mom_50", 0.0)
+
+# Optional clipping to keep magnitudes stable
+mom_5  = max(min(mom_5,  0.2), -0.2)
+mom_20 = max(min(mom_20, 0.2), -0.2)
+mom_50 = max(min(mom_50, 0.2), -0.2)
+
+features.extend([mom_5, mom_20, mom_50])
+
+Keep the existing feature order unchanged — just append these at the end.
+4. Keep all RL logic unchanged
+
+    No changes to the neural network except the new input dimension
+
+    No changes to C51, PER, N‑step, NoisyNets, or Dueling
+
+    No changes to reward logic
+
+The agent simply receives richer state information.
+5. Sanity check
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes run cleanly
+
+    No NaNs or exploding losses
+
+    Feature vector length = 13
+
+    Trend values appear in state
+
+    Behavior becomes more stable and directional

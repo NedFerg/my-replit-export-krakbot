@@ -159,7 +159,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
-    FEATURE_DIM = 10   # 8 base + 2 rolling volatility features (short_vol, long_vol)
+    FEATURE_DIM = 13   # 8 base + 2 rolling vol (short_vol, long_vol) + 3 trend (mom_5, mom_20, mom_50)
 
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
@@ -336,6 +336,9 @@ class ReinforcementLearningTrader(TraderAgent):
         H. imbalance     – order-flow imbalance if MarketState provides it, else 0.
         I. short_vol     – 5-step realized volatility from return history, capped at 0.1.
         J. long_vol      – 20-step realized volatility from return history, capped at 0.1.
+        K. mom_5         – 5-bar price momentum, clipped to ±0.2.
+        L. mom_20        – 20-bar price momentum, clipped to ±0.2.
+        M. mom_50        – 50-bar price momentum, clipped to ±0.2.
         """
         prev_price = agent.last_mid_price
         if prev_price is not None and prev_price > 0:
@@ -362,10 +365,17 @@ class ReinforcementLearningTrader(TraderAgent):
         short_vol = round(min(getattr(market_state, "short_vol", 0.0), 0.1), 5)
         long_vol  = round(min(getattr(market_state, "long_vol",  0.0), 0.1), 5)
 
+        # Multi-timeframe trend momentum injected by the simulation each step.
+        # Clipped to ±0.2 so extreme short-term moves don't dominate the input.
+        mom_5  = max(min(getattr(market_state, "mom_5",  0.0), 0.2), -0.2)
+        mom_20 = max(min(getattr(market_state, "mom_20", 0.0), 0.2), -0.2)
+        mom_50 = max(min(getattr(market_state, "mom_50", 0.0), 0.2), -0.2)
+
         return (
             price_bucket, vol_bucket, drift_bucket, inv_bucket, regime,
             m1, m3, imbalance,
             short_vol, long_vol,
+            mom_5, mom_20, mom_50,
         )
 
     # ------------------------------------------------------------------
