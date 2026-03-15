@@ -1,5 +1,7 @@
 import random
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,7 +10,72 @@ from agents.trader_agent import TraderAgent
 
 
 # ---------------------------------------------------------------------------
-# Dueling Q-Network
+# Noisy linear layer (NoisyNet)
+# ---------------------------------------------------------------------------
+
+class NoisyLinear(nn.Module):
+    """
+    Linear layer with parametric noise on weights and biases.
+
+    During training each forward pass adds Gaussian noise scaled by learned
+    sigma parameters, giving the network state-dependent stochasticity.
+    During evaluation (inference / target network) only the mean parameters
+    (weight_mu, bias_mu) are used, making the output deterministic.
+
+    Noise buffers are refreshed by calling reset_noise() — this happens once
+    per training step in update_q() so that exploration varies every update.
+
+    Parameters
+    ----------
+    sigma_init : initial value for all sigma parameters.  0.017 keeps the
+                 initial noise small relative to a typical weight magnitude
+                 of ±1/√fan_in, so early training is stable.
+    """
+
+    def __init__(self, in_features, out_features, sigma_init=0.017):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Learnable mean and sigma parameters
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+
+        # Noise samples (not learnable — refreshed each step)
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+
+        self.reset_parameters(sigma_init)
+        self.reset_noise()
+
+    def reset_parameters(self, sigma_init):
+        mu_range = 1.0 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(sigma_init)
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(sigma_init)
+
+    def reset_noise(self):
+        """Sample fresh factorised Gaussian noise for weights and biases."""
+        epsilon_in = torch.randn(self.in_features)
+        epsilon_out = torch.randn(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, x):
+        if self.training:
+            w = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            b = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            w = self.weight_mu
+            b = self.bias_mu
+        return torch.nn.functional.linear(x, w, b)
+
+
+# ---------------------------------------------------------------------------
+# Dueling Q-Network (with NoisyLinear value/advantage heads)
 # ---------------------------------------------------------------------------
 
 class DuelingQNetwork(nn.Module):
@@ -41,18 +108,18 @@ class DuelingQNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # Value stream V(s) — scalar per state
+        # Value stream V(s) — scalar per state (NoisyLinear heads)
         self.value = nn.Sequential(
-            nn.Linear(64, 32),
+            NoisyLinear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
+            NoisyLinear(32, 1),
         )
 
-        # Advantage stream A(s, a) — one value per action
+        # Advantage stream A(s, a) — one value per action (NoisyLinear heads)
         self.advantage = nn.Sequential(
-            nn.Linear(64, 32),
+            NoisyLinear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, output_dim),
+            NoisyLinear(32, output_dim),
         )
 
     def forward(self, x):
@@ -61,6 +128,12 @@ class DuelingQNetwork(nn.Module):
         A = self.advantage(f)                      # (batch, n_actions)
         A_mean = A.mean(dim=1, keepdim=True)       # (batch, 1)
         return V + (A - A_mean)                    # (batch, n_actions)
+
+    def reset_noise(self):
+        """Resample noise buffers in every NoisyLinear layer."""
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +544,10 @@ class ReinforcementLearningTrader(TraderAgent):
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        # Resample noise in both networks so exploration varies each step
+        self.q_net.reset_noise()
+        self.target_q_net.reset_noise()
 
         # Soft-update target network toward live network (Polyak)
         with torch.no_grad():

@@ -1,0 +1,143 @@
+We are continuing RL improvements.
+Next, I want to add Noisy Networks (NoisyLinear layers) to replace the standard Linear layers in the dueling DQN.
+
+This will give the agent learned, state‑dependent exploration and eventually allow us to remove epsilon‑greedy.
+
+Please implement the following changes cleanly and consistently.
+1. Add a NoisyLinear layer implementation
+
+In project/agents/rl_agent.py, above the DuelingQNetwork class, add:
+python
+
+class NoisyLinear(nn.Module):
+    def __init__(self, in_features, out_features, sigma_init=0.017):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        # Learnable parameters
+        self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
+        self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias_mu = nn.Parameter(torch.empty(out_features))
+        self.bias_sigma = nn.Parameter(torch.empty(out_features))
+
+        # Noise buffers (not parameters)
+        self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
+        self.register_buffer("bias_epsilon", torch.empty(out_features))
+
+        self.reset_parameters(sigma_init)
+        self.reset_noise()
+
+    def reset_parameters(self, sigma_init):
+        mu_range = 1 / math.sqrt(self.in_features)
+        self.weight_mu.data.uniform_(-mu_range, mu_range)
+        self.weight_sigma.data.fill_(sigma_init)
+        self.bias_mu.data.uniform_(-mu_range, mu_range)
+        self.bias_sigma.data.fill_(sigma_init)
+
+    def reset_noise(self):
+        epsilon_in = torch.randn(self.in_features)
+        epsilon_out = torch.randn(self.out_features)
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, x):
+        if self.training:
+            w = self.weight_mu + self.weight_sigma * self.weight_epsilon
+            b = self.bias_mu + self.bias_sigma * self.bias_epsilon
+        else:
+            w = self.weight_mu
+            b = self.bias_mu
+        return torch.nn.functional.linear(x, w, b)
+
+This is the standard NoisyNet layer from the original paper.
+2. Modify DuelingQNetwork to use NoisyLinear
+
+Replace all nn.Linear layers in the value and advantage streams with NoisyLinear.
+
+The shared feature trunk stays the same.
+
+Update the class to:
+python
+
+class DuelingQNetwork(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+
+        self.feature = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+
+        self.value = nn.Sequential(
+            NoisyLinear(64, 32),
+            nn.ReLU(),
+            NoisyLinear(32, 1),
+        )
+
+        self.advantage = nn.Sequential(
+            NoisyLinear(64, 32),
+            nn.ReLU(),
+            NoisyLinear(32, output_dim),
+        )
+
+    def forward(self, x):
+        f = self.feature(x)
+        V = self.value(f)
+        A = self.advantage(f)
+        A_mean = A.mean(dim=1, keepdim=True)
+        return V + (A - A_mean)
+
+    def reset_noise(self):
+        for module in self.modules():
+            if isinstance(module, NoisyLinear):
+                module.reset_noise()
+
+3. Reset noise every training step
+
+In update_q(), after optimizer.step(), add:
+python
+
+self.q_net.reset_noise()
+self.target_q_net.reset_noise()
+
+This ensures fresh exploration each step.
+4. Keep epsilon‑greedy for now
+
+Do not remove epsilon yet.
+
+After confirming stability, we can phase it out.
+5. Everything else stays unchanged
+
+    Double‑Q
+
+    PER
+
+    target network Polyak updates
+
+    replay
+
+    reward shaping
+
+    feature engineering
+
+All remain exactly as they are.
+6. Sanity check
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes run cleanly
+
+    No NaNs
+
+    No exploding losses
+
+    Exploration visibly changes (more stochasticity)
+
+    PER still updates priorities
+
+    Double‑Q still works
+
+    Target network still tracks smoothly
