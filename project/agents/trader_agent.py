@@ -15,6 +15,10 @@ class TraderAgent:
     def decide(self, market_price):
         raise NotImplementedError("Subclasses must implement decide()")
 
+    def update_unrealized_pnl(self, market_price):
+        # Unrealized PnL = value of open position
+        self.unrealized_pnl = self.position * market_price
+
 
 class ValueTrader(TraderAgent):
     def decide(self, price):
