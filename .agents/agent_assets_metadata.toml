@@ -5,16 +5,16 @@ generated = []
 id = "t1TYtYcgvWAK8H6PA4I7f"
 uri = "file://project/price_chart.png"
 type = "image"
-title = "Price History with Regime Shading"
+title = "Price History — BULL regime"
 
 [[outputs]]
 id = "vTjFQNCNfzcGLRr2KE5U5"
 uri = "file://project/equity_curves.png"
 type = "image"
-title = "Agent Equity Curves"
+title = "Agent Equity Curves (incl. RLTrader)"
 
 [[outputs]]
 id = "00WQvsPKTdtRnqD4QWk4T"
 uri = "file://project/drawdowns.png"
 type = "image"
-title = "Agent Drawdowns"
+title = "Agent Drawdowns (incl. RLTrader)"

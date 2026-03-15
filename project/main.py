@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
 from simulation.simulation import Simulation
+from agents.rl_agent import ReinforcementLearningTrader
 
 
 REGIME_COLORS = {
@@ -35,7 +36,6 @@ def plot_price_chart(price_history, regime_history):
     shade_regimes(ax, regime_history)
     ax.plot(price_history, color="black", linewidth=1.2, label="Price")
 
-    # Legend: regime patches + price line
     patches = [
         mpatches.Patch(color=REGIME_COLORS[r], alpha=0.4, label=r.replace("_", " ").title())
         for r in REGIME_COLORS
@@ -55,11 +55,12 @@ def plot_price_chart(price_history, regime_history):
 
 def plot_equity_curves(agents):
     fig, ax = plt.subplots(figsize=(12, 5))
-    colors = ["steelblue", "darkorange", "seagreen"]
+    colors = ["steelblue", "darkorange", "seagreen", "crimson"]
     for agent, color in zip(agents, colors):
         ax.plot(agent.equity_history, label=agent.name, color=color, linewidth=1.5)
-    ax.axhline(y=agent.equity_history[0], color="gray", linestyle="--",
-               linewidth=0.8, label="Starting equity")
+    if agents:
+        ax.axhline(y=agents[0].equity_history[0], color="gray", linestyle="--",
+                   linewidth=0.8, label="Starting equity")
     ax.set_title("Agent Equity Curves")
     ax.set_xlabel("Time Step")
     ax.set_ylabel("Equity")
@@ -73,7 +74,7 @@ def plot_equity_curves(agents):
 
 def plot_drawdowns(agents):
     fig, ax = plt.subplots(figsize=(12, 5))
-    colors = ["steelblue", "darkorange", "seagreen"]
+    colors = ["steelblue", "darkorange", "seagreen", "crimson"]
     for agent, color in zip(agents, colors):
         equity = agent.equity_history
         peak = equity[0]
@@ -112,10 +113,13 @@ def main():
     for agent in agents:
         total_equity = agent.balance + agent.unrealized_pnl
         print(f"{agent.name}:")
-        print(f"  Realized PnL: {agent.realized_pnl:.2f}")
+        print(f"  Realized PnL:   {agent.realized_pnl:.2f}")
         print(f"  Unrealized PnL: {agent.unrealized_pnl:.2f}")
-        print(f"  Final Balance: {agent.balance:.2f}")
-        print(f"  Total Equity: {total_equity:.2f}\n")
+        print(f"  Final Balance:  {agent.balance:.2f}")
+        print(f"  Total Equity:   {total_equity:.2f}")
+        if isinstance(agent, ReinforcementLearningTrader):
+            print(f"  Q-table states: {len(agent.q_table)}")
+        print()
 
     print("Generating charts...")
     plot_price_chart(price_history, regime_history)

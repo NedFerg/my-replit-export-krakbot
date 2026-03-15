@@ -1,0 +1,113 @@
+We now have a fully instrumented market simulation with order book, regimes, and charts.
+The next step is to add our first reinforcement‑learning trading agent.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add a new file: project/agents/rl_agent.py
+
+Create a class ReinforcementLearningTrader(TraderAgent) that:
+A. Inherits from TraderAgent
+B. Maintains a Q‑table (dictionary)
+python
+
+self.q_table = {}  # key: state tuple, value: dict of action->Q
+self.alpha = 0.1   # learning rate
+self.gamma = 0.95  # discount factor
+self.epsilon = 0.1 # exploration rate
+
+C. Defines a discretized state from MarketState
+
+Use a helper method:
+python
+
+def encode_state(self, market_state):
+    # discretize mid price into buckets of 5
+    price_bucket = int(market_state.mid_price // 5)
+    # discretize spread into buckets
+    spread_bucket = int((market_state.spread or 0) // 1)
+    # encode regime directly
+    regime = market_state.regime
+    return (price_bucket, spread_bucket, regime)
+
+D. Defines the action space
+python
+
+actions = ["buy", "sell", "hold"]
+
+E. Implements epsilon‑greedy action selection
+python
+
+def decide(self, market_state):
+    state = self.encode_state(market_state)
+    if random.random() < self.epsilon:
+        return random.choice(self.actions)
+    qvals = self.q_table.get(state, {})
+    if not qvals:
+        return random.choice(self.actions)
+    return max(qvals, key=qvals.get)
+
+F. Implements Q‑learning updates
+
+Add a method:
+python
+
+def update_q(self, prev_state, action, reward, new_state):
+    qvals = self.q_table.setdefault(prev_state, {a: 0.0 for a in self.actions})
+    next_qvals = self.q_table.get(new_state, {a: 0.0 for a in self.actions})
+    best_next = max(next_qvals.values())
+    qvals[action] += self.alpha * (reward + self.gamma * best_next - qvals[action])
+
+G. Reward function
+
+Reward = change in total equity:
+python
+
+reward = new_equity - old_equity
+
+Store self.prev_state, self.prev_equity, and self.prev_action each step.
+2. Integrate RL agent into the simulation
+
+In project/simulation/simulation.py:
+
+After each agent acts and after PnL is updated, add:
+python
+
+if isinstance(agent, ReinforcementLearningTrader):
+    new_state = state
+    new_equity = agent.balance + agent.position * state.mid_price
+    reward = new_equity - agent.prev_equity
+    agent.update_q(agent.prev_state, agent.prev_action, reward, new_state)
+    agent.prev_state = new_state
+    agent.prev_equity = new_equity
+
+Initialize these fields at the start of the run.
+3. Add RL agent to main.py
+
+In project/main.py:
+
+    Import the RL agent
+
+    Add one instance to the agent list, e.g.:
+
+python
+
+agents = [
+    ValueTrader("ValueTrader"),
+    MomentumTrader("MomentumTrader"),
+    RandomTrader("RandomTrader"),
+    ReinforcementLearningTrader("RLTrader")
+]
+
+Ensure the RL agent’s equity history is recorded like the others.
+4. Run the simulation and verify
+
+After implementing, run project/main.py and confirm:
+
+    RLTrader appears in the performance summary
+
+    RLTrader has an equity curve
+
+    RLTrader’s Q‑table grows during the run
+
+    No runtime errors
+
+Please implement this cleanly and keep the code readable.
