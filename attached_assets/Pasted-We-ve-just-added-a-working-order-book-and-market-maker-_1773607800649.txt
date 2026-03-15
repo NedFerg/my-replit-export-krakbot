@@ -1,0 +1,110 @@
+We’ve just added a working order book and market maker. Now I want agents to become order‑book aware instead of only looking at the last traded price.
+
+Goal: Introduce a MarketState object that exposes order book info (best bid/ask, spread, etc.), pass it into agents, and update their strategies to use it.
+
+Please do the following changes cleanly and consistently across the project.
+1. Add a MarketState structure
+
+In a suitable shared place (for example project/exchange/exchange.py or a new file like project/market_state.py), define a simple class or dataclass called MarketState with at least these fields:
+
+    last_price: float — the last traded price or current market price
+
+    best_bid: float | None
+
+    best_ask: float | None
+
+    spread: float | None (best_ask - best_bid if both exist)
+
+    mid_price: float | None (average of best bid/ask if both exist, else last_price)
+
+    bid_size: int — total quantity at best bid
+
+    ask_size: int — total quantity at best ask
+
+Implement a helper function or method to construct this from the order book and current price.
+2. Expose market state from the Exchange
+
+In project/exchange/exchange.py:
+
+    Add a method on Exchange, e.g. get_market_state(current_price) -> MarketState, which:
+
+        Reads best bid/ask and depth from the OrderBook
+
+        Computes spread and mid price
+
+        Returns a MarketState instance
+
+Keep this method read‑only with respect to the book (no side effects).
+3. Pass MarketState into agents in the simulation loop
+
+In project/simulation/simulation.py:
+
+    In the main simulation loop, after getting the current price from MarketAgent, call something like:
+
+        state = exchange.get_market_state(price)
+
+    For each agent:
+
+        Instead of action = agent.decide(price), change it to action = agent.decide(state)
+
+        If you still use update_last_price, update it based on state.mid_price or state.last_price (pick one and be consistent).
+
+    Update exchange.process_order(...) to accept MarketState or at least the current price as before; keep behavior consistent with the new call site.
+
+The goal: each agent’s decide method now receives a MarketState object instead of a bare price.
+4. Update TraderAgent and strategy subclasses to use MarketState
+
+In project/agents/trader_agent.py:
+
+    Change the base class signature from decide(self, price) to decide(self, market_state).
+
+    Update all subclasses (ValueTrader, MomentumTrader, RandomTrader) accordingly.
+
+For now, keep the logic simple but make it use MarketState fields:
+
+    ValueTrader:
+
+        Use market_state.mid_price (or last_price if mid is None) as price.
+
+        Buy when price is below some threshold (e.g. 95).
+
+        Sell when price is above some threshold (e.g. 110).
+
+        Optionally, you can make it more conservative when the spread is wide (e.g. don’t trade if spread is too large).
+
+    MomentumTrader:
+
+        Track last mid price (or last trade price) per agent.
+
+        Use market_state.mid_price as the current reference.
+
+        Buy when current mid > last mid (upward momentum).
+
+        Sell when current mid < last mid and the agent has a position.
+
+        You can optionally make it more active when bid/ask sizes show strong imbalance (e.g. more bids than asks).
+
+    RandomTrader:
+
+        Still mostly random, but you can optionally:
+
+            Trade more when spread is tight (cheap to cross).
+
+            Trade less when spread is wide.
+
+Make sure all these classes compile and their logic uses market_state instead of a raw price.
+5. Keep everything else working
+
+    Ensure PnL tracking, order book matching, and the performance summary in main.py still work without modification.
+
+    The only behavioral change should be that agents now have access to richer information (best bid/ask, spread, depth) via MarketState.
+
+    Run project/main.py at the end and confirm:
+
+        Trades still occur.
+
+        No runtime errors.
+
+        Agents’ behavior is still reasonable, but now based on order‑book‑aware logic.
+
+Please implement this cleanly and keep the code readable and consistent with the existing style.

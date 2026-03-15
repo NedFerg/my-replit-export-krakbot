@@ -1,3 +1,21 @@
+class MarketState:
+    """Snapshot of the order book and market at a point in time."""
+
+    def __init__(self, last_price, best_bid, best_ask, bid_size, ask_size):
+        self.last_price = last_price
+        self.best_bid = best_bid
+        self.best_ask = best_ask
+        self.bid_size = bid_size
+        self.ask_size = ask_size
+
+        if best_bid is not None and best_ask is not None:
+            self.spread = round(best_ask - best_bid, 4)
+            self.mid_price = round((best_bid + best_ask) / 2, 4)
+        else:
+            self.spread = None
+            self.mid_price = last_price
+
+
 class _MarketMaker:
     """Provides two-sided liquidity as counterparty of last resort."""
     name = "MarketMaker"
@@ -58,7 +76,7 @@ class OrderBook:
             buyer = best_bid.agent
             seller = best_ask.agent
 
-            # Update buyer (skip balance/PnL updates for market maker)
+            # Update buyer
             buyer.balance -= trade_price * trade_qty
             buyer.position += trade_qty
             buyer.realized_pnl -= trade_price * trade_qty
@@ -88,6 +106,19 @@ class Exchange:
         self.trade_log = []
         self.order_book = OrderBook(self.trade_log)
         self._mm = _MarketMaker()
+
+    def get_market_state(self, current_price) -> MarketState:
+        """Build a read-only MarketState snapshot from the current order book."""
+        # Exclude market maker orders — show only agent-submitted depth
+        agent_bids = [o for o in self.order_book.bids if o.agent is not self._mm]
+        agent_asks = [o for o in self.order_book.asks if o.agent is not self._mm]
+
+        best_bid = agent_bids[0].price if agent_bids else None
+        best_ask = agent_asks[0].price if agent_asks else None
+        bid_size = agent_bids[0].quantity if agent_bids else 0
+        ask_size = agent_asks[0].quantity if agent_asks else 0
+
+        return MarketState(current_price, best_bid, best_ask, bid_size, ask_size)
 
     def process_order(self, agent, action, market_price):
         """Submit a limit order and attempt agent-to-agent matching."""

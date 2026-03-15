@@ -22,17 +22,20 @@ class Simulation:
             # Update market price
             price = self.exchange.update_market()
 
-            # Each agent decides and submits orders
+            # Build order-book-aware market state for agents
+            state = self.exchange.get_market_state(price)
+
+            # Each agent decides using full market state
             for agent in self.agents:
-                action = agent.decide(price)
+                action = agent.decide(state)
                 self.exchange.process_order(agent, action, price)
 
             # Fill any unmatched orders via market maker
             self.exchange.fill_resting_orders(price)
 
-            # Update tracking for next step
+            # Update tracking for next step (use mid_price for momentum reference)
             for agent in self.agents:
-                agent.update_last_price(price)
+                agent.update_last_price(state.mid_price)
                 agent.update_unrealized_pnl(price)
 
         return self.exchange.trade_log
