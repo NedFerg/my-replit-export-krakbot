@@ -331,7 +331,11 @@ class ReinforcementLearningTrader(TraderAgent):
         s2_vec = self.state_to_vector(new_state)
 
         current_q = self.q_value(s_vec, action)
-        max_next_q = max(self.target_q_value(s2_vec, a) for a in self.actions)
+
+        # Double-Q: live network selects the action, target network evaluates it.
+        # This decouples selection from evaluation, reducing overestimation bias.
+        best_next_action = max(self.actions, key=lambda a: self.q_value(s2_vec, a))
+        max_next_q = self.target_q_value(s2_vec, best_next_action)
 
         td_target = reward + self.gamma * max_next_q
         soft_target = (1.0 - self.tau) * current_q + self.tau * td_target
