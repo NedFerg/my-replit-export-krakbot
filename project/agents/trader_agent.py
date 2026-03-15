@@ -6,6 +6,8 @@ class TraderAgent:
         self.balance = balance
         self.position = 0
         self.last_price = None
+        self.realized_pnl = 0
+        self.unrealized_pnl = 0
 
     def update_last_price(self, price):
         self.last_price = price
