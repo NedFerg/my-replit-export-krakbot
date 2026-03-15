@@ -1,0 +1,85 @@
+We’re continuing RL improvements.
+Next, I want to add eligibility traces (Q(λ)) to the ReinforcementLearningTrader so it can better learn from delayed rewards.
+
+Please implement the following changes cleanly and consistently.
+1. Add eligibility trace structures to the RL agent
+
+In project/agents/rl_agent.py, inside ReinforcementLearningTrader.__init__:
+
+    Add:
+    python
+
+    self.lambda_ = 0.8  # eligibility trace decay
+    self.eligibilities = {}  # (state, action) -> e_t
+
+    Keep λ configurable as a class attribute or constructor parameter so it’s easy to tune.
+
+2. Maintain eligibilities during learning
+
+Add a helper method, e.g. update_eligibilities(state, action) that:
+python
+
+def update_eligibilities(self, state, action):
+    # decay all existing eligibilities
+    for key in list(self.eligibilities.keys()):
+        self.eligibilities[key] *= self.gamma * self.lambda_
+        if self.eligibilities[key] < 1e-6:
+            del self.eligibilities[key]
+
+    # increment eligibility for the current (state, action)
+    key = (state, action)
+    self.eligibilities[key] = self.eligibilities.get(key, 0.0) + 1.0
+
+Call this from the learning path whenever a new transition is processed (inside the replay/update logic).
+3. Modify Q‑updates to use eligibility traces
+
+In the existing update_q(prev_state, action, reward, new_state) method:
+
+    Compute the TD error as before:
+    python
+
+    td_target = reward + self.gamma * max_next_q
+    td_error = td_target - current_q
+
+    Instead of updating only Q[prev_state, action], update all (s, a) pairs in self.eligibilities:
+    python
+
+    for (s, a), e in self.eligibilities.items():
+        self.q_table[(s, a)] = self.q_table.get((s, a), 0.0) + self.alpha * td_error * e
+
+This implements Q(λ) with accumulating traces.
+4. Integrate traces with replay
+
+In replay() where you loop over sampled transitions and call update_q(...):
+
+    Before calling update_q(...) for each sampled transition, call:
+    python
+
+    self.update_eligibilities(prev_state, action)
+
+    Then call update_q(prev_state, action, reward, new_state) as modified above.
+
+This ensures each sampled transition updates the trace structure and propagates TD error through recent state‑action pairs.
+5. Reset eligibilities per episode
+
+In reset_for_new_episode():
+
+    Add:
+    python
+
+    self.eligibilities.clear()
+
+This prevents traces from leaking across episodes.
+6. Keep behavior stable
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes still run cleanly.
+
+    Q‑table still grows.
+
+    No runtime errors from the new eligibility structure.
+
+    Learning remains stable (no exploding Q‑values).
+
+Please keep the code clean and consistent with the existing style.

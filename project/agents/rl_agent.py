@@ -12,9 +12,15 @@ class ReinforcementLearningTrader(TraderAgent):
         super().__init__(name, balance, latency)
 
         # Q-table and learning hyper-parameters (persist across episodes)
+        # q_table structure: {state_tuple: {action: q_value}}
         self.q_table = {}
         self.alpha = 0.1    # learning rate
         self.gamma = 0.95   # discount factor
+
+        # Eligibility traces for Q(λ)
+        # Stored as {(state_tuple, action): eligibility_value}
+        self.lambda_ = 0.8          # trace decay — higher = longer credit assignment
+        self.eligibilities = {}     # reset each episode to prevent trace leakage
 
         # Epsilon-greedy exploration with per-episode decay
         self.epsilon = 0.10
@@ -39,12 +45,16 @@ class ReinforcementLearningTrader(TraderAgent):
 
         Persisted across episodes: Q-table, replay buffer, epsilon
         (epsilon decays here rather than being reset).
+
+        Eligibilities are cleared per episode: traces accumulated in one
+        episode should not propagate credit into the next.
         """
         super().reset_for_new_episode()
         self.last_mid_price = None
         self.prev_state = None
         self.prev_action = None
         self.prev_equity = None
+        self.eligibilities.clear()
         # Decay exploration rate — more exploitation as agent matures
         self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
 
@@ -145,6 +155,33 @@ class ReinforcementLearningTrader(TraderAgent):
         return reward * vol_scale
 
     # ------------------------------------------------------------------
+    # Eligibility traces
+    # ------------------------------------------------------------------
+
+    def update_eligibilities(self, state, action):
+        """
+        Maintain accumulating eligibility traces for Q(λ).
+
+        Step 1 — decay all existing traces by γλ; prune those that have
+        fallen below a negligible threshold to keep the dict compact.
+
+        Step 2 — increment the trace for the (state, action) pair that
+        was just visited (accumulating-trace variant).
+
+        This means recently visited pairs receive a stronger update when
+        the TD error is back-propagated in update_q(), giving the agent
+        multi-step credit assignment without storing full trajectories.
+        """
+        decay = self.gamma * self.lambda_
+        for key in list(self.eligibilities.keys()):
+            self.eligibilities[key] *= decay
+            if self.eligibilities[key] < 1e-6:
+                del self.eligibilities[key]
+
+        key = (state, action)
+        self.eligibilities[key] = self.eligibilities.get(key, 0.0) + 1.0
+
+    # ------------------------------------------------------------------
     # Experience replay
     # ------------------------------------------------------------------
 
@@ -162,7 +199,13 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def replay(self):
         """
-        Sample a random mini-batch from the buffer and apply Q-updates.
+        Sample a random mini-batch and apply Q(λ) updates.
+
+        For each sampled transition:
+          1. update_eligibilities() — decay existing traces and boost the
+             visited (state, action) pair.
+          2. update_q() — compute one TD error and propagate it through
+             all currently eligible (state, action) pairs.
 
         No-ops until at least batch_size transitions have been collected,
         which avoids biased updates on a nearly-empty buffer.
@@ -171,15 +214,36 @@ class ReinforcementLearningTrader(TraderAgent):
             return
         batch = random.sample(self.replay_buffer, self.batch_size)
         for prev_state, action, reward, new_state in batch:
+            self.update_eligibilities(prev_state, action)
             self.update_q(prev_state, action, reward, new_state)
 
     # ------------------------------------------------------------------
-    # Q-learning core
+    # Q(λ) core update
     # ------------------------------------------------------------------
 
     def update_q(self, prev_state, action, reward, new_state):
-        """Standard Q-learning (Bellman) update."""
-        qvals = self.q_table.setdefault(prev_state, {a: 0.0 for a in self.actions})
-        next_qvals = self.q_table.get(new_state, {a: 0.0 for a in self.actions})
-        best_next = max(next_qvals.values())
-        qvals[action] += self.alpha * (reward + self.gamma * best_next - qvals[action])
+        """
+        Q(λ) update: compute one TD error and broadcast it across all
+        currently eligible (state, action) pairs weighted by their trace.
+
+        TD error:
+            δ = (reward + γ · max_a Q(new_state, a)) − Q(prev_state, action)
+
+        Update rule for every eligible pair (s, a):
+            Q(s, a) += α · δ · e(s, a)
+
+        The q_table is a nested dict {state: {action: value}} so that
+        decide() and encode_state() require no changes.  Entries for
+        states not yet in the table are initialised to zero on first write.
+        """
+        # Compute the TD error from this specific transition
+        current_q = self.q_table.get(prev_state, {}).get(action, 0.0)
+        next_qvals = self.q_table.get(new_state, {})
+        best_next = max(next_qvals.values()) if next_qvals else 0.0
+        td_error = (reward + self.gamma * best_next) - current_q
+
+        # Propagate TD error to all eligible (state, action) pairs
+        for (s, a), e in self.eligibilities.items():
+            if s not in self.q_table:
+                self.q_table[s] = {act: 0.0 for act in self.actions}
+            self.q_table[s][a] += self.alpha * td_error * e
