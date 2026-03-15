@@ -1,0 +1,81 @@
+We are continuing RL improvements.
+Next, I want to add a target network to the ReinforcementLearningTrader so that Q‑value targets are computed from a slowly updated copy of the weights.
+
+Please implement the following changes cleanly and consistently.
+1. Add a target‑network weight set
+
+In project/agents/rl_agent.py, inside ReinforcementLearningTrader.__init__, add:
+python
+
+# Target network (same shape as main weights)
+self.target_weights = {a: w.copy() for a, w in self.weights.items()}
+
+# Target network update parameters
+self.target_update_tau = 0.01   # Polyak averaging rate for target network
+self.target_update_interval = 1 # update every N replay steps (keep simple: 1 = every replay)
+self.replay_steps = 0
+
+This creates a stable copy of the weights that updates slowly.
+2. Add a helper to compute Q‑values using the target network
+
+Add:
+python
+
+def target_q_value(self, state_vec, action):
+    w = self.target_weights[action]
+    return sum(w[i] * state_vec[i] for i in range(len(w)))
+
+3. Modify TD target to use the target network
+
+In update_q(prev_state, action, reward, new_state), replace:
+python
+
+max_next_q = max(self.q_value(s2_vec, a) for a in self.actions)
+
+with:
+python
+
+max_next_q = max(self.target_q_value(s2_vec, a) for a in self.actions)
+
+This is the core DQN idea: targets come from the target network, not the live network.
+4. Add Polyak averaging updates for the target network
+
+After finishing the weight updates inside update_q(), add:
+python
+
+# Soft-update target network
+for a in self.actions:
+    for i in range(self.feature_dim):
+        self.target_weights[a][i] = (
+            (1 - self.target_update_tau) * self.target_weights[a][i]
+            + self.target_update_tau * self.weights[a][i]
+        )
+
+This keeps the target network slowly tracking the main network.
+5. Update replay() to count steps
+
+In replay(), after processing each sampled transition, increment:
+python
+
+self.replay_steps += 1
+
+(We are using continuous Polyak updates, so no interval gating is required, but keeping the counter is useful for future extensions.)
+6. Keep behavior stable
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes run cleanly
+
+    No exploding weights
+
+    Target network updates smoothly
+
+    Replay buffer still works
+
+    Eligibility traces still work
+
+    Soft updates still work
+
+    Epsilon decay still works
+
+Please keep the code clean and consistent with the existing style.

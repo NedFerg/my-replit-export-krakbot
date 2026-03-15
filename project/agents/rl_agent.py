@@ -25,6 +25,14 @@ class ReinforcementLearningTrader(TraderAgent):
         self.feature_dim = self.FEATURE_DIM
         self.weights = {a: [0.0] * self.feature_dim for a in self.actions}
 
+        # Target network — same shape as main weights, updated slowly.
+        # TD targets are computed from target_weights so they are stable
+        # across consecutive updates (core DQN idea).
+        self.target_weights = {a: w[:] for a, w in self.weights.items()}
+        self.target_update_tau = 0.01       # Polyak rate for target network
+        self.target_update_interval = 1     # update every N replay steps
+        self.replay_steps = 0               # cumulative replay step counter
+
         # Learning hyper-parameters
         self.alpha = 0.01   # learning rate (smaller than tabular — LFA is noisier)
         self.gamma = 0.95   # discount factor
@@ -180,12 +188,23 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def q_value(self, state_vec, action):
         """
-        Compute Q(s, a) = w_a · x(s) via dot product.
+        Compute Q(s, a) = w_a · x(s) via dot product (live network).
 
         state_vec must be the output of state_to_vector() — a plain list of
         floats of length self.feature_dim.
         """
         w = self.weights[action]
+        return sum(w[i] * state_vec[i] for i in range(self.feature_dim))
+
+    def target_q_value(self, state_vec, action):
+        """
+        Compute Q(s, a) using the target network weights.
+
+        Used exclusively for building TD targets in update_q() so that the
+        bootstrap value is not moving during the weight update — this is the
+        stabilisation mechanism from DQN.
+        """
+        w = self.target_weights[action]
         return sum(w[i] * state_vec[i] for i in range(self.feature_dim))
 
     # ------------------------------------------------------------------
@@ -278,6 +297,7 @@ class ReinforcementLearningTrader(TraderAgent):
         for prev_state, action, reward, new_state in batch:
             self.update_eligibilities(prev_state, action)
             self.update_q(prev_state, action, reward, new_state)
+            self.replay_steps += 1
 
     # ------------------------------------------------------------------
     # Linear Q(λ) weight update
@@ -311,7 +331,7 @@ class ReinforcementLearningTrader(TraderAgent):
         s2_vec = self.state_to_vector(new_state)
 
         current_q = self.q_value(s_vec, action)
-        max_next_q = max(self.q_value(s2_vec, a) for a in self.actions)
+        max_next_q = max(self.target_q_value(s2_vec, a) for a in self.actions)
 
         td_target = reward + self.gamma * max_next_q
         soft_target = (1.0 - self.tau) * current_q + self.tau * td_target
@@ -324,3 +344,11 @@ class ReinforcementLearningTrader(TraderAgent):
             step = self.alpha * td_error * e
             for i in range(self.feature_dim):
                 w[i] += step * s_vec_e[i]
+
+        # Soft-update target network toward main network (Polyak averaging)
+        tau = self.target_update_tau
+        for a in self.actions:
+            tw = self.target_weights[a]
+            mw = self.weights[a]
+            for i in range(self.feature_dim):
+                tw[i] = (1.0 - tau) * tw[i] + tau * mw[i]
