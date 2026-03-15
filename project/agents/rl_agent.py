@@ -152,10 +152,15 @@ class DuelingQNetwork(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ReinforcementLearningTrader(TraderAgent):
-    actions = ["buy", "sell", "hold"]
+    IS_RL_AGENT = True   # tells the exchange not to mutate self.position
+
+    # 5 discrete target-exposure levels the agent can select each step.
+    # Action index → target exposure in [-1, +1].
+    ACTION_TO_EXPOSURE = {0: -1.0, 1: -0.5, 2: 0.0, 3: 0.5, 4: 1.0}
+    num_actions = 5   # number of discrete actions (used to build the network)
 
     # Reward shaping coefficients — class-level for easy tuning
-    INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of absolute position
+    INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of absolute exposure
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
@@ -166,11 +171,9 @@ class ReinforcementLearningTrader(TraderAgent):
 
         self.feature_dim = self.FEATURE_DIM
 
-        # ---------------------------------------------------------------
-        # Action ↔ index mappings (needed for tensor indexing)
-        # ---------------------------------------------------------------
-        self.action_to_index = {a: i for i, a in enumerate(self.actions)}
-        self.index_to_action = {i: a for a, i in self.action_to_index.items()}
+        # Current target exposure set by decide() each step.
+        # The broker's execute_exposure() will ramp self.position toward this.
+        self.target_exposure = 0.0
 
         # ---------------------------------------------------------------
         # Neural Q-networks (live and target)
@@ -195,10 +198,10 @@ class ReinforcementLearningTrader(TraderAgent):
         self.support = self.support.to(self.device)
 
         self.q_net = DuelingQNetwork(
-            self.feature_dim, len(self.actions), self.num_atoms
+            self.feature_dim, self.num_actions, self.num_atoms
         ).to(self.device)
         self.target_q_net = DuelingQNetwork(
-            self.feature_dim, len(self.actions), self.num_atoms
+            self.feature_dim, self.num_actions, self.num_atoms
         ).to(self.device)
         self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.target_q_net.eval()
@@ -329,7 +332,7 @@ class ReinforcementLearningTrader(TraderAgent):
         A. price_bucket  – normalized 1-step price return, 3dp.
         B. vol_bucket    – current regime volatility parameter, 3dp.
         C. drift_bucket  – current drift, 3dp.
-        D. inv_bucket    – agent's integer position (raw).
+        D. inv_bucket    – agent's current exposure in [-1, +1] (float).
         E. regime        – regime string (converted to float in state_to_vector).
         F. m1            – 1-step momentum if MarketState provides it, else 0.
         G. m3            – 3-step momentum if MarketState provides it, else 0.
@@ -352,7 +355,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
         vol_bucket = round(market_state.volatility, 3)
         drift_bucket = round(market_state.drift, 3)
-        inv_bucket = int(agent.position)
+        inv_bucket = agent.position   # exposure float, already in [-1, +1]
         regime = market_state.regime
 
         m1 = round(market_state.momentum_1, 3) if hasattr(market_state, "momentum_1") else 0
@@ -423,32 +426,32 @@ class ReinforcementLearningTrader(TraderAgent):
         support = self.support.view(1, 1, -1)           # [1, 1, num_atoms]
         return (probs * support).sum(dim=-1)            # [batch, num_actions]
 
-    def q_value(self, state_vec, action):
+    def q_value(self, state_vec, action_idx):
         """
         Expected Q(s, a) from the live network (no grad, inference only).
 
+        action_idx : int in [0, num_actions)
         Returns a plain Python float.
         """
-        idx = self.action_to_index[action]
         x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             logits = self.q_net(x)                      # [1, num_actions, num_atoms]
             q_vals = self._dist_to_q_values(logits)     # [1, num_actions]
-        return q_vals[0, idx].item()
+        return q_vals[0, action_idx].item()
 
-    def target_q_value(self, state_vec, action):
+    def target_q_value(self, state_vec, action_idx):
         """
         Expected Q(s, a) from the target network (no grad, inference only).
 
+        action_idx : int in [0, num_actions)
         Used exclusively for action evaluation in update_q() so that the
         bootstrap signal comes from a stable, slowly-updated copy.
         """
-        idx = self.action_to_index[action]
         x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             logits = self.target_q_net(x)
             q_vals = self._dist_to_q_values(logits)
-        return q_vals[0, idx].item()
+        return q_vals[0, action_idx].item()
 
     # ------------------------------------------------------------------
     # Action selection
@@ -458,7 +461,11 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         Epsilon-greedy action selection using the live Q-network.
 
-        Greedy action: argmax_a Q(s, a) via live network.
+        Returns an integer action index in [0, num_actions).
+        Also sets self.target_exposure = ACTION_TO_EXPOSURE[action_idx]
+        so the broker knows which exposure level to move toward.
+
+        Greedy: single forward pass → argmax over 5 expected Q-values.
         """
         state_tuple = self.featurize_state(market_state, self)
 
@@ -466,10 +473,18 @@ class ReinforcementLearningTrader(TraderAgent):
         self.last_mid_price = market_state.mid_price
 
         if random.random() < self.epsilon:
-            return random.choice(self.actions)
+            action_idx = random.randrange(self.num_actions)
+        else:
+            state_vec = self.state_to_vector(state_tuple)
+            x = torch.tensor(state_vec, dtype=torch.float32,
+                              device=self.device).unsqueeze(0)
+            with torch.no_grad():
+                logits = self.q_net(x)                      # [1, 5, 51]
+                q_vals = self._dist_to_q_values(logits)     # [1, 5]
+            action_idx = int(q_vals[0].argmax().item())
 
-        state_vec = self.state_to_vector(state_tuple)
-        return max(self.actions, key=lambda a: self.q_value(state_vec, a))
+        self.target_exposure = self.ACTION_TO_EXPOSURE[action_idx]
+        return action_idx
 
     # ------------------------------------------------------------------
     # Reward shaping
@@ -644,7 +659,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
         x  = torch.tensor(s_vec,  dtype=torch.float32, device=self.device).unsqueeze(0)
         x2 = torch.tensor(s2_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-        a_idx = torch.tensor([self.action_to_index[action]], device=self.device)
+        a_idx = torch.tensor([action], device=self.device)   # action is int 0-4
         r = torch.tensor([reward], dtype=torch.float32, device=self.device)
 
         # --- Live network forward (gradient tracked) ---

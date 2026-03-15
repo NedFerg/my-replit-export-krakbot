@@ -115,13 +115,17 @@ class OrderBook:
             buyer = best_bid.agent
             seller = best_ask.agent
 
-            # --- Apply position and cash changes at actual execution price ---
+            # --- Apply cash changes at actual execution price ---
+            # Position is only mutated for classical (non-RL) agents.
+            # The RL agent manages its own exposure float via the broker.
             buyer.balance -= cost
-            buyer.position += trade_qty
+            if not getattr(buyer, 'IS_RL_AGENT', False):
+                buyer.position += trade_qty
             buyer.realized_pnl -= cost
 
             seller.balance += cost
-            seller.position -= trade_qty
+            if not getattr(seller, 'IS_RL_AGENT', False):
+                seller.position -= trade_qty
             seller.realized_pnl += cost
 
             # --- Taker fees (market maker is exempt) -----------------------
@@ -218,7 +222,7 @@ class Exchange:
             self.order_book.add_order(order)
             return self.order_book.match()
 
-        elif action == "sell" and agent.position > 0:
+        elif action == "sell" and (getattr(agent, 'IS_RL_AGENT', False) or agent.position > 0):
             order = Order(agent, "sell", exec_price)
             self.order_book.add_order(order)
             return self.order_book.match()

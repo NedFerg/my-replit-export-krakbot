@@ -2,11 +2,13 @@ import random
 
 
 class TraderAgent:
+    IS_RL_AGENT = False   # overridden to True in ReinforcementLearningTrader
+
     def __init__(self, name, balance, latency=0):
         self.name = name
         self.initial_balance = balance  # preserved for episode resets
         self.balance = balance
-        self.position = 0
+        self.position = 0.0   # float: share count for classical agents, exposure [-1,+1] for RL
         self.last_price = None  # tracks last mid_price for momentum comparison
         self.realized_pnl = 0
         self.unrealized_pnl = 0
@@ -28,7 +30,7 @@ class TraderAgent:
     def reset_for_new_episode(self):
         """Reset per-episode state while keeping anything that persists (e.g. a Q-table)."""
         self.balance = self.initial_balance
-        self.position = 0
+        self.position = 0.0
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
         self.equity_history = []

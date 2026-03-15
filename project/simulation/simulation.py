@@ -223,13 +223,22 @@ class Simulation:
                 action = agent.decide(state)
                 step_actions[agent] = action
 
-                if action != "hold":
+                if isinstance(agent, ReinforcementLearningTrader):
+                    # RL agent manages exposure directly via execute_exposure();
+                    # it does not go through the latency queue or order book.
+                    pass
+                elif action != "hold":
                     intent = OrderIntent(side=action, quantity=1, price=price)
                     deliver_step = current_step + agent.latency
                     self.latency_queue.append((deliver_step, agent, intent))
 
             # --- End-of-step settlement via broker -----------------------
             self.broker.fill_resting_orders(price)
+
+            # --- RL agent: ramp exposure toward target -------------------
+            for agent in self.agents:
+                if isinstance(agent, ReinforcementLearningTrader):
+                    self.broker.execute_exposure(agent, price)
 
             # --- Tracking + Q-learning update ----------------------------
             for agent in self.agents:

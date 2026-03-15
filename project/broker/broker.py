@@ -28,6 +28,14 @@ class Broker(ABC):
         """Settle any unmatched resting orders at end of step.
         Returns a list of Fill objects from the final match."""
 
+    @abstractmethod
+    def execute_exposure(self, agent, price) -> None:
+        """
+        For exposure-based agents: ramp agent.position toward
+        agent.target_exposure and update it directly.
+        No-ops for classical (non-RL) agents.
+        """
+
     @property
     @abstractmethod
     def trade_log(self):
@@ -58,6 +66,31 @@ class SimulatedBroker(Broker):
 
     def fill_resting_orders(self, price) -> list:
         return self._exchange.fill_resting_orders(price)
+
+    def execute_exposure(self, agent, price) -> None:
+        """
+        Ramp agent.position (exposure float in [-1, +1]) toward
+        agent.target_exposure using up to max_steps increments of 1/max_steps.
+
+        No exchange order book is involved — the position is updated directly.
+        This keeps the exposure model clean and independent of the order-book
+        integer semantics used by classical agents.
+
+        Idempotent when abs(delta) < 0.05 (dead-band to avoid churning).
+        """
+        delta = agent.target_exposure - agent.position
+        if abs(delta) < 0.05:
+            return
+
+        max_steps = 3
+        # Number of unit steps to take this call (proportional to delta)
+        steps = int(round(abs(delta) * max_steps))
+        exposure_change = steps * (1.0 / max_steps)
+
+        if delta > 0:
+            agent.position = min(1.0, agent.position + exposure_change)
+        else:
+            agent.position = max(-1.0, agent.position - exposure_change)
 
     @property
     def trade_log(self):

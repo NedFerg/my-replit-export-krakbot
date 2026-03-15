@@ -1,0 +1,151 @@
+We are upgrading the trading environment to use exposure‑based positions instead of integer share counts, and adding 5 discrete position‑sizing actions.
+
+Exposure will be a float in the range [-1.0, +1.0], and the RL agent will choose one of five target exposures:
+Code
+
+0 → -1.0   (full short)
+1 → -0.5   (half short)
+2 →  0.0   (flat)
+3 → +0.5   (half long)
+4 → +1.0   (full long)
+
+The exchange should no longer mutate position.
+The RLTrader will manage its own exposure and the broker will execute trades to move toward the target exposure.
+
+Make the following edits:
+1. Modify TraderAgent to use exposure instead of share count
+
+In trader_agent.py:
+Change initialization
+python
+
+self.position = 0.0   # exposure, not share count
+
+Change reset
+python
+
+self.position = 0.0
+
+Keep unrealized PnL logic the same
+python
+
+self.unrealized_pnl = self.position * market_price
+
+This now means “exposure × price”.
+2. Stop the exchange from mutating position
+
+In exchange.py, inside OrderBook.match():
+Remove or comment out these lines:
+python
+
+buyer.position  += trade_qty
+seller.position -= trade_qty
+
+Remove the long‑only restriction
+
+Find:
+python
+
+elif action == "sell" and agent.position > 0:
+
+Replace with:
+python
+
+elif action == "sell":
+
+After this, the exchange only moves cash, not position.
+3. Add 5 discrete sizing actions to RLTrader
+
+In rl_agent.py:
+Set number of actions to 5
+
+Where RLTrader defines its action count, change to:
+python
+
+self.num_actions = 5
+
+Add mapping from action index → target exposure
+
+Add this constant inside RLTrader:
+python
+
+ACTION_TO_EXPOSURE = {
+    0: -1.0,
+    1: -0.5,
+    2:  0.0,
+    3:  0.5,
+    4:  1.0,
+}
+
+In decide(), convert action index to target exposure
+
+After selecting the action index:
+python
+
+target_exposure = ACTION_TO_EXPOSURE[action_idx]
+self.target_exposure = target_exposure
+
+4. Update the broker to trade toward target exposure
+
+In the broker (the component that submits orders each step):
+Compute desired exposure change
+python
+
+delta = agent.target_exposure - agent.position
+
+If small, do nothing
+python
+
+if abs(delta) < 0.05:
+    return
+
+Convert delta into number of unit orders
+
+Use a simple proportional rule:
+python
+
+max_steps = 3   # how aggressively to move toward target
+steps = int(round(abs(delta) * max_steps))
+
+Submit buy/sell orders
+python
+
+if delta > 0:
+    for _ in range(steps):
+        submit_order(agent, "buy", quantity=1)
+else:
+    for _ in range(steps):
+        submit_order(agent, "sell", quantity=1)
+
+After fills, update exposure manually
+
+Inside the broker, after processing fills:
+python
+
+agent.position += filled_buys * (1.0 / max_steps)
+agent.position -= filled_sells * (1.0 / max_steps)
+
+This keeps exposure in sync with executed trades.
+5. Keep equity logic unchanged
+
+Because equity is already:
+python
+
+equity = balance + position * price
+
+…and position is now exposure, this works automatically.
+6. Sanity checks after implementation
+
+Run main.py and verify:
+
+    No NaNs
+
+    No crashes
+
+    RLTrader now shows exposure values like −0.5, +1.0, etc.
+
+    Exchange no longer changes position
+
+    Broker moves exposure toward target
+
+    Equity curve remains stable
