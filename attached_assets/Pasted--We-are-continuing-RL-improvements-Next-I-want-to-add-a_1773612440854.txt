@@ -1,0 +1,114 @@
+    We are continuing RL improvements.
+    Next, I want to add a feature‑engineering layer that converts raw market state into a normalized, discretized state tuple before the RL agent uses it.
+
+    Please implement the following changes cleanly and consistently.
+    1. Add a feature‑engineering method to the RL agent
+
+    In project/agents/rl_agent.py, inside ReinforcementLearningTrader, add a method:
+    python
+
+    def featurize_state(self, market_state, agent):
+        """
+        Convert raw market_state into a normalized, discretized state tuple.
+        """
+
+    Implement the following features:
+    A. Price change (normalized)
+    python
+
+    price_change = (market_state.price - market_state.prev_price) / max(market_state.prev_price, 1e-6)
+    price_bucket = round(price_change, 3)
+
+    B. Volatility bucket
+    python
+
+    vol_bucket = round(market_state.volatility, 3)
+
+    C. Drift bucket
+    python
+
+    drift_bucket = round(market_state.drift, 3)
+
+    D. Inventory bucket
+    python
+
+    inv_bucket = int(agent.position)
+
+    E. Regime (categorical)
+
+    Use the existing regime string directly:
+    python
+
+    regime = market_state.regime
+
+    F. Momentum features
+
+    Add 1‑step and 3‑step returns if available:
+    python
+
+    m1 = round(market_state.momentum_1, 3) if hasattr(market_state, "momentum_1") else 0
+    m3 = round(market_state.momentum_3, 3) if hasattr(market_state, "momentum_3") else 0
+
+    G. Order‑flow imbalance (if available)
+    python
+
+    imbalance = round(market_state.order_imbalance, 3) if hasattr(market_state, "order_imbalance") else 0
+
+    Final state tuple
+    python
+
+    return (
+        price_bucket,
+        vol_bucket,
+        drift_bucket,
+        inv_bucket,
+        regime,
+        m1,
+        m3,
+        imbalance,
+    )
+
+    2. Modify the RL agent to use featurized states
+
+    In all places where the RL agent currently uses market_state directly as a state key (e.g., in decide(), add_experience(), update_q()), replace raw state usage with:
+    python
+
+    state = self.featurize_state(market_state, self)
+
+    This ensures the Q‑table keys are the engineered feature tuples.
+    3. Update Simulation to pass featurized states
+
+    In project/simulation/simulation.py, wherever the RL agent receives a state for:
+
+        deciding an action
+
+        computing reward
+
+        adding experience
+
+        replay
+
+    Replace raw state with:
+    python
+
+    state = agent.featurize_state(market_state, agent)
+
+    This keeps the RL pipeline consistent.
+    4. Keep behavior stable
+
+    After implementing, run project/main.py and confirm:
+
+        All 10 episodes run cleanly
+
+        Q‑table still grows, but with fewer noisy states
+
+        Replay buffer still fills and samples
+
+        Eligibility traces still work
+
+        Soft updates still work
+
+        Epsilon decay still works
+
+    Please keep the code clean and consistent with the existing style.
+

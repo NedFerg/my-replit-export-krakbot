@@ -117,14 +117,72 @@ class ReinforcementLearningTrader(TraderAgent):
         )
 
     # ------------------------------------------------------------------
+    # Feature engineering
+    # ------------------------------------------------------------------
+
+    def featurize_state(self, market_state, agent):
+        """
+        Convert raw market_state into a normalized, discretized state tuple
+        suitable for use as a Q-table key.
+
+        Features
+        --------
+        A. price_bucket  – normalized 1-step price change, rounded to 3dp.
+                           Uses agent.last_mid_price as the previous price;
+                           0.0 when no previous price is available.
+        B. vol_bucket    – current volatility, rounded to 3dp.
+        C. drift_bucket  – current drift, rounded to 3dp.
+        D. inv_bucket    – agent's integer position (raw, unclamped).
+        E. regime        – categorical regime string from MarketAgent.
+        F. m1            – 1-step momentum if provided by MarketState, else 0.
+        G. m3            – 3-step momentum if provided by MarketState, else 0.
+        H. imbalance     – order-flow imbalance if provided, else 0.
+
+        Optional attributes (m1, m3, imbalance) are gated with hasattr so the
+        method works without any changes to MarketState.  When those fields are
+        added to MarketState in the future, they will be picked up automatically.
+        """
+        # A. Normalized price change
+        prev_price = agent.last_mid_price
+        if prev_price is not None and prev_price > 0:
+            price_change = (market_state.mid_price - prev_price) / max(prev_price, 1e-6)
+        else:
+            price_change = 0.0
+        price_bucket = round(price_change, 3)
+
+        # B. Volatility
+        vol_bucket = round(market_state.volatility, 3)
+
+        # C. Drift
+        drift_bucket = round(market_state.drift, 3)
+
+        # D. Inventory
+        inv_bucket = int(agent.position)
+
+        # E. Regime (categorical — used directly as a string key)
+        regime = market_state.regime
+
+        # F–G. Momentum (optional)
+        m1 = round(market_state.momentum_1, 3) if hasattr(market_state, "momentum_1") else 0
+        m3 = round(market_state.momentum_3, 3) if hasattr(market_state, "momentum_3") else 0
+
+        # H. Order-flow imbalance (optional)
+        imbalance = (
+            round(market_state.order_imbalance, 3)
+            if hasattr(market_state, "order_imbalance") else 0
+        )
+
+        return (price_bucket, vol_bucket, drift_bucket, inv_bucket, regime, m1, m3, imbalance)
+
+    # ------------------------------------------------------------------
     # Action selection
     # ------------------------------------------------------------------
 
     def decide(self, market_state):
-        """Epsilon-greedy action selection over the current encoded state."""
-        state = self.encode_state(market_state)
+        """Epsilon-greedy action selection over the featurized state."""
+        state = self.featurize_state(market_state, self)
 
-        # Update momentum reference for next step's encode_state call
+        # Update price reference for next step's featurize_state call
         self.last_mid_price = market_state.mid_price
 
         if random.random() < self.epsilon:

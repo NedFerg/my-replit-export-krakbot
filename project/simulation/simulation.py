@@ -125,7 +125,7 @@ class Simulation:
                 agent.record_equity()
 
                 if isinstance(agent, ReinforcementLearningTrader):
-                    new_encoded = agent.encode_state(state)
+                    new_encoded = agent.featurize_state(state, agent)
                     new_equity = agent.balance + agent.unrealized_pnl
 
                     if agent.prev_state is not None:
