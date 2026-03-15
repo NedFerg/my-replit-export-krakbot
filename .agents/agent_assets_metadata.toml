@@ -5,16 +5,22 @@ generated = []
 id = "t1TYtYcgvWAK8H6PA4I7f"
 uri = "file://project/price_chart.png"
 type = "image"
-title = "Price History — BULL regime"
+title = "Price Chart — Final Episode (HIGH_VOL)"
 
 [[outputs]]
 id = "vTjFQNCNfzcGLRr2KE5U5"
 uri = "file://project/equity_curves.png"
 type = "image"
-title = "Agent Equity Curves (incl. RLTrader)"
+title = "Equity Curves — Final Episode"
 
 [[outputs]]
 id = "00WQvsPKTdtRnqD4QWk4T"
 uri = "file://project/drawdowns.png"
 type = "image"
 title = "Agent Drawdowns (incl. RLTrader)"
+
+[[outputs]]
+id = "-fFfOEXUCGnVgQ6rLCp8J"
+uri = "file://project/rl_qtable_growth.png"
+type = "image"
+title = "RLTrader Q-table Growth Across Episodes"

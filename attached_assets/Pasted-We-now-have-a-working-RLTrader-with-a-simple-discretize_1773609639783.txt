@@ -1,0 +1,163 @@
+We now have a working RLTrader with a simple discretized state and single‑run learning.
+Next, I want to:
+(1) add multi‑episode training, and (2) expand the RL state vector with richer features.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Enrich the RL state vector in rl_agent.py
+
+In project/agents/rl_agent.py, update ReinforcementLearningTrader as follows:
+A. Keep the existing Q‑learning structure, but expand encode_state
+
+Modify encode_state(self, market_state) to include:
+
+    price_bucket: as before, int(market_state.mid_price // 5)
+
+    spread_bucket: as before, int((market_state.spread or 0) // 1)
+
+    regime: market_state.regime (string)
+
+    imbalance_bucket: based on bid/ask size imbalance
+
+        compute imbalance = (market_state.bid_size - market_state.ask_size)
+
+        bucket as:
+
+            -1 if imbalance < 0
+
+            0 if imbalance == 0
+
+            1 if imbalance > 0
+
+    vol_bucket: discretized volatility
+
+        e.g. vol_bucket = int(market_state.volatility * 10) (or similar simple scaling)
+
+    momentum_bucket: based on mid‑price change
+
+        track self.last_mid_price (initialize to None)
+
+        if last_mid_price is not None:
+
+            delta = market_state.mid_price - self.last_mid_price
+
+            bucket as: -1 if delta < 0, 0 if ~0, 1 if delta > 0
+
+        if last_mid_price is None, use 0
+
+    inventory_bucket: based on current position
+
+        e.g. inventory_bucket = max(-2, min(2, int(self.position))) (clamp to [-2, 2])
+
+Return a tuple like:
+python
+
+return (
+    price_bucket,
+    spread_bucket,
+    regime,
+    imbalance_bucket,
+    vol_bucket,
+    momentum_bucket,
+    inventory_bucket,
+)
+
+Update self.last_mid_price at the end of decide() or in a dedicated method after each step.
+B. Keep actions and Q‑learning logic as is
+
+    Keep actions = ["buy", "sell", "hold"]
+
+    Keep epsilon‑greedy selection and update_q logic
+
+    Ensure prev_state, prev_action, and prev_equity are still tracked
+
+2. Add multi‑episode training in main.py
+
+In project/main.py, introduce a simple multi‑episode training loop while keeping the existing single‑run behavior easy to use.
+A. Add a constant for number of episodes
+
+Near the top of main.py, define:
+python
+
+NUM_EPISODES = 10  # or 20; keep it modest for now
+
+B. Reuse the same RLTrader across episodes
+
+    Instantiate agents once before the episode loop, including a single ReinforcementLearningTrader("RLTrader").
+
+    The RLTrader’s q_table should persist across episodes.
+
+C. Wrap the simulation in an episode loop
+
+Instead of running the simulation only once, do something like:
+python
+
+for episode in range(NUM_EPISODES):
+    print(f"=== Episode {episode + 1}/{NUM_EPISODES} ===")
+    # reset balances, positions, and histories for all agents
+    for agent in agents:
+        agent.reset_for_new_episode()  # implement this in TraderAgent
+
+    sim = Simulation(agents=agents, ...)  # however it's currently constructed
+    trade_log, agents, price_history, regime_history = sim.run()
+
+    # print per‑episode summary (PnL, equity, RL Q‑table size, etc.)
+
+D. Add reset_for_new_episode to TraderAgent
+
+In project/agents/trader_agent.py, add a method to the base class:
+python
+
+def reset_for_new_episode(self):
+    self.balance = self.initial_balance  # store this at init
+    self.position = 0
+    self.realized_pnl = 0.0
+    self.unrealized_pnl = 0.0
+    self.equity_history = []
+
+For ReinforcementLearningTrader, override this if needed to:
+
+    reset prev_state, prev_action, prev_equity
+
+    do NOT reset q_table (we want learning across episodes)
+
+3. Ensure RL updates work across episodes in simulation.py
+
+In project/simulation/simulation.py, where you already call update_q for RLTrader:
+
+    Make sure the first step of each episode does not call update_q (no previous state/action yet).
+
+    At the start of each episode (e.g., in Simulation.__init__ or a dedicated method), initialize RLTrader’s prev_state, prev_action, and prev_equity appropriately.
+
+    Use state.mid_price (or market_state.mid_price) to compute equity for reward:
+    python
+
+    new_equity = agent.balance + agent.position * state.mid_price
+    reward = new_equity - agent.prev_equity
+
+The goal: RLTrader’s Q‑table accumulates experience across episodes, but each episode starts with fresh balances/positions.
+4. Charts and reporting
+
+For now, it’s fine if charts (price, equity, drawdowns) are generated only for the last episode.
+
+In main.py:
+
+    After the episode loop, generate charts using the data from the final run.
+
+    Print RLTrader’s final Q‑table size and maybe the number of unique states:
+    python
+
+    print(f"RLTrader Q‑table size: {len(rl_trader.q_table)} states")
+
+5. Run and verify
+
+After implementing, run project/main.py and confirm:
+
+    Multiple episodes run in sequence.
+
+    RLTrader’s Q‑table size increases across episodes.
+
+    RLTrader’s performance (average equity or final equity) tends to improve over episodes (it doesn’t have to be perfect yet).
+
+    No runtime errors.
+
+Please keep the code clean and consistent with the existing style.

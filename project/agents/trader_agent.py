@@ -4,6 +4,7 @@ import random
 class TraderAgent:
     def __init__(self, name, balance):
         self.name = name
+        self.initial_balance = balance  # preserved for episode resets
         self.balance = balance
         self.position = 0
         self.last_price = None  # tracks last mid_price for momentum comparison
@@ -22,6 +23,15 @@ class TraderAgent:
 
     def record_equity(self):
         self.equity_history.append(self.balance + self.unrealized_pnl)
+
+    def reset_for_new_episode(self):
+        """Reset per-episode state while keeping anything that persists (e.g. a Q-table)."""
+        self.balance = self.initial_balance
+        self.position = 0
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        self.equity_history = []
+        self.last_price = None
 
 
 class ValueTrader(TraderAgent):

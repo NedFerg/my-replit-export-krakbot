@@ -10,18 +10,25 @@ from config.config import (
 
 
 class Simulation:
-    def __init__(self):
+    def __init__(self, agents=None):
+        # Fresh market and exchange each episode
         self.market = MarketAgent(MARKET_START_PRICE)
         self.exchange = Exchange(self.market)
         self.initial_regime = self.market.regime
         self.price_history = []
         self.regime_history = []
-        self.agents = [
-            ValueTrader("ValueTrader", INITIAL_BALANCE),
-            MomentumTrader("MomentumTrader", INITIAL_BALANCE),
-            RandomTrader("RandomTrader", INITIAL_BALANCE),
-            ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE),
-        ]
+
+        # Accept externally-managed agents (e.g. for multi-episode training)
+        # or create a default set if none provided.
+        if agents is not None:
+            self.agents = agents
+        else:
+            self.agents = [
+                ValueTrader("ValueTrader", INITIAL_BALANCE),
+                MomentumTrader("MomentumTrader", INITIAL_BALANCE),
+                RandomTrader("RandomTrader", INITIAL_BALANCE),
+                ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE),
+            ]
 
     def run(self):
         for step in range(SIMULATION_STEPS):
@@ -37,7 +44,7 @@ class Simulation:
             )
 
             # All agents decide and submit orders.
-            # We capture each agent's action so RL can use it in the Q-update below.
+            # Capture each agent's action so RL can use it in the Q-update below.
             step_actions = {}
             for agent in self.agents:
                 action = agent.decide(state)
