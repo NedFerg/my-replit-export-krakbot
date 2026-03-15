@@ -6,8 +6,16 @@ import matplotlib.patches as mpatches
 from simulation.simulation import Simulation
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
+from agents.market_agent import MarketAgent
+from market_data.data_source import SimulatedDataSource
 from risk.risk_manager import RiskManager
-from config.config import INITIAL_BALANCE
+from config.config import INITIAL_BALANCE, MARKET_START_PRICE
+
+# ---------------------------------------------------------------------------
+# Mode switch — only "sim" is implemented; plug in "live" or "paper" here
+# when a real MarketDataSource is available.
+# ---------------------------------------------------------------------------
+MODE = "sim"
 
 NUM_EPISODES = 10
 
@@ -25,7 +33,6 @@ REGIME_COLORS = {
 # ---------------------------------------------------------------------------
 
 def shade_regimes(ax, regime_history):
-    """Shade chart background by market regime."""
     seen = set()
     i = 0
     while i < len(regime_history):
@@ -43,11 +50,9 @@ def plot_price_chart(price_history, regime_history):
     fig, ax = plt.subplots(figsize=(12, 5))
     shade_regimes(ax, regime_history)
     ax.plot(price_history, color="black", linewidth=1.2, label="Price")
-
     patches = [
         mpatches.Patch(color=REGIME_COLORS[r], alpha=0.4, label=r.replace("_", " ").title())
-        for r in REGIME_COLORS
-        if r in regime_history
+        for r in REGIME_COLORS if r in regime_history
     ]
     ax.legend(handles=patches + [plt.Line2D([0], [0], color="black", label="Price")],
               loc="upper left", fontsize=8)
@@ -117,8 +122,7 @@ def plot_rl_qtable_growth(qtable_sizes):
     print("Saved: rl_qtable_growth.png")
 
 
-def print_risk_summary(episode, risk_manager):
-    """Print a concise risk report for one episode."""
+def print_risk_summary(risk_manager):
     summary = risk_manager.episode_summary()
     rejected = summary["rejected_per_agent"]
     locked = summary["drawdown_locked"]
@@ -126,17 +130,15 @@ def print_risk_summary(episode, risk_manager):
 
     total_blocked = sum(rejected.values())
     if total_blocked == 0 and not locked and not gks:
-        print(f"  [Risk] No limits hit this episode.")
+        print("  [Risk] No limits hit this episode.")
         return
 
-    print(f"  [Risk] Orders blocked: ", end="")
     parts = [f"{name}={n}" for name, n in rejected.items() if n > 0]
-    print(", ".join(parts) if parts else "none")
-
+    print(f"  [Risk] Orders blocked: {', '.join(parts) if parts else 'none'}")
     if locked:
-        print(f"  [Risk] Drawdown-locked agents: {', '.join(locked)}")
+        print(f"  [Risk] Drawdown-locked: {', '.join(locked)}")
     if gks:
-        print(f"  [Risk] *** GLOBAL KILL-SWITCH triggered ***")
+        print("  [Risk] *** GLOBAL KILL-SWITCH triggered ***")
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +155,7 @@ def main():
     ]
     rl_trader = agents[-1]
 
-    # Single RiskManager instance — reused across episodes (register_agents
-    # resets per-episode state at the start of each run)
+    # Single RiskManager — register_agents() resets per-episode state each run
     risk_manager = RiskManager(
         max_position=10,
         max_notional_per_order=1_000,
@@ -168,12 +169,25 @@ def main():
     regime_history = []
 
     for episode in range(1, NUM_EPISODES + 1):
-        # Reset per-episode agent state; Q-table is preserved on RLTrader
+        # Reset per-episode agent state; Q-table preserved on RLTrader
         for agent in agents:
             agent.reset_for_new_episode()
 
-        # Fresh market + exchange, same agents and risk manager
-        sim = Simulation(agents=agents, risk_manager=risk_manager)
+        # --- Data source: mode switch ------------------------------------
+        if MODE == "sim":
+            data_source = SimulatedDataSource(MarketAgent(MARKET_START_PRICE))
+        else:
+            raise NotImplementedError(
+                f"MODE={MODE!r} is not implemented. "
+                "Add a MarketDataSource subclass for live or paper trading."
+            )
+
+        # --- Fresh simulation with shared agents and risk manager --------
+        sim = Simulation(
+            agents=agents,
+            market_data_source=data_source,
+            risk_manager=risk_manager,
+        )
         trades, agents, price_history, regime_history = sim.run()
 
         # Collect stats
@@ -182,8 +196,8 @@ def main():
         episode_summaries.append(episode_equity)
 
         regime_label = sim.initial_regime.upper()
-        if sim.market.regime != sim.initial_regime:
-            regime_label += f" → {sim.market.regime.upper()}"
+        if regime_history and regime_history[-1] != sim.initial_regime:
+            regime_label += f" → {regime_history[-1].upper()}"
 
         print(f"=== Episode {episode}/{NUM_EPISODES}  [Regime: {regime_label}] ===")
         for a in agents:
@@ -191,7 +205,7 @@ def main():
             tag = (f"  (Q-table: {len(rl_trader.q_table)} states)"
                    if isinstance(a, ReinforcementLearningTrader) else "")
             print(f"  {a.name:<18} equity: {eq:>10.2f}{tag}")
-        print_risk_summary(episode, risk_manager)
+        print_risk_summary(risk_manager)
         print()
 
     # ---------------------------------------------------------------------------
@@ -209,7 +223,6 @@ def main():
 
     print(f"\nRLTrader final Q-table: {len(rl_trader.q_table)} unique states")
 
-    # Final episode performance detail
     print("\nFinal Episode — Performance Detail:")
     for agent in agents:
         total_equity = agent.balance + agent.unrealized_pnl
@@ -218,9 +231,6 @@ def main():
         print(f"    Unrealized PnL: {agent.unrealized_pnl:.2f}")
         print(f"    Total Equity:   {total_equity:.2f}")
 
-    # ---------------------------------------------------------------------------
-    # Charts (final episode data + RL Q-table growth)
-    # ---------------------------------------------------------------------------
     print("\nGenerating charts...")
     plot_price_chart(price_history, regime_history)
     plot_equity_curves(agents)

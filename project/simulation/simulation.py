@@ -2,6 +2,7 @@ from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
 from exchange.exchange import Exchange
+from market_data.data_source import SimulatedDataSource
 from risk.risk_manager import RiskManager, OrderIntent
 from config.config import (
     SIMULATION_STEPS,
@@ -11,16 +12,33 @@ from config.config import (
 
 
 class Simulation:
-    def __init__(self, agents=None, risk_manager=None):
-        # Fresh market and exchange each episode
-        self.market = MarketAgent(MARKET_START_PRICE)
-        self.exchange = Exchange(self.market)
-        self.initial_regime = self.market.regime
-        self.price_history = []
-        self.regime_history = []
+    """
+    Orchestrates one episode of the multi-agent market simulation.
 
-        # Accept externally-managed agents (e.g. for multi-episode training)
-        # or create a default set if none provided.
+    Price generation is fully delegated to a MarketDataSource, so the
+    simulation loop only consumes Tick objects — it has no knowledge of
+    how prices are produced. Swapping SimulatedDataSource for a live or
+    paper-trading source requires no changes here.
+    """
+
+    def __init__(self, agents=None, market_data_source=None, risk_manager=None):
+        # --- Market data source ------------------------------------------
+        # Create a default SimulatedDataSource if none is provided.
+        if market_data_source is not None:
+            self.market_data_source = market_data_source
+        else:
+            self.market_data_source = SimulatedDataSource(
+                MarketAgent(MARKET_START_PRICE)
+            )
+
+        # Record the initial regime before any ticks are produced
+        self.initial_regime = self.market_data_source.initial_regime
+
+        # --- Order book --------------------------------------------------
+        # Exchange no longer drives price; it only manages the order book.
+        self.exchange = Exchange()
+
+        # --- Agents -------------------------------------------------------
         if agents is not None:
             self.agents = agents
         else:
@@ -31,28 +49,32 @@ class Simulation:
                 ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE),
             ]
 
-        # Accept an externally-managed RiskManager or create a default one
+        # --- Risk manager ------------------------------------------------
         self.risk_manager = risk_manager if risk_manager is not None else RiskManager()
 
+        # --- Histories ---------------------------------------------------
+        self.price_history = []
+        self.regime_history = []
+
     def run(self):
-        # Register agents with the risk manager so it can track starting equity
-        # and reset per-episode counters (drawdown locks, rejection log, etc.)
+        # Register agents with the risk manager: records starting equity and
+        # clears per-episode counters (drawdown locks, rejection log, etc.)
         self.risk_manager.register_agents(self.agents)
 
-        for step in range(SIMULATION_STEPS):
-            # Update market price (applies regime effects internally)
-            price = self.exchange.update_market()
+        for _step in range(SIMULATION_STEPS):
+            # --- Consume one tick from the data source -------------------
+            tick = self.market_data_source.get_next_tick()
+            price = tick.price
 
-            # Build order-book-aware market state including regime signals
+            # --- Build MarketState from the live order book + tick data --
             state = self.exchange.get_market_state(
                 price,
-                self.market.regime,
-                self.market.drift,
-                self.market.volatility
+                tick.regime,
+                tick.drift,
+                tick.volatility,
             )
 
-            # All agents decide.  For non-hold actions the order is submitted
-            # only if the risk manager approves it.
+            # --- Agent decisions + risk-gated order submission -----------
             step_actions = {}
             for agent in self.agents:
                 action = agent.decide(state)
@@ -62,12 +84,12 @@ class Simulation:
                     intent = OrderIntent(side=action, quantity=1, price=price)
                     if self.risk_manager.approve_order(agent, intent, state):
                         self.exchange.process_order(agent, action, price)
-                    # else: order silently blocked by risk manager
+                    # else: silently blocked by risk manager
 
-            # Fill any unmatched resting orders via market maker
+            # --- Fill any unmatched resting orders via market maker ------
             self.exchange.fill_resting_orders(price)
 
-            # Update tracking and run Q-learning update for the RL agent
+            # --- Tracking + Q-learning update ----------------------------
             for agent in self.agents:
                 agent.update_last_price(state.mid_price)
                 agent.update_unrealized_pnl(price)
@@ -77,26 +99,24 @@ class Simulation:
                     new_encoded = agent.encode_state(state)
                     new_equity = agent.balance + agent.unrealized_pnl
 
-                    # Skip Q-update on the very first step (no previous state yet)
                     if agent.prev_state is not None:
                         reward = new_equity - agent.prev_equity
                         agent.update_q(
                             agent.prev_state,
                             agent.prev_action,
                             reward,
-                            new_encoded
+                            new_encoded,
                         )
 
-                    # Store experience for next step's update
                     agent.prev_state = new_encoded
                     agent.prev_action = step_actions[agent]
                     agent.prev_equity = new_equity
 
-            # Check global risk after all equity is updated
+            # --- Global risk check ---------------------------------------
             self.risk_manager.check_global_risk(self.agents)
 
-            # Record price and regime history
+            # --- Histories -----------------------------------------------
             self.price_history.append(price)
-            self.regime_history.append(self.market.regime)
+            self.regime_history.append(tick.regime)
 
         return self.exchange.trade_log, self.agents, self.price_history, self.regime_history

@@ -1,0 +1,87 @@
+We now have a multi‑episode RL system, a risk manager, and a stable simulation.
+The next step is to prepare for live/paper trading by abstracting the market data source and adding a simple “mode” switch, while still using only simulated data for now.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add a MarketDataSource abstraction
+
+Create a new file, e.g. project/market_data/data_source.py, with:
+python
+
+from abc import ABC, abstractmethod
+
+class MarketDataSource(ABC):
+    @abstractmethod
+    def get_next_tick(self):
+        """
+        Returns the next piece of market data needed by the simulation loop.
+        For now, this can be a simple dict or a small object with price and any other fields.
+        """
+        pass
+
+Then create a SimulatedDataSource(MarketDataSource) that wraps the existing MarketAgent / price‑update logic:
+
+    Internally holds a reference to the MarketAgent (or whatever currently drives price).
+
+    Each call to get_next_tick() advances the simulated market one step and returns:
+
+        current price
+
+        regime
+
+        volatility
+
+        any other fields the simulation already uses
+
+For now, this is just a thin wrapper around the existing simulation behavior.
+2. Update Simulation to use MarketDataSource
+
+In project/simulation/simulation.py:
+
+    Add a market_data_source parameter to Simulation.__init__.
+
+    Replace any direct calls that advance the market (e.g. market.update_price()) with calls to self.market_data_source.get_next_tick().
+
+    Use the returned tick data to build the MarketState and drive the rest of the step (order book, agents, PnL, RL updates, risk checks, etc.).
+
+The goal: the simulation no longer “owns” how price is generated—it just consumes ticks from a data source.
+3. Add a mode flag in main.py
+
+In project/main.py:
+
+    Add a simple mode flag near the top:
+    python
+
+    MODE = "sim"  # later: "live" or "paper"
+
+    For now, only "sim" is implemented.
+
+    When constructing the Simulation, create a SimulatedDataSource and pass it in as market_data_source.
+
+Example:
+python
+
+if MODE == "sim":
+    data_source = SimulatedDataSource(...)
+else:
+    raise NotImplementedError("Only sim mode is implemented for now.")
+
+sim = Simulation(agents=agents, market_data_source=data_source, ...)
+
+This sets up a clean place to plug in a future KrakenDataSource without touching agent logic.
+4. Keep behavior identical for now
+
+    The simulation’s external behavior (episodes, charts, RL learning, risk manager) should remain the same.
+
+    We’re only refactoring how price and regime data are fed into the loop, not changing the logic itself.
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes still run cleanly.
+
+    Charts still generate.
+
+    RLTrader’s Q‑table still grows.
+
+    RiskManager still blocks orders when limits are hit.
+
+Please keep the code clean and consistent with the existing style.

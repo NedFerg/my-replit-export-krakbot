@@ -100,8 +100,8 @@ class OrderBook:
 
 
 class Exchange:
-    def __init__(self, market_agent):
-        self.market = market_agent
+    def __init__(self, market_agent=None):
+        self.market = market_agent  # optional: only needed if calling update_market()
         self.trade_log = []
         self.order_book = OrderBook(self.trade_log)
         self._mm = _MarketMaker()
