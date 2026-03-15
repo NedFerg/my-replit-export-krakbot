@@ -1,3 +1,24 @@
+SLIPPAGE_K = 0.0005  # market-impact coefficient per unit vs. available book depth
+
+
+class Fill:
+    """Records one completed execution with realistic price and quantity."""
+
+    __slots__ = ("agent_name", "side", "price", "quantity")
+
+    def __init__(self, agent_name, side, price, quantity):
+        self.agent_name = agent_name
+        self.side = side
+        self.price = price
+        self.quantity = quantity
+
+    def __repr__(self):
+        return (
+            f"Fill({self.agent_name!r}, {self.side!r}, "
+            f"price={self.price}, qty={self.quantity})"
+        )
+
+
 class MarketState:
     """Snapshot of the order book and market conditions at a point in time."""
 
@@ -61,14 +82,24 @@ class OrderBook:
     def get_best_ask(self):
         return self.asks[0].price if self.asks else None
 
-    def match(self):
+    def match(self) -> list:
+        """
+        Match resting orders by price-time priority.
+
+        Handles partial fills: if the best bid quantity > best ask quantity (or
+        vice versa), the residual stays on the book and matching continues with
+        the next level.
+
+        Returns a list of Fill objects for every execution that occurred.
+        """
+        fills = []
+
         while self.bids and self.asks:
             best_bid = self.bids[0]
             best_ask = self.asks[0]
 
             if best_bid.price < best_ask.price:
                 break
-
             if best_bid.agent is best_ask.agent:
                 break
 
@@ -78,18 +109,29 @@ class OrderBook:
             buyer = best_bid.agent
             seller = best_ask.agent
 
-            buyer.balance -= trade_price * trade_qty
+            # Apply position and cash changes at actual execution price
+            cost = trade_price * trade_qty
+
+            buyer.balance -= cost
             buyer.position += trade_qty
-            buyer.realized_pnl -= trade_price * trade_qty
-            if buyer.name != "MarketMaker":
-                self.trade_log.append((buyer.name, "BUY", trade_price))
+            buyer.realized_pnl -= cost
 
-            seller.balance += trade_price * trade_qty
+            seller.balance += cost
             seller.position -= trade_qty
-            seller.realized_pnl += trade_price * trade_qty
-            if seller.name != "MarketMaker":
-                self.trade_log.append((seller.name, "SELL", trade_price))
+            seller.realized_pnl += cost
 
+            # Record fills (excluding market maker internal fills)
+            if buyer.name != "MarketMaker":
+                fill = Fill(buyer.name, "buy", trade_price, trade_qty)
+                fills.append(fill)
+                self.trade_log.append((buyer.name, "BUY", trade_price, trade_qty))
+
+            if seller.name != "MarketMaker":
+                fill = Fill(seller.name, "sell", trade_price, trade_qty)
+                fills.append(fill)
+                self.trade_log.append((seller.name, "SELL", trade_price, trade_qty))
+
+            # Reduce remaining quantities — enables partial fills
             best_bid.quantity -= trade_qty
             best_ask.quantity -= trade_qty
 
@@ -98,6 +140,8 @@ class OrderBook:
             if best_ask.quantity == 0:
                 self.asks.pop(0)
 
+        return fills
+
 
 class Exchange:
     def __init__(self, market_agent=None):
@@ -105,6 +149,31 @@ class Exchange:
         self.trade_log = []
         self.order_book = OrderBook(self.trade_log)
         self._mm = _MarketMaker()
+
+    # ------------------------------------------------------------------
+    # Slippage
+    # ------------------------------------------------------------------
+
+    def _slippage_price(self, base_price: float, side: str, quantity: int) -> float:
+        """
+        Compute an execution price that reflects market impact.
+
+        Buys execute slightly above base_price; sells slightly below.
+        Impact shrinks as available book depth grows.
+        """
+        if side == "buy":
+            available = sum(o.quantity for o in self.order_book.asks)
+        else:
+            available = sum(o.quantity for o in self.order_book.bids)
+
+        depth = max(available, 1)  # floor at 1 to avoid division by zero
+        impact = SLIPPAGE_K * quantity / depth
+        direction = 1.0 if side == "buy" else -1.0
+        return round(base_price * (1.0 + impact * direction), 4)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def get_market_state(self, current_price, regime, drift, volatility) -> MarketState:
         """Build a read-only MarketState snapshot from the current order book."""
@@ -119,22 +188,36 @@ class Exchange:
         return MarketState(current_price, best_bid, best_ask, bid_size, ask_size,
                            regime, drift, volatility)
 
-    def process_order(self, agent, action, market_price):
-        """Submit a limit order and attempt agent-to-agent matching."""
-        if action == "buy" and agent.balance >= market_price:
-            order = Order(agent, "buy", market_price)
+    def process_order(self, agent, action, market_price) -> list:
+        """
+        Submit a limit order at a slippage-adjusted price and match immediately.
+
+        Returns a (possibly empty) list of Fill objects produced by matching.
+        Partial fills are supported: if the book cannot absorb the full quantity,
+        the residual rests in the book until fill_resting_orders() is called.
+        """
+        exec_price = self._slippage_price(market_price, action, quantity=1)
+
+        if action == "buy" and agent.balance >= exec_price:
+            order = Order(agent, "buy", exec_price)
             self.order_book.add_order(order)
-            self.order_book.match()
+            return self.order_book.match()
 
         elif action == "sell" and agent.position > 0:
-            order = Order(agent, "sell", market_price)
+            order = Order(agent, "sell", exec_price)
             self.order_book.add_order(order)
-            self.order_book.match()
+            return self.order_book.match()
 
-    def fill_resting_orders(self, price):
-        """Fill any unmatched orders using the market maker as counterparty of last resort."""
+        return []
+
+    def fill_resting_orders(self, price) -> list:
+        """
+        Fill any unmatched resting agent orders using the market maker as
+        counterparty of last resort.  Returns fills produced by the final match.
+        """
         mm = self._mm
 
+        # Remove any leftover market-maker orders from the previous step
         self.order_book.bids = [o for o in self.order_book.bids if o.agent is not mm]
         self.order_book.asks = [o for o in self.order_book.asks if o.agent is not mm]
 
@@ -147,7 +230,9 @@ class Exchange:
             self.order_book.add_order(Order(mm, "buy", price))
 
         if has_agent_bids or has_agent_asks:
-            self.order_book.match()
+            return self.order_book.match()
+
+        return []
 
     def update_market(self):
         return self.market.update_price()

@@ -1,0 +1,83 @@
+We’re following Path B: strengthen the simulation before touching real markets.
+Next, I want to add slippage and partial fills to the exchange so executions are more realistic.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Extend the Exchange to support slippage and partial fills
+
+In project/exchange/exchange.py (or wherever the Exchange lives):
+
+    Identify where incoming orders are matched against the order book (the core matching logic).
+
+    Modify this logic so that:
+
+    A. Partial fills are possible
+
+        If an incoming order’s quantity is larger than the available liquidity at the best price level, fill only what’s available.
+
+        Reduce the remaining quantity and continue matching deeper into the book (if your current design supports multiple levels), or leave the remainder as a resting order if that’s how your exchange works.
+
+        Record each partial fill as a separate trade in the trade log (price, quantity, side, agent).
+
+    B. Slippage is applied
+
+        For market‑like orders (or however your current intents are interpreted), do not assume fills at mid price.
+
+        Instead, use the actual best bid/ask from the book as the execution price.
+
+        Optionally, add a simple slippage model:
+
+            For larger orders, execution price moves slightly against the trader.
+
+            Example:
+            python
+
+            # pseudo‑logic
+            impact = k * (order_qty / (book_depth + 1e-6))
+            exec_price = base_price * (1 + impact * direction)
+
+            where direction is +1 for buys, −1 for sells, and k is a small constant.
+
+    Ensure the Exchange returns enough information about each fill (price, quantity) so that PnL and equity can be updated accurately.
+
+2. Update Broker and Simulation to handle fills explicitly
+
+In project/broker/broker.py and project/simulation/simulation.py:
+
+    Update SimulatedBroker.submit_order(...) so that it returns a list of fills (or a structured object) instead of assuming a single, full fill.
+
+        Each fill should include at least: price, quantity, and side.
+
+    In the simulation loop, after calling broker.submit_order(...):
+
+        For each fill, update the agent’s:
+
+            position
+
+            balance (cash)
+
+            realized PnL (if applicable)
+
+        Use the actual fill prices, not mid price, for PnL and equity.
+
+    Ensure the RiskManager’s equity calculations use the updated position and balance with slippage‑adjusted fills.
+
+The goal: agents’ PnL and equity reflect realistic execution prices and partial fills, not idealized mid‑price fills.
+3. Keep the external behavior stable
+
+    The overall episode structure, charts, and RL logic should remain intact.
+
+    RLTrader should still learn, but now in a more realistic execution environment.
+
+    RiskManager should still enforce position, notional, and drawdown limits as before.
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes still run cleanly.
+
+    Trade logs now show partial fills where appropriate.
+
+    Execution prices differ from mid price when slippage applies.
+
+    Equity curves and PnL reflect the new execution model.
+
+Please keep the code clean and consistent with the existing style.

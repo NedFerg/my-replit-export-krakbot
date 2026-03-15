@@ -235,6 +235,13 @@ def main():
         print(f"    Unrealized PnL: {agent.unrealized_pnl:.2f}")
         print(f"    Total Equity:   {total_equity:.2f}")
 
+    # Show a sample of fills from the final episode to verify slippage prices
+    print(f"\nFinal Episode — Trade Sample (first 12 fills of {len(trades)}):")
+    print(f"  {'Agent':<18} {'Side':<5} {'Qty':>4}  {'Exec Price':>12}")
+    print(f"  {'-'*18} {'-'*5} {'-'*4}  {'-'*12}")
+    for name, side, price, qty in trades[:12]:
+        print(f"  {name:<18} {side:<5} {qty:>4}  {price:>12.4f}")
+
     print("\nGenerating charts...")
     plot_price_chart(price_history, regime_history)
     plot_equity_curves(agents)
