@@ -1,21 +1,23 @@
 SLIPPAGE_K = 0.0005  # market-impact coefficient per unit vs. available book depth
+FEE_RATE = 0.001     # 0.1% taker fee applied to each fill (market maker is exempt)
 
 
 class Fill:
-    """Records one completed execution with realistic price and quantity."""
+    """Records one completed execution with realistic price, quantity, and fee."""
 
-    __slots__ = ("agent_name", "side", "price", "quantity")
+    __slots__ = ("agent_name", "side", "price", "quantity", "fee")
 
-    def __init__(self, agent_name, side, price, quantity):
+    def __init__(self, agent_name, side, price, quantity, fee=0.0):
         self.agent_name = agent_name
         self.side = side
         self.price = price
         self.quantity = quantity
+        self.fee = fee
 
     def __repr__(self):
         return (
             f"Fill({self.agent_name!r}, {self.side!r}, "
-            f"price={self.price}, qty={self.quantity})"
+            f"price={self.price}, qty={self.quantity}, fee={self.fee:.4f})"
         )
 
 
@@ -90,6 +92,9 @@ class OrderBook:
         vice versa), the residual stays on the book and matching continues with
         the next level.
 
+        Applies a taker fee (FEE_RATE) to every agent fill; the market maker
+        is exempt.  Fee is deducted from the agent's balance immediately.
+
         Returns a list of Fill objects for every execution that occurred.
         """
         fills = []
@@ -105,13 +110,12 @@ class OrderBook:
 
             trade_price = best_ask.price
             trade_qty = min(best_bid.quantity, best_ask.quantity)
+            cost = trade_price * trade_qty
 
             buyer = best_bid.agent
             seller = best_ask.agent
 
-            # Apply position and cash changes at actual execution price
-            cost = trade_price * trade_qty
-
+            # --- Apply position and cash changes at actual execution price ---
             buyer.balance -= cost
             buyer.position += trade_qty
             buyer.realized_pnl -= cost
@@ -120,18 +124,29 @@ class OrderBook:
             seller.position -= trade_qty
             seller.realized_pnl += cost
 
-            # Record fills (excluding market maker internal fills)
+            # --- Taker fees (market maker is exempt) -----------------------
+            buyer_fee = 0.0
+            seller_fee = 0.0
+
             if buyer.name != "MarketMaker":
-                fill = Fill(buyer.name, "buy", trade_price, trade_qty)
+                buyer_fee = round(trade_price * trade_qty * FEE_RATE, 6)
+                buyer.balance -= buyer_fee
+                fill = Fill(buyer.name, "buy", trade_price, trade_qty, buyer_fee)
                 fills.append(fill)
-                self.trade_log.append((buyer.name, "BUY", trade_price, trade_qty))
+                self.trade_log.append(
+                    (buyer.name, "BUY", trade_price, trade_qty, buyer_fee)
+                )
 
             if seller.name != "MarketMaker":
-                fill = Fill(seller.name, "sell", trade_price, trade_qty)
+                seller_fee = round(trade_price * trade_qty * FEE_RATE, 6)
+                seller.balance -= seller_fee
+                fill = Fill(seller.name, "sell", trade_price, trade_qty, seller_fee)
                 fills.append(fill)
-                self.trade_log.append((seller.name, "SELL", trade_price, trade_qty))
+                self.trade_log.append(
+                    (seller.name, "SELL", trade_price, trade_qty, seller_fee)
+                )
 
-            # Reduce remaining quantities — enables partial fills
+            # --- Reduce remaining quantities — enables partial fills -------
             best_bid.quantity -= trade_qty
             best_ask.quantity -= trade_qty
 

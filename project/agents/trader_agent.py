@@ -2,7 +2,7 @@ import random
 
 
 class TraderAgent:
-    def __init__(self, name, balance):
+    def __init__(self, name, balance, latency=0):
         self.name = name
         self.initial_balance = balance  # preserved for episode resets
         self.balance = balance
@@ -11,6 +11,7 @@ class TraderAgent:
         self.realized_pnl = 0
         self.unrealized_pnl = 0
         self.equity_history = []  # total equity snapshot after each step
+        self.latency = latency  # steps between decide() and broker submission
 
     def update_last_price(self, price):
         self.last_price = price
@@ -35,6 +36,9 @@ class TraderAgent:
 
 
 class ValueTrader(TraderAgent):
+    def __init__(self, name, balance, latency=1):
+        super().__init__(name, balance, latency)
+
     def decide(self, market_state):
         price = market_state.mid_price
         regime = market_state.regime
@@ -68,6 +72,9 @@ class ValueTrader(TraderAgent):
 
 
 class MomentumTrader(TraderAgent):
+    def __init__(self, name, balance, latency=1):
+        super().__init__(name, balance, latency)
+
     def decide(self, market_state):
         price = market_state.mid_price
         regime = market_state.regime
@@ -102,6 +109,9 @@ class MomentumTrader(TraderAgent):
 
 
 class RandomTrader(TraderAgent):
+    def __init__(self, name, balance, latency=0):
+        super().__init__(name, balance, latency)
+
     def decide(self, market_state):
         regime = market_state.regime
 

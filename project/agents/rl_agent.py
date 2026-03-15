@@ -5,8 +5,8 @@ from agents.trader_agent import TraderAgent
 class ReinforcementLearningTrader(TraderAgent):
     actions = ["buy", "sell", "hold"]
 
-    def __init__(self, name, balance):
-        super().__init__(name, balance)
+    def __init__(self, name, balance, latency=2):
+        super().__init__(name, balance, latency)
         self.q_table = {}   # rich state tuple → {action: Q-value}
         self.alpha = 0.1    # learning rate
         self.gamma = 0.95   # discount factor

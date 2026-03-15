@@ -1,0 +1,113 @@
+We are continuing Path B: strengthening the simulation before touching real markets.
+The next upgrade is to add latency and transaction costs to the execution model.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add per‑agent latency
+
+In project/agents/trader_agent.py (base class):
+
+    Add a new attribute in __init__:
+    python
+
+    self.latency = 0  # number of simulation steps delay before order reaches the broker
+
+    Default latency = 0 for all agents unless overridden.
+
+In each agent subclass (ValueTrader, MomentumTrader, RLTrader, etc.):
+
+    Add a constructor parameter latency=0 and pass it to the base class.
+
+    For now, set:
+
+        ValueTrader: latency = 1
+
+        MomentumTrader: latency = 1
+
+        RandomTrader: latency = 0
+
+        RLTrader: latency = 2 (forces it to learn around stale quotes)
+
+2. Add a latency queue in Simulation
+
+In project/simulation/simulation.py:
+
+    Add a new attribute in Simulation.__init__:
+    python
+
+    self.latency_queue = []  # list of (deliver_step, agent, order_intent)
+
+    When an agent decides on an action and produces an order_intent:
+
+        Instead of sending it immediately to the broker, compute:
+        python
+
+        deliver_step = current_step + agent.latency
+        self.latency_queue.append((deliver_step, agent, order_intent))
+
+    At the start of each simulation step:
+
+        Pop all entries from latency_queue where deliver_step == current_step
+
+        For each, run the existing risk check and broker submission:
+        python
+
+        if self.risk_manager.approve_order(agent, order_intent, state):
+            fills = self.broker.submit_order(agent, order_intent, state)
+
+This simulates realistic network/exchange delay.
+3. Add transaction costs (fees)
+
+In project/exchange/exchange.py:
+
+    Add a fee model inside the matching logic.
+
+    For each fill, compute:
+    python
+
+    fee_rate = 0.001  # 0.1% taker fee for now
+    fee = fill.price * fill.quantity * fee_rate
+
+    Deduct the fee from the agent’s balance after applying the fill.
+
+    Add the fee to the trade log entry so the simulation can inspect it later.
+
+Update the Fill class to include:
+python
+
+self.fee = fee
+
+4. Update Simulation to incorporate fees into equity and RL rewards
+
+In simulation.py:
+
+    After receiving fills from the broker, ensure the agent’s:
+
+        balance
+
+        realized PnL
+
+        equity
+        reflect the fee deduction.
+
+In the RL reward calculation:
+
+    The reward should already be based on equity change.
+
+    Because fees reduce equity, the RL agent will naturally learn to avoid over‑trading.
+
+No extra reward shaping is needed yet.
+5. Keep behavior stable
+
+After implementing, run project/main.py and confirm:
+
+    All 10 episodes still run cleanly.
+
+    Latency queue delays orders correctly.
+
+    Fees appear in the trade log.
+
+    RLTrader’s Q‑table still grows.
+
+    Equity curves reflect slippage + fees + latency.
+
+Please keep the code clean and consistent with the existing style.

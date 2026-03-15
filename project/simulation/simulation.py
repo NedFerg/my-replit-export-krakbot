@@ -17,7 +17,24 @@ class Simulation:
 
     All market data flows in through a MarketDataSource (Tick objects).
     All order execution flows out through a Broker, which returns Fill objects.
-    The simulation has no direct knowledge of Exchange internals.
+
+    Latency model
+    -------------
+    When an agent decides on an action, the resulting OrderIntent is not sent
+    to the broker immediately.  Instead it is placed on a latency_queue with a
+    delivery step of  current_step + agent.latency.  At the start of each step
+    the queue is drained: any intent whose delivery step has been reached is
+    risk-checked and forwarded to the broker using the *current* market state.
+    This means a delayed order may be rejected (or fill at a stale price) if the
+    market has moved before the order arrives — realistic behaviour for slow or
+    high-latency agents.
+
+    Fee model
+    ---------
+    Fees are applied inside the Exchange during matching and are deducted
+    directly from the agent's balance.  Because equity = balance + unrealized_pnl,
+    fees naturally reduce equity and flow into the RL reward signal without any
+    extra reward shaping.
     """
 
     def __init__(self, agents=None, market_data_source=None, broker=None, risk_manager=None):
@@ -48,6 +65,9 @@ class Simulation:
         # --- Risk manager ------------------------------------------------
         self.risk_manager = risk_manager if risk_manager is not None else RiskManager()
 
+        # --- Latency queue: (deliver_step, agent, order_intent) ----------
+        self.latency_queue = []
+
         # --- Histories ---------------------------------------------------
         self.price_history = []
         self.regime_history = []
@@ -56,7 +76,7 @@ class Simulation:
         # Register agents: records starting equity, clears per-episode counters
         self.risk_manager.register_agents(self.agents)
 
-        for _step in range(SIMULATION_STEPS):
+        for current_step in range(SIMULATION_STEPS):
             # --- Consume one tick from the data source -------------------
             tick = self.market_data_source.get_next_tick()
             price = tick.price
@@ -69,22 +89,31 @@ class Simulation:
                 tick.volatility,
             )
 
-            # --- Agent decisions + risk-gated order submission -----------
-            # The broker returns Fill objects with actual execution prices
-            # (slippage-adjusted).  Agent state (balance, position, PnL) is
-            # updated inside the Exchange during matching.
+            # --- Deliver queued orders that are due ----------------------
+            # Use the *current* state for the risk check so a delayed order
+            # is evaluated against up-to-date market conditions.
+            due = [
+                (s, a, i) for (s, a, i) in self.latency_queue
+                if s <= current_step
+            ]
+            self.latency_queue = [
+                (s, a, i) for (s, a, i) in self.latency_queue
+                if s > current_step
+            ]
+            for _, agent, intent in due:
+                if self.risk_manager.approve_order(agent, intent, state):
+                    self.broker.submit_order(agent, intent, state)
+
+            # --- Agent decisions → latency queue -------------------------
             step_actions = {}
             for agent in self.agents:
                 action = agent.decide(state)
-                step_actions[agent] = action  # record intent regardless of approval
+                step_actions[agent] = action
 
                 if action != "hold":
                     intent = OrderIntent(side=action, quantity=1, price=price)
-                    if self.risk_manager.approve_order(agent, intent, state):
-                        fills = self.broker.submit_order(agent, intent, state)
-                        # fills carry (agent_name, side, exec_price, qty) —
-                        # state already updated by Exchange during matching;
-                        # available here for logging or richer RL rewards.
+                    deliver_step = current_step + agent.latency
+                    self.latency_queue.append((deliver_step, agent, intent))
 
             # --- End-of-step settlement via broker -----------------------
             self.broker.fill_resting_orders(price)
@@ -100,6 +129,8 @@ class Simulation:
                     new_equity = agent.balance + agent.unrealized_pnl
 
                     if agent.prev_state is not None:
+                        # Reward already incorporates slippage + fees via
+                        # equity change — no extra shaping needed.
                         reward = new_equity - agent.prev_equity
                         agent.update_q(
                             agent.prev_state,

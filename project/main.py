@@ -157,6 +157,11 @@ def main():
     ]
     rl_trader = agents[-1]
 
+    print("Agent latency configuration:")
+    for a in agents:
+        print(f"  {a.name:<18} latency = {a.latency} step(s)")
+    print()
+
     # Single RiskManager — register_agents() resets per-episode state each run
     risk_manager = RiskManager(
         max_position=10,
@@ -235,12 +240,12 @@ def main():
         print(f"    Unrealized PnL: {agent.unrealized_pnl:.2f}")
         print(f"    Total Equity:   {total_equity:.2f}")
 
-    # Show a sample of fills from the final episode to verify slippage prices
+    # Show a sample of fills from the final episode to verify slippage + fees
     print(f"\nFinal Episode — Trade Sample (first 12 fills of {len(trades)}):")
-    print(f"  {'Agent':<18} {'Side':<5} {'Qty':>4}  {'Exec Price':>12}")
-    print(f"  {'-'*18} {'-'*5} {'-'*4}  {'-'*12}")
-    for name, side, price, qty in trades[:12]:
-        print(f"  {name:<18} {side:<5} {qty:>4}  {price:>12.4f}")
+    print(f"  {'Agent':<18} {'Side':<5} {'Qty':>4}  {'Exec Price':>12}  {'Fee':>8}")
+    print(f"  {'-'*18} {'-'*5} {'-'*4}  {'-'*12}  {'-'*8}")
+    for name, side, exec_price, qty, fee in trades[:12]:
+        print(f"  {name:<18} {side:<5} {qty:>4}  {exec_price:>12.4f}  {fee:>8.4f}")
 
     print("\nGenerating charts...")
     plot_price_chart(price_history, regime_history)
