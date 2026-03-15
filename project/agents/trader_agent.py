@@ -9,6 +9,7 @@ class TraderAgent:
         self.last_price = None  # tracks last mid_price for momentum comparison
         self.realized_pnl = 0
         self.unrealized_pnl = 0
+        self.equity_history = []  # total equity snapshot after each step
 
     def update_last_price(self, price):
         self.last_price = price
@@ -18,6 +19,9 @@ class TraderAgent:
 
     def update_unrealized_pnl(self, market_price):
         self.unrealized_pnl = self.position * market_price
+
+    def record_equity(self):
+        self.equity_history.append(self.balance + self.unrealized_pnl)
 
 
 class ValueTrader(TraderAgent):
@@ -37,11 +41,9 @@ class ValueTrader(TraderAgent):
             buy_thresh, buy_prob = 90, 0.30
             sell_thresh, sell_prob = 105, 0.50
         elif regime == "high_vol":
-            # Be more cautious — widen thresholds
             buy_thresh, buy_prob = 85, 0.35
             sell_thresh, sell_prob = 120, 0.35
         elif regime == "low_vol":
-            # Tighter market — trade more actively
             buy_thresh, buy_prob = 97, 0.50
             sell_thresh, sell_prob = 105, 0.45
         else:
@@ -70,15 +72,12 @@ class MomentumTrader(TraderAgent):
             up_prob = 0.45 if buy_bias else 0.35
             down_prob = 0.20
         elif regime == "bear":
-            # More aggressive selling on downward momentum
             up_prob = 0.20
             down_prob = 0.45
         elif regime == "high_vol":
-            # Faster reactions in volatile markets
             up_prob = 0.40 if buy_bias else 0.35
             down_prob = 0.40
         elif regime == "low_vol":
-            # Quieter market — reduce sensitivity to avoid noise
             up_prob = 0.20
             down_prob = 0.15
         else:
@@ -98,9 +97,9 @@ class RandomTrader(TraderAgent):
 
         # Base probabilities by regime
         if regime == "high_vol":
-            buy_p, sell_p = 0.03, 0.06  # trade less in choppy markets
+            buy_p, sell_p = 0.03, 0.06
         elif regime == "low_vol":
-            buy_p, sell_p = 0.08, 0.16  # trade more in quiet markets
+            buy_p, sell_p = 0.08, 0.16
         else:
             buy_p, sell_p = 0.05, 0.10
 

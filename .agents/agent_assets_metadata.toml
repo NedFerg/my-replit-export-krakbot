@@ -1,0 +1,20 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "t1TYtYcgvWAK8H6PA4I7f"
+uri = "file://project/price_chart.png"
+type = "image"
+title = "Price History with Regime Shading"
+
+[[outputs]]
+id = "vTjFQNCNfzcGLRr2KE5U5"
+uri = "file://project/equity_curves.png"
+type = "image"
+title = "Agent Equity Curves"
+
+[[outputs]]
+id = "00WQvsPKTdtRnqD4QWk4T"
+uri = "file://project/drawdowns.png"
+type = "image"
+title = "Agent Drawdowns"

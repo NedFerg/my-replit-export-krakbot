@@ -1,0 +1,102 @@
+We now have market regimes, an order book, and adaptive agents.
+The next step is to add charts & visualization so we can see price, equity curves, drawdowns, and regime effects.
+
+Please implement the following changes cleanly and consistently across the project.
+1. Add matplotlib as a dependency
+
+If not already present, import matplotlib in main.py:
+python
+
+import matplotlib.pyplot as plt
+
+No need to modify project files outside Python.
+2. Track price history and regime history
+
+In project/simulation/simulation.py:
+
+    Add self.price_history = []
+
+    Add self.regime_history = []
+
+Inside the main simulation loop, after computing the new price and regime:
+python
+
+self.price_history.append(price)
+self.regime_history.append(self.market.regime)
+
+This gives us a full time series for plotting.
+3. After the simulation ends, return price and regime history
+
+Modify Simulation.run() to return:
+python
+
+return self.exchange.trade_log, self.agents, self.price_history, self.regime_history
+
+Update main.py accordingly to unpack these values.
+4. Add chart generation to main.py
+
+In project/main.py, after printing the performance summary and risk metrics, add a new section that generates three charts:
+A. Price chart with regime shading
+
+    Plot price_history as a line.
+
+    For each regime segment (bull, bear, high_vol, low_vol, crash), shade the background with a light color:
+
+        bull → light green
+
+        bear → light red
+
+        high_vol → light orange
+
+        low_vol → light blue
+
+        crash → light purple
+
+Use plt.axvspan(start, end, color, alpha=0.15) for shading.
+B. Equity curves for each agent
+
+    For each agent, plot agent.equity_history on the same chart.
+
+    Add a legend with agent names.
+
+    Label axes: “Time Step” and “Equity”.
+
+C. Drawdown chart
+
+For each agent:
+
+    Compute drawdown series:
+    python
+
+    peak = equity[0]
+    dd_series = []
+    for v in equity:
+        peak = max(peak, v)
+        dd_series.append((peak - v) / peak)
+
+    Plot each agent’s drawdown curve.
+
+Label axes: “Time Step” and “Drawdown”.
+5. Save charts to files
+
+At the end of each chart block, save the figure:
+python
+
+plt.savefig("price_chart.png")
+plt.savefig("equity_curves.png")
+plt.savefig("drawdowns.png")
+
+Then call plt.close() to avoid overlapping figures.
+6. Run the simulation and generate charts
+
+After implementing, run project/main.py and ensure:
+
+    All three charts are generated without errors
+
+    Regime shading appears correctly
+
+    Equity curves look correct
+
+    Drawdowns plot correctly
+
+Please implement this cleanly and keep the code readable.
