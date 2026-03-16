@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import hmac
 import hashlib
@@ -504,9 +505,18 @@ class LiveBroker(SimulatedBroker):
         self.last_latency_sec = 0.0    # round-trip latency of last API call
         self.kill_switch      = False  # set True to halt all order flow immediately
 
-        # Kraken REST configuration
+        # Kraken spot REST configuration
         self.kraken_base_url = "https://api.kraken.com"
         self.kraken_session  = requests.Session()
+
+        # Kraken Futures REST configuration (separate credentials + base URL)
+        self.futures_api_key    = os.getenv("KRAKEN_FUTURES_API_KEY", "")
+        self.futures_api_secret = os.getenv("KRAKEN_FUTURES_API_SECRET", "")
+        self.futures_base_url   = "https://futures.kraken.com/derivatives/api/v3"
+
+        if not self.futures_api_key or not self.futures_api_secret:
+            print("[LiveBroker] WARNING: KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET "
+                  "not set.  Futures live submission will be blocked.")
 
         # Map internal asset names → Kraken ticker symbols
         self.kraken_pairs = {
@@ -966,14 +976,54 @@ class LiveBroker(SimulatedBroker):
 
     def _kraken_futures_private(self, path: str, data: dict | None = None):
         """
-        Stub: private Kraken Futures REST request.
+        Real Kraken Futures private REST request.
 
-        Kraken Futures uses a different base URL (https://futures.kraken.com)
-        and a different HMAC-SHA256 signing scheme.  Wire this separately
-        when Futures API credentials are available.
+        Kraken Futures uses:
+        - Base URL: https://futures.kraken.com/derivatives/api/v3
+        - HMAC-SHA256 signing: endpoint + nonce + JSON payload
+        - Headers: APIKey, Nonce, Authent
         """
-        print(f"[FUTURES API STUB] path={path}  (not yet wired)")
-        return None
+        if not self.futures_api_key or not self.futures_api_secret:
+            self.trigger_kill_switch("Missing Kraken Futures credentials")
+            return None
+
+        if data is None:
+            data = {}
+
+        url     = self.futures_base_url + path
+        nonce   = str(int(time.time() * 1000))
+        payload = json.dumps(data, separators=(",", ":"))
+
+        # Signing message: endpoint + nonce + compact JSON payload
+        message   = path + nonce + payload
+        signature = hmac.new(
+            self.futures_api_secret.encode(),
+            msg=message.encode(),
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+
+        headers = {
+            "APIKey":       self.futures_api_key,
+            "Nonce":        nonce,
+            "Authent":      signature,
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = requests.post(url, headers=headers, data=payload, timeout=10)
+        except Exception as e:
+            self.trigger_kill_switch(f"Futures request exception: {e}")
+            return None
+
+        if resp.status_code != 200:
+            self.trigger_kill_switch(f"Futures HTTP error {resp.status_code}")
+            return None
+
+        try:
+            return resp.json()
+        except Exception:
+            self.trigger_kill_switch("Futures JSON decode error")
+            return None
 
     # ------------------------------------------------------------------
     # Live order execution (overrides SimulatedBroker private helpers)
