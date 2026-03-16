@@ -342,7 +342,8 @@ class ReinforcementLearningTrader(TraderAgent):
 
             balances, positions = state
 
-            if not balances:
+            # balances is a dict — None means API failure, {} means zero balance (valid)
+            if balances is None:
                 print("[WARM-UP] Empty balances — retrying")
                 time.sleep(1)
                 continue

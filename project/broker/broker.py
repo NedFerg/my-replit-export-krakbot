@@ -513,14 +513,10 @@ class LiveBroker(SimulatedBroker):
         self.kraken_base_url = "https://api.kraken.com"
         self.kraken_session  = requests.Session()
 
-        # Kraken Futures REST configuration (separate credentials + base URL)
-        self.futures_api_key    = os.getenv("KRAKEN_FUTURES_API_KEY", "")
-        self.futures_api_secret = os.getenv("KRAKEN_FUTURES_API_SECRET", "")
+        # Kraken Futures REST configuration — same keypair as spot
+        self.futures_api_key    = self.kraken_api_key
+        self.futures_api_secret = self.kraken_api_secret
         self.futures_base_url   = "https://futures.kraken.com/derivatives/api/v3"
-
-        if not self.futures_api_key or not self.futures_api_secret:
-            print("[LiveBroker] WARNING: KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET "
-                  "not set.  Futures live submission will be blocked.")
 
         # Map internal asset names → Kraken ticker symbols
         self.kraken_pairs = {
@@ -716,6 +712,8 @@ class LiveBroker(SimulatedBroker):
             print("[BALANCE ERROR] Could not fetch balances from Kraken")
             return None
 
+        # An empty result dict {} is valid — it means zero funded balance.
+        # Only treat API errors (missing "result" key) as a failure.
         self.live_balances = data["result"]
         return self.live_balances
 
@@ -1279,7 +1277,7 @@ class LiveBroker(SimulatedBroker):
         - Headers: APIKey, Nonce, Authent
         """
         if not self.futures_api_key or not self.futures_api_secret:
-            self.trigger_kill_switch("Missing Kraken Futures credentials")
+            self.trigger_kill_switch("Missing Kraken API credentials (shared keypair required for Futures)")
             return None
 
         if data is None:
