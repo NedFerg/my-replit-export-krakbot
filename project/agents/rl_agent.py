@@ -517,6 +517,19 @@ class ReinforcementLearningTrader(TraderAgent):
         # ----------------------------------------------------------------
         MIN_TRADE_USD = 5.0   # Kraken per-asset minimums; keep well above them
 
+        # Refresh balances from Kraken so deposits are picked up immediately
+        if hasattr(self.broker, "fetch_live_balances"):
+            self.broker.fetch_live_balances()
+
+        # Anchor starting equity on first step (prices are loaded by now)
+        if (hasattr(self.broker, "_starting_equity")
+                and self.broker._starting_equity is None
+                and hasattr(self.broker, "compute_total_equity")):
+            anchor = self.broker.compute_total_equity()
+            if anchor > 0:
+                self.broker._starting_equity = anchor
+                print(f"  [EQUITY ANCHOR] Starting equity = {anchor:.2f} (ZUSD + crypto at live prices)")
+
         # Equity available for sizing
         zusd_str = getattr(self.broker, "live_balances", {}).get("ZUSD", "0")
         equity   = float(zusd_str) if zusd_str else 0.0

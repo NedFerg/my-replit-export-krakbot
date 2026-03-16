@@ -17,3 +17,7 @@
 {"status": "live", "symbol": "HBAR", "side": "buy", "size": 61.45226536363126, "result": null, "timestamp": 1773639399.6702}
 {"status": "live", "symbol": "ETH", "side": "buy", "size": 0.0023966166347930045, "result": {"txid": ["OBILNL-VG3AB-VNQJXM"], "descr": {"order": "buy 0.00239 ETHUSD @ market"}}, "timestamp": 1773639478.5852482}
 {"status": "live", "symbol": "HBAR", "side": "buy", "size": 10.99479964547409, "result": null, "timestamp": 1773639478.757574}
+{"status": "live", "symbol": "XRP", "side": "buy", "size": 23.522569738515845, "result": {"txid": ["OCO2ZW-K24P4-IFOT54"], "descr": {"order": "buy 23.52256 XRPUSD @ market"}}, "timestamp": 1773640615.2505536}
+{"status": "live", "symbol": "LINK", "side": "buy", "size": 1.394949135734627, "result": {"txid": ["OFFV7M-R45FF-OXVJ73"], "descr": {"order": "buy 1.39494 LINKUSD @ market"}}, "timestamp": 1773640615.4105163}
+{"status": "live", "symbol": "XRP", "side": "sell", "size": 23.471036155381867, "result": null, "timestamp": 1773640616.6358492}
+{"status": "live", "symbol": "LINK", "side": "sell", "size": 1.394949135734627, "result": null, "timestamp": 1773640616.6359906}

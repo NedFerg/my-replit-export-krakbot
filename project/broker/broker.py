@@ -530,6 +530,19 @@ class LiveBroker(SimulatedBroker):
             "XLM":  "XLMUSD",
         }
 
+        # Kraken balance-dict keys for each tracked asset
+        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names)
+        self.kraken_balance_keys = {
+            "BTC":  "XXBT",
+            "ETH":  "XETH",
+            "SOL":  "SOL",
+            "AVAX": "AVAX",
+            "LINK": "LINK",
+            "HBAR": "HBAR",
+            "XRP":  "XXRP",
+            "XLM":  "XXLM",
+        }
+
         # Live price cache (populated by fetch_live_prices)
         self.live_prices           = {}   # asset → latest float price
         self.last_price_timestamp  = 0    # Unix timestamp of last successful fetch
@@ -542,7 +555,7 @@ class LiveBroker(SimulatedBroker):
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
         self.max_total_notional     = 200.0   # USD cap across all open positions
         self.max_trades_per_hour    = 10      # rate limiter
-        self.max_daily_loss         = 20.0    # USD drawdown cap from session start
+        self.max_daily_loss         = 50.0    # USD drawdown cap from session start (true P&L, not cash)
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
         self._starting_equity    = None # ZUSD balance at first trade of the session
@@ -704,33 +717,45 @@ class LiveBroker(SimulatedBroker):
         """
         Fetch real account balances from Kraken (private endpoint, read-only).
         Populates self.live_balances and returns the raw result dict, or None
-        on failure.
+        on failure.  Retries once with back-off on rate-limit errors.
         """
-        data = self._kraken_private("/0/private/Balance")
-
-        if not data or "result" not in data:
-            print("[BALANCE ERROR] Could not fetch balances from Kraken")
-            return None
-
-        # An empty result dict {} is valid — it means zero funded balance.
-        # Only treat API errors (missing "result" key) as a failure.
-        self.live_balances = data["result"]
-        return self.live_balances
+        for attempt in range(2):
+            data = self._kraken_private("/0/private/Balance")
+            if not data:
+                break
+            errors = data.get("error", [])
+            if any("Rate limit" in e for e in errors):
+                print(f"[BALANCE] Rate limit hit — waiting 15 s before retry (attempt {attempt+1})")
+                time.sleep(15)
+                continue
+            if "result" not in data:
+                break
+            self.live_balances = data["result"]
+            return self.live_balances
+        print("[BALANCE ERROR] Could not fetch balances from Kraken")
+        return None
 
     def fetch_live_positions(self):
         """
         Fetch open positions (spot-margin or futures) from Kraken (read-only).
         Populates self.live_positions and returns the raw result dict, or None
-        on failure.
+        on failure.  Retries once with back-off on rate-limit errors.
         """
-        data = self._kraken_private("/0/private/OpenPositions", {"docalcs": "true"})
-
-        if not data or "result" not in data:
-            print("[POSITION ERROR] Could not fetch open positions from Kraken")
-            return None
-
-        self.live_positions = data["result"]
-        return self.live_positions
+        for attempt in range(2):
+            data = self._kraken_private("/0/private/OpenPositions", {"docalcs": "true"})
+            if not data:
+                break
+            errors = data.get("error", [])
+            if any("Rate limit" in e for e in errors):
+                print(f"[POSITION] Rate limit hit — waiting 15 s before retry (attempt {attempt+1})")
+                time.sleep(15)
+                continue
+            if "result" not in data:
+                break
+            self.live_positions = data["result"]
+            return self.live_positions
+        print("[POSITION ERROR] Could not fetch open positions from Kraken")
+        return None
 
     def sync_live_account_state(self):
         """
@@ -854,8 +879,7 @@ class LiveBroker(SimulatedBroker):
         - _starting_equity (set on first live trade) as session anchor
         - compute_unified_exposure() for notional and leverage estimate
         """
-        balances = self.live_balances or {}
-        equity   = float(balances.get("ZUSD", 0.0))
+        equity = self.compute_total_equity()
 
         exposure       = self.compute_unified_exposure()
         total_notional = exposure.get("total_notional", 0.0)
@@ -1150,25 +1174,38 @@ class LiveBroker(SimulatedBroker):
         self._trade_count_window.append(now)
         return True
 
+    def compute_total_equity(self) -> float:
+        """
+        True portfolio value = ZUSD cash + all crypto holdings at live prices.
+        Avoids treating buy orders as losses in the daily-loss check.
+        """
+        balances = self.live_balances or {}
+        equity   = float(balances.get("ZUSD", 0.0))
+        for asset, bal_key in self.kraken_balance_keys.items():
+            qty   = float(balances.get(bal_key, 0.0))
+            price = self.live_prices.get(asset, 0.0)
+            equity += qty * price
+        return equity
+
     def _check_daily_loss(self) -> bool:
         """
-        Compare current ZUSD balance to the session-start balance.
+        Compare current total portfolio value to the session-start value.
+        Uses compute_total_equity() so that buying crypto is not counted as a loss.
         Triggers kill switch if the drawdown exceeds max_daily_loss.
         """
-        bal_str = self.live_balances.get("ZUSD")
+        equity = self.compute_total_equity()
 
         if self._starting_equity is None:
-            # Initialise once on the first call that has a balance available
-            if bal_str:
-                self._starting_equity = float(bal_str)
+            if equity > 0:
+                self._starting_equity = equity
             return True
 
-        if not bal_str:
-            return True   # balance unavailable — permissive, do not block
+        if equity <= 0:
+            return True   # no balance info yet — permissive
 
-        if float(bal_str) < self._starting_equity - self.max_daily_loss:
+        if equity < self._starting_equity - self.max_daily_loss:
             self.trigger_kill_switch(
-                f"Daily loss limit exceeded: balance={float(bal_str):.2f}  "
+                f"Daily loss limit exceeded: balance={equity:.2f}  "
                 f"start={self._starting_equity:.2f}  limit={self.max_daily_loss:.2f}"
             )
             return False
@@ -1471,12 +1508,6 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
     balances, positions = state
     print(f"[MAIN LOOP] Initial balances: {balances}")
     print(f"[MAIN LOOP] Initial positions: {positions}")
-
-    # Set starting equity anchor on first run if not already set
-    if getattr(broker, "_starting_equity", None) is None:
-        zusd = float(balances.get("ZUSD", 0.0))
-        broker._starting_equity = zusd
-        print(f"[MAIN LOOP] Starting equity set to {zusd}")
 
     try:
         while True:
