@@ -62,3 +62,6 @@
 {"status": "live", "symbol": "XRP", "side": "buy", "size": 33.81188420105899, "result": {"txid": ["OPCFQV-3YGL6-2VGKAS"], "descr": {"order": "buy 33.81188 XRPUSD @ market"}}, "timestamp": 1773642780.8561735}
 {"status": "live", "symbol": "ETH", "side": "buy", "size": 0.014324701249140087, "result": {"txid": ["OBSBA4-L5B74-GJGEAU"], "descr": {"order": "buy 0.01432 ETHUSD @ market"}}, "timestamp": 1773642781.0824778}
 {"status": "live", "symbol": "BTC", "side": "buy", "size": 0.0002240386313591565, "result": null, "timestamp": 1773642781.082614}
+{"status": "live", "symbol": "XRP", "side": "sell", "size": 33.81165555390254, "result": {"txid": ["O4FXTP-HSIT4-GXTLX3"], "descr": {"order": "sell 33.81165 XRPUSD @ market"}}, "timestamp": 1773643152.582585}
+{"status": "live", "symbol": "ETH", "side": "sell", "size": 0.0192794, "result": {"txid": ["OLYKXZ-SGVPV-WO6L5O"], "descr": {"order": "sell 0.01927 ETHUSD @ market"}}, "timestamp": 1773643152.7456226}
+{"status": "live", "symbol": "AVAX", "side": "buy", "size": 1.4461542449919198, "result": {"txid": ["OPZF2D-P5ET3-PD4Y4A"], "descr": {"order": "buy 1.44615 AVAXUSD @ market"}}, "timestamp": 1773643152.9150538}
