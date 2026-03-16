@@ -170,6 +170,14 @@ class Simulation:
         self.top_risk      = 0
         self.prev_top_risk = 0
 
+        # --- Long-term crypto cycle model ---------------------------------
+        # Tracks where we are in the broader cycle using BTC price history,
+        # altseason_index, vol_regime, and liq_regime — no new data sources.
+        # 0=early accumulation, 1=mid expansion, 2=late distribution, 3=reset
+        self.cycle_phase      = 0
+        self.cycle_score      = 0.0
+        self.prev_cycle_phase = 0
+
         # --- Flash-crash / panic risk flag --------------------------------
         # 0 = normal, 1 = warning (instability rising), 2 = panic (flash-crash)
         self.panic_risk      = 0
@@ -696,6 +704,62 @@ class Simulation:
             self.prev_panic_risk = self.panic_risk
             self.prev_vol_regime = self.vol_regime   # keep for next-step spike calc
 
+            # --- Long-term cycle scoring ----------------------------------
+            # Uses BTC price history, altseason, and vol — no new data needed.
+            _cyc_btc = self.asset_prices["BTC"]
+            if len(_cyc_btc) >= 200:
+                # 1. Long-horizon BTC trend (200-step return)
+                _ret_200 = (_cyc_btc[-1] - _cyc_btc[-200]) / max(_cyc_btc[-200], 1e-6)
+
+                # 2. Long-horizon realised vol (std-dev of 200-step window)
+                _win = _cyc_btc[-200:]
+                _wmean = sum(_win) / 200
+                _wvar  = sum((p - _wmean) ** 2 for p in _win) / 200
+                _vol_200 = (_wvar ** 0.5) / max(_wmean, 1e-6)
+
+                # 3. Current altseason as cycle proxy
+                _alt_long = self.altseason_index
+
+                _cscore = 0.0
+                if _ret_200 > 0.5:   _cscore += 1.0   # strong uptrend → later cycle
+                if _ret_200 > 1.0:   _cscore += 1.0   # very strong uptrend
+                if _vol_200 > 0.10:  _cscore += 1.0   # high long-term vol → late/reset
+                if _alt_long > 0.5:  _cscore += 0.5   # mid/late altseason
+                if _alt_long > 0.8:  _cscore += 0.5   # extreme altseason
+
+                self.cycle_score = _cscore
+
+                if _cscore < 0.5:
+                    self.cycle_phase = 0   # early accumulation
+                elif _cscore < 1.5:
+                    self.cycle_phase = 1   # mid-cycle expansion
+                elif _cscore < 2.5:
+                    self.cycle_phase = 2   # late-cycle distribution
+                else:
+                    self.cycle_phase = 3   # post-crash / reset
+            else:
+                self.cycle_score = 0.0
+                self.cycle_phase = 0   # not enough history yet
+
+            setattr(state, "cycle_phase", self.cycle_phase)
+            setattr(state, "cycle_score", self.cycle_score)
+
+            # Cycle feedback: print only on phase transitions
+            if self.cycle_phase != self.prev_cycle_phase:
+                _cnames = {
+                    0: "early accumulation",
+                    1: "mid-cycle expansion",
+                    2: "late-cycle distribution",
+                    3: "post-crash reset",
+                }
+                _cmsg = (
+                    f"Cycle shift: {_cnames.get(self.prev_cycle_phase, '?')} "
+                    f"→ {_cnames.get(self.cycle_phase, '?')}."
+                )
+                self.macro_messages.append(_cmsg)
+                print(_cmsg)
+            self.prev_cycle_phase = self.cycle_phase
+
             # --- Dynamic exposure caps ------------------------------------
             # Per-asset caps that adapt each step to volatility, liquidity,
             # altseason momentum, and the effective macro regime.
@@ -928,9 +992,20 @@ class Simulation:
                         macro = self.macro_regime
                         # AUTO mode: ignore manual call, use internally
                         # derived regime so reward shaping is fully signal-driven.
-                        macro_effective = (
-                            self.internal_regime if macro == 2 else macro
-                        )
+                        # Then apply a gentle cycle-phase bias on top.
+                        if macro == 2:
+                            macro_effective = self.internal_regime
+                            # Early/mid → tilt bullish; late/reset → tilt defensive
+                            if self.cycle_phase == 0:
+                                macro_effective = max(macro_effective, 0)    # avoid forced bear
+                            elif self.cycle_phase == 1:
+                                macro_effective = max(macro_effective, +1)   # lean bull
+                            elif self.cycle_phase == 2:
+                                macro_effective = min(macro_effective, 0)    # avoid full bull
+                            elif self.cycle_phase == 3:
+                                macro_effective = min(macro_effective, -1)   # lean bear
+                        else:
+                            macro_effective = macro
                         alt = getattr(state, "altseason_index", 0.0)
                         vol = getattr(state, "vol_regime", 0.0)
 
@@ -980,6 +1055,24 @@ class Simulation:
                                 / len(self.rotation_score)
                             )
                             reward += _rot_bonus
+
+                        # --- Cycle-aware reward tilt ----------------------
+                        # Small directional guidance — coefficients kept tiny
+                        # so this is a nudge, not a hard rule.
+                        if self.cycle_phase == 0:
+                            # Early accumulation: reward being risk-on when returns > 0
+                            if step_return > 0:
+                                reward += 0.001 * step_return
+                        elif self.cycle_phase == 1:
+                            pass   # mid-cycle: neutral, minimal tilt
+                        elif self.cycle_phase == 2:
+                            # Late distribution: reward caution
+                            reward -= 0.001 * turnover
+                        elif self.cycle_phase == 3:
+                            # Post-crash reset: reward rebuilding, penalise overtrading
+                            if step_return > 0:
+                                reward += 0.001 * step_return
+                            reward -= 0.0005 * turnover
 
                         # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)

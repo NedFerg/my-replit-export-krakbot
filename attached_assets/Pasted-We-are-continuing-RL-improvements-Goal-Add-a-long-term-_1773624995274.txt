@@ -1,0 +1,177 @@
+We are continuing RL improvements.
+
+Goal:  
+Add a long‑term cycle model that tracks where we are in the broader crypto cycle and exposes:
+
+    cycle_phase (discrete)
+
+    cycle_score (continuous)
+
+Cycle phases:
+
+    0 = early accumulation
+
+    1 = mid‑cycle expansion
+
+    2 = late‑cycle / distribution
+
+    3 = post‑crash / reset
+
+This model should:
+
+    use only existing data (BTC price history, altseason_index, vol_regime, liq_regime)
+
+    inform AUTO mode (internal_regime)
+
+    lightly shape reward
+
+    emit feedback like:
+
+        “Cycle shift: early → mid expansion.”
+
+        “Cycle shift: mid → late distribution.”
+
+All RL core logic stays unchanged.
+1. Add cycle state to simulation
+
+In simulation.py, inside __init__:
+python
+
+# Long-term cycle model
+self.cycle_phase = 0      # 0=early,1=mid,2=late,3=reset
+self.cycle_score = 0.0
+self.prev_cycle_phase = 0
+
+Attach to state before returning:
+python
+
+setattr(state, "cycle_phase", self.cycle_phase)
+setattr(state, "cycle_score", self.cycle_score)
+
+2. Compute long‑term cycle score each step
+
+After regime features (altseason_index, vol_regime, liq_regime, btc_dominance) are computed:
+python
+
+# --- Long-term cycle scoring ---
+btc_hist = self.asset_prices["BTC"]
+
+if len(btc_hist) >= 200:
+    # 1. Long-horizon BTC trend (e.g. 200-step)
+    ret_200 = (btc_hist[-1] - btc_hist[-200]) / max(btc_hist[-200], 1e-6)
+
+    # 2. Long-horizon realized vol (approx)
+    window = btc_hist[-200:]
+    mean_p = sum(window) / len(window)
+    var_p = sum((p - mean_p) ** 2 for p in window) / len(window)
+    vol_200 = (var_p ** 0.5) / max(mean_p, 1e-6)
+
+    # 3. Average altseason over long window (use stored history if available, else approximate)
+    alt_long = self.altseason_index  # placeholder; agent can refine with a buffer
+
+    score = 0.0
+
+    # Strong uptrend → later in cycle
+    if ret_200 > 0.5:
+        score += 1.0
+    if ret_200 > 1.0:
+        score += 1.0
+
+    # High long-term vol → late / post-crash
+    if vol_200 > 0.10:
+        score += 1.0
+
+    # Strong altseason → mid/late
+    if alt_long > 0.5:
+        score += 0.5
+    if alt_long > 0.8:
+        score += 0.5
+
+    self.cycle_score = score
+
+    # Map score → phase
+    if score < 0.5:
+        self.cycle_phase = 0   # early accumulation
+    elif score < 1.5:
+        self.cycle_phase = 1   # mid expansion
+    elif score < 2.5:
+        self.cycle_phase = 2   # late distribution
+    else:
+        self.cycle_phase = 3   # post-crash / reset
+else:
+    # Not enough history yet
+    self.cycle_score = 0.0
+    self.cycle_phase = 0
+
+Re‑attach to state:
+python
+
+setattr(state, "cycle_phase", self.cycle_phase)
+setattr(state, "cycle_score", self.cycle_score)
+
+3. Let AUTO mode be cycle‑aware
+
+Where you set macro_effective (or internal_regime for AUTO), add a gentle bias from cycle_phase:
+python
+
+macro = self.macro_regime
+
+if macro == 2:
+    # AUTO mode: start from internal_regime
+    macro_effective = self.internal_regime
+
+    # Cycle bias: early/mid → tilt bullish, late/post → tilt defensive
+    if self.cycle_phase == 0:
+        macro_effective = max(macro_effective, 0)   # avoid forced bear
+    elif self.cycle_phase == 1:
+        macro_effective = max(macro_effective, +1)  # lean bull
+    elif self.cycle_phase == 2:
+        macro_effective = min(macro_effective, 0)   # avoid full bull
+    elif self.cycle_phase == 3:
+        macro_effective = min(macro_effective, -1)  # lean bear
+else:
+    macro_effective = macro
+
+Use macro_effective in your reward and regime logic (as you already do).
+4. Light reward shaping by cycle phase
+
+After your existing reward logic (regime, blow‑off, panic, rotation), add:
+python
+
+# Cycle-aware reward tilt (small, directional)
+if self.cycle_phase == 0:
+    # Early: reward being risk-on when returns are positive
+    if step_return > 0:
+        reward += 0.001 * step_return
+elif self.cycle_phase == 1:
+    # Mid: neutral, minimal tilt
+    pass
+elif self.cycle_phase == 2:
+    # Late: reward caution (lower turnover, smaller positions)
+    reward -= 0.001 * turnover
+elif self.cycle_phase == 3:
+    # Post-crash: reward rebuilding after pain, but not overtrading
+    if step_return > 0:
+        reward += 0.001 * step_return
+    reward -= 0.0005 * turnover
+
+Keep coefficients small—this is guidance, not a hard rule.
+5. Cycle feedback messages
+
+After computing cycle_phase:
+python
+
+if self.cycle_phase != self.prev_cycle_phase:
+    phase_names = {
+        0: "early accumulation",
+        1: "mid-cycle expansion",
+        2: "late-cycle distribution",
+        3: "post-crash reset",
+    }
+    msg = f"Cycle shift: {phase_names.get(self.prev_cycle_phase, '?')} → {phase_names.get(self.cycle_phase, '?')}."
+    self.macro_messages.append(msg)
+    print(msg)
+
+self.prev_cycle_phase = self.cycle_phase
+
+Transition‑only, like your other feedback.
