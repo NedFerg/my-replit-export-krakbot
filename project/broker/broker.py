@@ -524,15 +524,29 @@ class LiveBroker(SimulatedBroker):
         # Futures.kraken.com uses SEPARATE API credentials from spot.
         # Generate them at: https://futures.kraken.com → Settings → API Keys
         # Store as KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET.
-        # Falls back to spot keys if futures-specific keys are absent (will
-        # likely fail auth — futures overlay auto-disables in that case).
+        #
+        # If dedicated futures keys are absent, the overlay runs in PAPER mode:
+        # full sizing/hedging/regime logic executes and is logged, but no orders
+        # are sent to Kraken.  Add the two secrets to switch to live futures.
+        has_futures_keys = bool(os.getenv("KRAKEN_FUTURES_API_KEY"))
+        self.futures_paper_mode = not has_futures_keys
+
         self.futures_api_key    = (os.getenv("KRAKEN_FUTURES_API_KEY")
                                    or self.kraken_api_key)
         self.futures_api_secret = (os.getenv("KRAKEN_FUTURES_API_SECRET")
                                    or self.kraken_api_secret)
         self.futures_base_url   = "https://futures.kraken.com/derivatives/api/v3"
-        # Set to False automatically if auth fails (spot bot continues unaffected)
+        # Paper mode: always available (never auth-fails).
+        # Live mode: set to False on auth failure so spot bot continues.
         self.futures_available  = True
+
+        if self.futures_paper_mode:
+            print("[FUTURES] No KRAKEN_FUTURES_API_KEY found — running in PAPER mode.")
+            print("  Full sizing/hedging logic is active; orders are logged but NOT sent to Kraken.")
+            print("  To enable live futures: add KRAKEN_FUTURES_API_KEY + KRAKEN_FUTURES_API_SECRET")
+            print("  (generate at https://futures.kraken.com → Settings → API Keys)")
+        else:
+            print("[FUTURES] Dedicated futures API keys found — LIVE mode enabled.")
 
         # Futures wallet balance (USD collateral in the Kraken Futures account).
         # Refreshed at startup and after each rebalancing window.
@@ -595,6 +609,30 @@ class LiveBroker(SimulatedBroker):
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
         self._starting_equity    = None # ZUSD balance at first trade of the session
+
+    # ------------------------------------------------------------------
+    # Portfolio exposure — live override
+    # ------------------------------------------------------------------
+
+    def _compute_portfolio_exposure(self):
+        """
+        Override for LiveBroker: spot_positions stores raw unit quantities
+        (e.g. 300 XLM, 0.5 SOL) rather than fractional exposures, so we
+        must convert using live prices and total equity before summing.
+        Futures positions are already stored as fractions (unchanged).
+        """
+        equity = self.compute_total_equity() if hasattr(self, "compute_total_equity") else 0.0
+        if equity <= 0:
+            return 0.0, 0.0, 0.0
+
+        total_spot = 0.0
+        for asset, qty in self.spot_positions.items():
+            price = self.live_prices.get(asset, 0.0)
+            if price > 0:
+                total_spot += abs(qty * price / equity)
+
+        total_fut = sum(abs(v) for v in self.futures_positions.values())
+        return total_spot, total_fut, total_spot + total_fut
 
     # ------------------------------------------------------------------
     # Health / kill-switch
@@ -827,9 +865,15 @@ class LiveBroker(SimulatedBroker):
         """
         Fetch open futures positions from Kraken Futures.
 
-        Uses the fully wired _kraken_futures_private client.
-        Populates self.futures_positions with {asset: size}.
+        Paper mode: no HTTP call — paper positions are maintained entirely by
+        run_futures_overlay(); returns the current dict unchanged.
+        Live mode: calls _kraken_futures_private → /openpositions.
+        Populates self.futures_positions with {asset: fractional_delta}.
         """
+        if self.futures_paper_mode:
+            print(f"[PAPER FUTURES POSITIONS] {self.futures_positions}")
+            return self.futures_positions
+
         resp = self._kraken_futures_private("/openpositions", {}, method="GET")
 
         if not resp:
@@ -1159,9 +1203,7 @@ class LiveBroker(SimulatedBroker):
         """
         futures_symbol = self.kraken_futures_pairs.get(asset)
         if futures_symbol is None:
-            # Not a kill-switch condition — some assets simply have no futures.
-            print(f"[FUT BUILD] {asset} has no Kraken Futures contract — skipping")
-            return None
+            return None   # Asset has no futures contract (e.g. HBAR, XLM) — skip silently
 
         if price is None or price <= 0:
             self.trigger_kill_switch(f"Invalid price for futures order: {asset} price={price}")
@@ -1408,13 +1450,19 @@ class LiveBroker(SimulatedBroker):
         """
         Submit a futures/perps order to the Kraken Futures endpoint.
 
-        Calls _kraken_futures_private (separate base URL + auth scheme from
-        spot).  That helper is scaffolded here and can be wired when the
-        Kraken Futures API credentials are ready.
+        Paper mode: logs the order and returns a mock success (no HTTP call).
+        Live mode: calls _kraken_futures_private → /sendorder on futures.kraken.com.
         Returns the result dict on success, or None on failure.
         """
         if not order:
             return None
+
+        if self.futures_paper_mode:
+            paper_id = f"PAPER-{int(time.time() * 1000) % 10_000_000}"
+            print(f"[PAPER FUTURES FILLED]  {order['symbol']}"
+                  f"  side={order['side']}  size={order['size']}"
+                  f"  type={order['orderType']}  id={paper_id}")
+            return {"status": "paperFilled", "order_id": paper_id}
 
         resp = self._kraken_futures_private("/sendorder", order)
         if not resp:
@@ -1516,8 +1564,9 @@ class LiveBroker(SimulatedBroker):
         """
         Fetch the USD collateral balance from the Kraken Futures account.
 
-        Calls GET /accounts on futures.kraken.com and extracts the
-        'cash' (or 'portfolioValue') field for the USD-settled account.
+        Paper mode: simulates 25 % of current spot equity as collateral.
+        Live mode: calls GET /accounts on futures.kraken.com.
+
         Returns 0.0 on any failure (futures overlay continues with last
         known balance; does not disable the overlay on a transient error).
 
@@ -1525,6 +1574,15 @@ class LiveBroker(SimulatedBroker):
         """
         if not self.futures_available:
             return self.futures_wallet_usd
+
+        if self.futures_paper_mode:
+            spot_equity = self.compute_total_equity()
+            balance = round(spot_equity * 0.25, 2)
+            self.futures_wallet_usd     = balance
+            self.last_futures_wallet_ts = time.time()
+            print(f"[PAPER FUTURES WALLET] Simulated collateral: ${balance:.2f}"
+                  f"  (25% of spot equity ${spot_equity:.2f})")
+            return balance
 
         resp = self._kraken_futures_private("/accounts", {}, method="GET")
         if not resp:
@@ -1630,16 +1688,17 @@ class LiveBroker(SimulatedBroker):
 
         order = self._build_futures_order(asset, price, delta_exposure)
         if order is None:
-            print(f"[LIVE FUTURES NO-OP]   {asset}  delta={delta_exposure:+.4f}")
+            label = "PAPER FUTURES NO-OP " if self.futures_paper_mode else "LIVE FUTURES NO-OP "
+            print(f"[{label}]  {asset}  delta={delta_exposure:+.4f}")
             return 0.0
 
         if self.dry_run:
-            print(f"[LIVE FUTURES DRY-RUN] {asset}  order={order}")
+            label = "PAPER FUTURES DRY-RUN" if self.futures_paper_mode else "LIVE FUTURES DRY-RUN"
+            print(f"[{label}] {asset}  order={order}")
             return 0.0
 
-        # Live path — submit to Kraken Futures
         result = self._submit_futures_order(order)
-        if result is None:
+        if result is None and not self.futures_paper_mode:
             print(f"[LIVE FUTURES FAILED]  {asset}  order={order}")
         return 0.0
 
@@ -1693,7 +1752,8 @@ class LiveBroker(SimulatedBroker):
         n_tradeable         = len(self.kraken_futures_pairs)   # assets with liquid contracts
         per_asset_budget    = futures_budget_usd / max(n_tradeable, 1)
 
-        print(f"[FUT OVERLAY] wallet=${self.futures_wallet_usd:.2f}"
+        mode_tag = "PAPER FUT OVERLAY" if self.futures_paper_mode else "FUT OVERLAY"
+        print(f"[{mode_tag}] wallet=${self.futures_wallet_usd:.2f}"
               f"  budget=${futures_budget_usd:.2f}"
               f"  per_asset=${per_asset_budget:.2f}"
               f"  cycle={cycle_phase}  vol_scaler={vol_scaler:.2f}"
@@ -1703,6 +1763,10 @@ class LiveBroker(SimulatedBroker):
             # Re-check after each asset in case auth failure disabled futures mid-loop
             if not self.futures_available:
                 break
+
+            # Skip assets that have no Kraken Futures perpetual contract
+            if a not in self.kraken_futures_pairs:
+                continue
 
             price = prices.get(a, 0.0)
             if price <= 0:
@@ -1796,15 +1860,17 @@ class LiveBroker(SimulatedBroker):
                 delta_fut = (min(delta_fut, _allowed) if delta_fut > 0
                              else max(delta_fut, -_allowed))
 
+            asset_tag = "PAPER FUT" if self.futures_paper_mode else "FUT OVERLAY"
             if abs(delta_fut) > 0.01:
                 delta_fut_slipped = self._apply_slippage(delta_fut,
                                                          self.futures_slippage_bps)
-                print(f"  [FUT OVERLAY] {a}: delta={delta_fut:+.4f}"
-                      f"  slipped={delta_fut_slipped:+.4f}  price={price}")
+                print(f"  [{asset_tag}] {a}: delta={delta_fut:+.4f}"
+                      f"  slipped={delta_fut_slipped:+.4f}  price={price}"
+                      f"  pos={current_fut:+.4f} → {current_fut + delta_fut_slipped:+.4f}")
                 self._execute_futures_trade(a, price, delta_fut_slipped)
                 self.futures_positions[a] = current_fut + delta_fut_slipped
             else:
-                print(f"  [FUT OVERLAY] {a}: delta={delta_fut:+.5f}  (below 1% — skip)")
+                print(f"  [{asset_tag}] {a}: delta={delta_fut:+.5f}  (below 1% — skip)")
 
 
 # ======================================================================

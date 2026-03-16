@@ -152,9 +152,14 @@ def run_live():
     print("[MAIN] Starting live trading loop...")
     broker = LiveBroker(dry_run=False)
 
-    # Attempt to fetch the futures wallet balance at startup so the overlay
-    # knows how much collateral is available before the first rebalancing window.
-    print("[MAIN] Fetching futures wallet balance...")
+    # Fetch futures wallet at startup so the overlay has collateral info
+    # before the first rebalancing window fires.
+    # Paper mode: simulates 25% of spot equity as collateral (no HTTP call).
+    # Live mode: fetches real balance from futures.kraken.com.
+    if broker.futures_paper_mode:
+        print("[MAIN] Futures overlay: PAPER mode — simulating collateral from spot equity.")
+    else:
+        print("[MAIN] Futures overlay: LIVE mode — fetching real collateral from futures.kraken.com.")
     broker.fetch_futures_wallet()
 
     agent  = ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False)

@@ -565,7 +565,11 @@ class ReinforcementLearningTrader(TraderAgent):
         # Free USD cash caps buy spending; sells are limited by actual holdings
         remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
-        # Sync spot_positions from live Kraken balances so sells reflect real holdings
+        # Sync spot_positions from live Kraken balances so sells reflect real holdings.
+        # Values are stored as raw unit quantities (e.g. 300 XLM, 0.5 SOL) so that
+        # the sell-cap logic below (min(delta_units, current_units)) works correctly.
+        # _compute_portfolio_exposure() is overridden in LiveBroker to convert
+        # these to fractional exposures before computing leverage totals.
         spot_positions = getattr(self.broker, "spot_positions", {})
         if hasattr(self.broker, "kraken_balance_keys"):
             for asset, bal_key in self.broker.kraken_balance_keys.items():
