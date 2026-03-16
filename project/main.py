@@ -151,6 +151,12 @@ def run_live():
     """Launch the Kraken live trading loop (MODE='live')."""
     print("[MAIN] Starting live trading loop...")
     broker = LiveBroker(dry_run=False)
+
+    # Attempt to fetch the futures wallet balance at startup so the overlay
+    # knows how much collateral is available before the first rebalancing window.
+    print("[MAIN] Fetching futures wallet balance...")
+    broker.fetch_futures_wallet()
+
     agent  = ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False)
     agent.warm_up(broker, cycles=5)
     if not agent.ready:

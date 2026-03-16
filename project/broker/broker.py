@@ -520,12 +520,26 @@ class LiveBroker(SimulatedBroker):
         self.kraken_base_url = "https://api.kraken.com"
         self.kraken_session  = requests.Session()
 
-        # Kraken Futures REST configuration — same keypair as spot
-        self.futures_api_key    = self.kraken_api_key
-        self.futures_api_secret = self.kraken_api_secret
+        # Kraken Futures REST configuration.
+        # Futures.kraken.com uses SEPARATE API credentials from spot.
+        # Generate them at: https://futures.kraken.com → Settings → API Keys
+        # Store as KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET.
+        # Falls back to spot keys if futures-specific keys are absent (will
+        # likely fail auth — futures overlay auto-disables in that case).
+        self.futures_api_key    = (os.getenv("KRAKEN_FUTURES_API_KEY")
+                                   or self.kraken_api_key)
+        self.futures_api_secret = (os.getenv("KRAKEN_FUTURES_API_SECRET")
+                                   or self.kraken_api_secret)
         self.futures_base_url   = "https://futures.kraken.com/derivatives/api/v3"
         # Set to False automatically if auth fails (spot bot continues unaffected)
         self.futures_available  = True
+
+        # Futures wallet balance (USD collateral in the Kraken Futures account).
+        # Refreshed at startup and after each rebalancing window.
+        # Futures position sizing is capped to futures_wallet_usd × max_leverage.
+        self.futures_wallet_usd     = 0.0
+        self.futures_max_leverage   = 2.0    # max 2× the futures wallet collateral
+        self.last_futures_wallet_ts = 0.0    # Unix timestamp of last balance fetch
 
         # Map internal asset names → Kraken ticker symbols
         self.kraken_pairs = {
@@ -816,7 +830,7 @@ class LiveBroker(SimulatedBroker):
         Uses the fully wired _kraken_futures_private client.
         Populates self.futures_positions with {asset: size}.
         """
-        resp = self._kraken_futures_private("/openpositions", {})
+        resp = self._kraken_futures_private("/openpositions", {}, method="GET")
 
         if not resp:
             print("[FUTURES POSITIONS] No response from Kraken Futures")
@@ -1156,10 +1170,17 @@ class LiveBroker(SimulatedBroker):
         if delta_exposure == 0:
             return None
 
-        # Convert fractional delta (fraction of equity) → coin units.
-        # Kraken Futures size is in base currency units (e.g. SOL for PF_SOLUSD).
-        equity    = self.compute_total_equity() or 1.0
-        coin_size = round(abs(delta_exposure * equity) / price, 8)
+        # Convert fractional delta → coin units.
+        # Sizing basis = futures wallet collateral × allowed leverage.
+        # If the futures wallet hasn't been fetched yet, fall back to spot
+        # equity so the overlay still produces a non-zero order.
+        if self.futures_wallet_usd > 0:
+            sizing_usd = self.futures_wallet_usd * self.futures_max_leverage
+        else:
+            sizing_usd = self.compute_total_equity() or 1.0
+
+        # Kraken Futures size is in base-currency units (e.g. SOL for PF_SOLUSD).
+        coin_size = round(abs(delta_exposure * sizing_usd) / price, 8)
 
         if coin_size == 0:
             return None
@@ -1420,15 +1441,19 @@ class LiveBroker(SimulatedBroker):
         print(f"[LIVE FUTURES SUBMITTED] order_id={order_id}  status={send_status.get('status')}")
         return send_status
 
-    def _kraken_futures_private(self, path: str, data: dict | None = None):
+    def _kraken_futures_private(self, path: str, data: dict | None = None,
+                                method: str = "POST"):
         """
         Real Kraken Futures private REST request.
 
         Kraken Futures signing scheme (different from spot):
-          postData  = URL-encoded form body
+          postData  = URL-encoded form body  (empty string for GET requests)
           nonce     = millisecond timestamp string
           message   = SHA-256(postData + nonce + endpoint)
           Authent   = Base64( HMAC-SHA512(message, Base64Decode(api_secret)) )
+
+        Use method="GET" for read-only endpoints (/accounts, /openpositions).
+        Use method="POST" for order submission (/sendorder).
 
         Ref: https://docs.kraken.com/api/docs/futures-api/authenication
         """
@@ -1444,7 +1469,7 @@ class LiveBroker(SimulatedBroker):
 
         url      = self.futures_base_url + path
         nonce    = str(int(time.time() * 1000))
-        postdata = urllib.parse.urlencode(data)
+        postdata = urllib.parse.urlencode(data) if data else ""
 
         # 1. SHA-256 of (postData + nonce + endpoint)
         sha256_hash = hashlib.sha256(
@@ -1469,7 +1494,10 @@ class LiveBroker(SimulatedBroker):
         }
 
         try:
-            resp = requests.post(url, headers=headers, data=postdata, timeout=10)
+            if method.upper() == "GET":
+                resp = requests.get(url, headers=headers, timeout=10)
+            else:
+                resp = requests.post(url, headers=headers, data=postdata, timeout=10)
         except Exception as e:
             print(f"[FUTURES REQUEST ERROR] {e}")
             return None
@@ -1483,6 +1511,67 @@ class LiveBroker(SimulatedBroker):
         except Exception:
             print("[FUTURES] JSON decode error")
             return None
+
+    def fetch_futures_wallet(self) -> float:
+        """
+        Fetch the USD collateral balance from the Kraken Futures account.
+
+        Calls GET /accounts on futures.kraken.com and extracts the
+        'cash' (or 'portfolioValue') field for the USD-settled account.
+        Returns 0.0 on any failure (futures overlay continues with last
+        known balance; does not disable the overlay on a transient error).
+
+        Updates self.futures_wallet_usd and self.last_futures_wallet_ts.
+        """
+        if not self.futures_available:
+            return self.futures_wallet_usd
+
+        resp = self._kraken_futures_private("/accounts", {}, method="GET")
+        if not resp:
+            print("[FUTURES WALLET] Could not fetch balance — keeping last known:"
+                  f" ${self.futures_wallet_usd:.2f}")
+            return self.futures_wallet_usd
+
+        # Detect API-level auth errors (returns 200 OK but result="error")
+        if resp.get("result") == "error":
+            err = resp.get("error", "unknown")
+            print(f"[FUTURES WALLET] API error: {err}")
+            if "auth" in str(err).lower() or "credential" in str(err).lower():
+                print("[FUTURES WALLET] Auth failed — futures overlay disabled.")
+                print("  Add KRAKEN_FUTURES_API_KEY + KRAKEN_FUTURES_API_SECRET secrets")
+                print("  from: https://futures.kraken.com → Settings → API Keys")
+                self.futures_available = False
+            return self.futures_wallet_usd
+
+        # Kraken Futures /accounts returns:
+        # { "result": "success", "accounts": { "flex": {...}, "cash": {...} } }
+        # The flex account is the multi-collateral pool; cash is USD-only.
+        accounts = resp.get("accounts", {})
+        print(f"[FUTURES WALLET] Account keys: {list(accounts.keys())}")
+
+        # Try flex account first (multi-collateral), then cash account
+        flex = accounts.get("flex", {})
+        cash = accounts.get("cash", {})
+
+        balance = 0.0
+        if flex:
+            # portfolioValue is the USD-equivalent total value
+            balance = float(flex.get("portfolioValue", 0.0))
+        if balance == 0.0 and cash:
+            balance = float(cash.get("balance", 0.0))
+
+        # Fallback: sum all account balances if neither key found
+        if balance == 0.0 and accounts:
+            for acct_name, acct_data in accounts.items():
+                if isinstance(acct_data, dict):
+                    b = float(acct_data.get("portfolioValue",
+                              acct_data.get("balance", 0.0)))
+                    balance = max(balance, b)
+
+        self.futures_wallet_usd     = balance
+        self.last_futures_wallet_ts = time.time()
+        print(f"[FUTURES WALLET] Balance: ${balance:.2f} USD collateral")
+        return balance
 
     # ------------------------------------------------------------------
     # Live order execution (overrides SimulatedBroker private helpers)
@@ -1579,6 +1668,17 @@ class LiveBroker(SimulatedBroker):
         if not self.futures_available:
             return
 
+        # Refresh futures wallet balance (throttled: at most once per 5 min)
+        if time.time() - self.last_futures_wallet_ts > 300:
+            self.fetch_futures_wallet()
+
+        # If no collateral is known yet, try once and bail if still zero
+        if self.futures_wallet_usd <= 0:
+            self.fetch_futures_wallet()
+            if self.futures_wallet_usd <= 0:
+                print("[FUT OVERLAY] No collateral in futures wallet — skipping overlay")
+                return
+
         regime      = regime or {}
         cycle_phase = int(regime.get("cycle_phase", 1))   # 1 = late-accum / early-bull
         vol_scaler  = float(regime.get("vol_scaler",  1.0))
@@ -1587,7 +1687,16 @@ class LiveBroker(SimulatedBroker):
 
         spot_w, fut_w = _get_spot_futures_weights(cycle_phase)
 
-        print(f"[FUT OVERLAY] cycle={cycle_phase}  vol_scaler={vol_scaler:.2f}"
+        # Total USD notional the futures wallet can support (collateral × leverage).
+        # We keep per-asset allocation modest to stay within margin requirements.
+        futures_budget_usd  = self.futures_wallet_usd * self.futures_max_leverage
+        n_tradeable         = len(self.kraken_futures_pairs)   # assets with liquid contracts
+        per_asset_budget    = futures_budget_usd / max(n_tradeable, 1)
+
+        print(f"[FUT OVERLAY] wallet=${self.futures_wallet_usd:.2f}"
+              f"  budget=${futures_budget_usd:.2f}"
+              f"  per_asset=${per_asset_budget:.2f}"
+              f"  cycle={cycle_phase}  vol_scaler={vol_scaler:.2f}"
               f"  panic={panic_risk}  top={top_risk}")
 
         for a in agent.assets:
