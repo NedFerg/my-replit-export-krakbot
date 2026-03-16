@@ -169,6 +169,11 @@ class Simulation:
         self.top_risk      = 0
         self.prev_top_risk = 0
 
+        # --- Multi-asset rotation engine ----------------------------------
+        # rotation_score[asset] ∈ [0, ~4.5] — higher = current leader
+        self.rotation_score      = {}   # asset → score this step
+        self.prev_rotation_score = {}   # asset → score last step (for feedback)
+
         # --- Macro feedback message log -----------------------------------
         # Populated each step when manual flag conflicts with signals,
         # or when AUTO mode detects uncertain / mixed conditions.
@@ -533,6 +538,60 @@ class Simulation:
             state.macro_regime     = self.macro_regime
             state.internal_regime  = self.internal_regime
 
+            # --- Multi-asset rotation engine ------------------------------
+            # Derives relative strength for SOL, XRP, LINK, ETH vs BTC/ETH
+            # anchors using existing price buffers — no new data sources.
+            _rot_assets = ["SOL", "XRP", "LINK", "ETH"]
+            _btc_prices = self.asset_prices["BTC"]
+            _eth_prices = self.asset_prices["ETH"]
+
+            self.rotation_score = {}
+
+            for _ra in _rot_assets:
+                _rap = self.asset_prices[_ra]
+                _rap_n = len(_rap)
+
+                # Short-term momentum (5-step percentage return)
+                _rm5_a   = (_rap[-1] - _rap[-5])   / max(_rap[-5],   1e-6) if _rap_n >= 5  else 0.0
+                _rm5_btc = (_btc_prices[-1] - _btc_prices[-5]) / max(_btc_prices[-5], 1e-6) \
+                           if len(_btc_prices) >= 5 else 0.0
+
+                # Medium-term momentum (20-step percentage return)
+                _rm20_a   = (_rap[-1] - _rap[-20])  / max(_rap[-20],  1e-6) if _rap_n >= 20 else 0.0
+                _rm20_btc = (_btc_prices[-1] - _btc_prices[-20]) / max(_btc_prices[-20], 1e-6) \
+                            if len(_btc_prices) >= 20 else 0.0
+
+                # Strength ratios vs anchor assets
+                _vs_btc = _rap[-1] / max(_btc_prices[-1], 1e-6) if _btc_prices else 0.0
+                _vs_eth = _rap[-1] / max(_eth_prices[-1], 1e-6) if _eth_prices else 0.0
+
+                _rscore = 0.0
+                if _rm5_a > 0:               _rscore += 1.0   # positive 5-step mom
+                if _rm5_a > _rm5_btc:        _rscore += 0.5   # outperforming BTC (5-step)
+                if _rm20_a > 0:              _rscore += 1.0   # positive 20-step mom
+                if _rm20_a > _rm20_btc:      _rscore += 0.5   # outperforming BTC (20-step)
+                if _vs_btc > 1.0:            _rscore += 0.5   # priced above BTC ratio
+                if _vs_eth > 1.0:            _rscore += 0.5   # priced above ETH ratio
+                _rscore += 0.5 * self.altseason_index          # altseason tailwind
+
+                self.rotation_score[_ra] = _rscore
+
+            setattr(state, "rotation_score", self.rotation_score)
+
+            # Rotation feedback: only on meaningful score shifts (>1.0)
+            for _ra in _rot_assets:
+                _rold = self.prev_rotation_score.get(_ra)
+                _rnew = self.rotation_score[_ra]
+                if _rold is not None and abs(_rnew - _rold) > 1.0:
+                    _rmsg = (
+                        f"Rotation shift: {_ra} score changed "
+                        f"{_rold:.2f} → {_rnew:.2f}"
+                    )
+                    self.macro_messages.append(_rmsg)
+                    print(_rmsg)
+
+            self.prev_rotation_score = self.rotation_score.copy()
+
             # --- Blow-off top detection -----------------------------------
             # Scores late-cycle, unsustainable acceleration using existing
             # regime features — no new data sources required.
@@ -613,6 +672,12 @@ class Simulation:
                     _cap *= 0.8   # early warning: moderate reduction
                 elif self.top_risk == 2:
                     _cap *= 0.5   # blow-off: de-risk hard
+
+                # Rotation tilt: leaders get up to +20% cap
+                # BTC is the anchor so has no rotation score entry (returns 0.0)
+                _rot_raw  = self.rotation_score.get(_asset, 0.0)
+                _rot_norm = min(1.0, _rot_raw / 4.0)   # normalise to [0, 1]
+                _cap *= (1.0 + 0.2 * _rot_norm)
 
                 # Clamp to [0.1, 1.5 × base]
                 self.dynamic_caps[_asset] = max(0.1, min(1.5 * _base, _cap))
@@ -820,6 +885,16 @@ class Simulation:
                             reward -= 1.0 * turnover
                             if step_return < 0:
                                 reward -= 2.0 * abs(step_return)
+
+                        # --- Rotation leader bonus ------------------------
+                        # Small positive signal toward overweighting leaders;
+                        # averaged across all scored alts so it's portfolio-level.
+                        if self.rotation_score:
+                            _rot_bonus = 0.01 * (
+                                sum(self.rotation_score.values())
+                                / len(self.rotation_score)
+                            )
+                            reward += _rot_bonus
 
                         # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)

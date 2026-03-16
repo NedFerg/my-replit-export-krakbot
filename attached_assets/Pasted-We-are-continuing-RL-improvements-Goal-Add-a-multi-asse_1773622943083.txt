@@ -1,0 +1,130 @@
+We are continuing RL improvements.
+
+Goal:  
+Add a multi‑asset rotation engine that computes per‑asset relative strength scores, produces a rotation_score[asset] dictionary, and integrates rotation into:
+
+    reward shaping
+
+    dynamic caps
+
+    feedback messages
+
+This module should nudge the RL agent toward intelligent rotation without hard‑coding behavior.
+
+All RL core logic (actor, critic, replay, microstructure, etc.) stays unchanged.
+1. Add relative strength signals
+
+In simulation.py, after computing regime features, add:
+python
+
+# --- Relative strength signals for rotation ---
+prices = {
+    "SOL": self.sol_price,
+    "XRP": self.xrp_price,
+    "LINK": self.link_price,
+    "ETH": self.eth_price,
+    "BTC": self.btc_price,
+}
+
+# 1. Short-term momentum (5-step)
+mom_5 = {a: (prices[a] - self.prev_prices[a]) / max(self.prev_prices[a], 1e-6)
+         for a in prices}
+
+# 2. Medium-term momentum (20-step)
+mom_20 = {a: (prices[a] - self.prev_prices_20[a]) / max(self.prev_prices_20[a], 1e-6)
+          for a in prices}
+
+# 3. Strength vs BTC (anchor asset)
+vs_btc = {a: prices[a] / max(prices["BTC"], 1e-6) for a in prices}
+
+# 4. Strength vs ETH (secondary anchor)
+vs_eth = {a: prices[a] / max(prices["ETH"], 1e-6) for a in prices}
+
+Make sure prev_prices and prev_prices_20 are updated each step (similar to how you track returns).
+2. Compute rotation scores
+
+Add:
+python
+
+# --- Rotation score per asset ---
+self.rotation_score = {}
+
+for a in ["SOL", "XRP", "LINK", "ETH"]:
+    score = 0.0
+
+    # Short-term momentum
+    if mom_5[a] > 0:
+        score += 1.0
+    if mom_5[a] > mom_5["BTC"]:
+        score += 0.5
+
+    # Medium-term momentum
+    if mom_20[a] > 0:
+        score += 1.0
+    if mom_20[a] > mom_20["BTC"]:
+        score += 0.5
+
+    # Strength vs BTC and ETH
+    if vs_btc[a] > 1.0:
+        score += 0.5
+    if vs_eth[a] > 1.0:
+        score += 0.5
+
+    # Altseason boost
+    score += 0.5 * self.altseason_index
+
+    self.rotation_score[a] = score
+
+Attach to state:
+python
+
+setattr(state, "rotation_score", self.rotation_score)
+
+3. Integrate rotation into dynamic caps
+
+In the dynamic caps block, after regime and top_risk scaling, add:
+python
+
+# Rotation tilt: leaders get slightly higher caps
+rot = self.rotation_score.get(asset, 0.0)
+
+# Normalize rotation score (0–1 range)
+rot_norm = min(1.0, rot / 4.0)
+
+# Leaders get up to +20% cap
+cap *= (1.0 + 0.2 * rot_norm)
+
+This gently rewards strong assets without forcing behavior.
+4. Integrate rotation into reward shaping
+
+After computing reward, add:
+python
+
+# Reward tilt for rotation: encourage overweighting leaders
+if asset in self.rotation_score:
+    leader_bonus = 0.01 * self.rotation_score[asset]
+    reward += leader_bonus
+
+This is small but directional — enough to guide learning.
+5. Add rotation feedback messages
+
+After computing rotation scores:
+python
+
+# --- Rotation feedback ---
+if not hasattr(self, "prev_rotation_score"):
+    self.prev_rotation_score = {}
+
+# Detect meaningful shifts
+for a in ["SOL", "XRP", "LINK", "ETH"]:
+    old = self.prev_rotation_score.get(a, None)
+    new = self.rotation_score[a]
+
+    if old is not None and abs(new - old) > 1.0:
+        msg = f"Rotation shift: {a} score changed {old:.2f} → {new:.2f}"
+        self.macro_messages.append(msg)
+        print(msg)
+
+self.prev_rotation_score = self.rotation_score.copy()
+
+This prints only on real transitions, not every step.
