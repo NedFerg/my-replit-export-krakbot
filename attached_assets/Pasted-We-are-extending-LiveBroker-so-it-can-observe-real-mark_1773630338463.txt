@@ -1,0 +1,113 @@
+We are extending LiveBroker so it can observe real market prices from Kraken while remaining fully non‑trading.
+
+Goal:  
+Add:
+
+    a Kraken ticker fetcher
+
+    a method to update internal prices
+
+    stale‑data protection
+
+    no live orders, no balance sync, no trading
+
+1. Add a mapping from your asset symbols → Kraken ticker pairs
+
+Inside LiveBroker.__init__, add:
+python
+
+        # Map internal asset names to Kraken ticker symbols
+        self.kraken_pairs = {
+            "BTC": "XBTUSD",
+            "ETH": "ETHUSD",
+            "SOL": "SOLUSD",
+            "AVAX": "AVAXUSD",
+            "LINK": "LINKUSD",
+            "HBAR": "HBARUSD",
+            "XRP": "XRPUSD",
+            "XLM": "XLMUSD",
+        }
+
+        # Live price cache
+        self.live_prices = {}
+        self.last_price_timestamp = 0
+
+2. Add a method to fetch live prices from Kraken
+
+Add this inside the LiveBroker class:
+python
+
+    def fetch_live_prices(self):
+        """
+        Fetch live prices for all tracked assets using Kraken's public ticker API.
+        Still safe: no trading, no private endpoints.
+        """
+        result = {}
+
+        for asset, pair in self.kraken_pairs.items():
+            data = self._kraken_public(f"/0/public/Ticker", {"pair": pair})
+            if not data or "result" not in data:
+                print(f"[PRICE FEED ERROR] No data for {asset}")
+                continue
+
+            # Kraken returns a dict keyed by the pair name
+            ticker_key = list(data["result"].keys())[0]
+            ticker = data["result"][ticker_key]
+
+            # 'c' = last trade price array: [price, lot volume]
+            try:
+                price = float(ticker["c"][0])
+                result[asset] = price
+            except Exception:
+                print(f"[PRICE PARSE ERROR] {asset}")
+                continue
+
+        # Update cache
+        if result:
+            self.live_prices = result
+            self.last_price_timestamp = time.time()
+
+        return result
+
+3. Add stale‑data protection
+
+Add this method inside LiveBroker:
+python
+
+    def prices_are_fresh(self, max_age_sec=10):
+        """
+        Ensure we never trade on stale or missing data.
+        """
+        if not self.live_prices:
+            return False
+        if time.time() - self.last_price_timestamp > max_age_sec:
+            return False
+        return True
+
+4. Add a safe wrapper to update internal prices before each step
+
+Add this inside LiveBroker:
+python
+
+    def update_prices_if_needed(self):
+        """
+        Called before each portfolio step.
+        Ensures fresh prices; triggers kill-switch if data is stale.
+        """
+        if not self.prices_are_fresh():
+            print("[PRICE FEED] Refreshing live prices...")
+            self.fetch_live_prices()
+
+        if not self.prices_are_fresh():
+            self.trigger_kill_switch("Stale or missing live prices")
+
+5. Integrate price updates into the live execution loop
+
+Inside your main loop (wherever LiveBroker is used), call:
+python
+
+live_broker.update_prices_if_needed()
+
+before any exposure calculations.
+
+If your agent needs a specific insertion point, it will ask — but this is the correct conceptual placement.

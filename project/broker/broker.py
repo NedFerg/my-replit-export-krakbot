@@ -508,6 +508,22 @@ class LiveBroker(SimulatedBroker):
         self.kraken_base_url = "https://api.kraken.com"
         self.kraken_session  = requests.Session()
 
+        # Map internal asset names → Kraken ticker symbols
+        self.kraken_pairs = {
+            "BTC":  "XBTUSD",
+            "ETH":  "ETHUSD",
+            "SOL":  "SOLUSD",
+            "AVAX": "AVAXUSD",
+            "LINK": "LINKUSD",
+            "HBAR": "HBARUSD",
+            "XRP":  "XRPUSD",
+            "XLM":  "XLMUSD",
+        }
+
+        # Live price cache (populated by fetch_live_prices)
+        self.live_prices           = {}   # asset → latest float price
+        self.last_price_timestamp  = 0    # Unix timestamp of last successful fetch
+
     # ------------------------------------------------------------------
     # Health / kill-switch
     # ------------------------------------------------------------------
@@ -607,10 +623,59 @@ class LiveBroker(SimulatedBroker):
 
     def fetch_live_prices(self):
         """
-        Stub: fetch latest mid-prices from Kraken REST or WebSocket.
-        Not yet implemented — simulation still provides price data.
+        Fetch the latest mid-price for all tracked assets via Kraken's
+        public Ticker endpoint.  No authentication required; no orders placed.
+        Updates self.live_prices and self.last_price_timestamp on success.
         """
-        pass
+        result = {}
+
+        for asset, pair in self.kraken_pairs.items():
+            data = self._kraken_public("/0/public/Ticker", {"pair": pair})
+            if not data or "result" not in data:
+                print(f"[PRICE FEED ERROR] No data for {asset} ({pair})")
+                continue
+
+            # Kraken keys the result by the normalised pair name (may differ from request)
+            ticker_key = list(data["result"].keys())[0]
+            ticker     = data["result"][ticker_key]
+
+            # 'c' = last trade closed: [price, lot_volume]
+            try:
+                price          = float(ticker["c"][0])
+                result[asset]  = price
+            except Exception:
+                print(f"[PRICE PARSE ERROR] Could not parse last trade for {asset}")
+                continue
+
+        if result:
+            self.live_prices          = result
+            self.last_price_timestamp = time.time()
+
+        return result
+
+    def prices_are_fresh(self, max_age_sec: float = 10.0) -> bool:
+        """
+        Return True only when the price cache is non-empty and younger than
+        `max_age_sec` seconds.  Guards against stale or missing data.
+        """
+        if not self.live_prices:
+            return False
+        if time.time() - self.last_price_timestamp > max_age_sec:
+            return False
+        return True
+
+    def update_prices_if_needed(self):
+        """
+        Call before each portfolio step when running in live mode.
+        Refreshes the price cache if stale; triggers the kill switch if the
+        refresh still fails — so the system never acts on bad data.
+        """
+        if not self.prices_are_fresh():
+            print("[PRICE FEED] Refreshing live prices...")
+            self.fetch_live_prices()
+
+        if not self.prices_are_fresh():
+            self.trigger_kill_switch("Stale or missing live prices — halting order flow")
 
     def sync_live_positions(self):
         """
