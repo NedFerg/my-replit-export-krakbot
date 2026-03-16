@@ -569,7 +569,7 @@ class LiveBroker(SimulatedBroker):
         # --- Automatic safety limits (first-night harness) ---------------
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
         self.max_total_notional     = 200.0   # USD cap across all open positions
-        self.max_trades_per_hour    = 10      # rate limiter
+        self.max_trades_per_hour    = 30      # rate limiter (≈ 3 cycles worth of orders)
         self.max_daily_loss         = 50.0    # USD drawdown cap from session start (true P&L, not cash)
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
@@ -1247,7 +1247,8 @@ class LiveBroker(SimulatedBroker):
             return False
 
         # Per-asset notional cap — soft reject (skip this order, don't halt the bot)
-        if price and abs(delta_exposure * price) > self.max_notional_per_asset:
+        # Use 1.001× threshold to absorb floating-point boundary rounding
+        if price and abs(delta_exposure * price) > self.max_notional_per_asset * 1.001:
             print(f"[SAFETY] Per-asset cap: skipping {asset} "
                   f"(|{delta_exposure:.4f}| × {price:.2f}"
                   f" = {abs(delta_exposure * price):.2f}"

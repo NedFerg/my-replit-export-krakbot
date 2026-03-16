@@ -517,9 +517,24 @@ class ReinforcementLearningTrader(TraderAgent):
         # ----------------------------------------------------------------
         MIN_TRADE_USD = 5.0   # Kraken per-asset minimums; keep well above them
 
+        # Rebalancing cooldown — only execute orders every 5 minutes.
+        # The RL agent generates signals every 5 s; without this gate the bot
+        # would churn the portfolio on every random signal and burn through
+        # the hourly trade-rate limit within a few steps.
+        REBALANCE_COOLDOWN_SEC = 300   # 5 minutes between rebalancing rounds
+        _now = time.time()
+        _last_rebal = getattr(self.broker, "_last_rebalance_time", 0.0)
+        if _now - _last_rebal < REBALANCE_COOLDOWN_SEC:
+            return   # too soon — skip this step
+        # Mark the rebalancing time so the next call respects the cooldown
+        if self.broker is not None:
+            self.broker._last_rebalance_time = _now
+
         # Refresh balances from Kraken so deposits are picked up immediately
         if hasattr(self.broker, "fetch_live_balances"):
             self.broker.fetch_live_balances()
+
+        live_balances = getattr(self.broker, "live_balances", {})
 
         # Anchor starting equity on first step (prices are loaded by now)
         if (hasattr(self.broker, "_starting_equity")
@@ -530,17 +545,26 @@ class ReinforcementLearningTrader(TraderAgent):
                 self.broker._starting_equity = anchor
                 print(f"  [EQUITY ANCHOR] Starting equity = {anchor:.2f} (ZUSD + crypto at live prices)")
 
-        # Equity available for sizing
-        zusd_str = getattr(self.broker, "live_balances", {}).get("ZUSD", "0")
-        equity   = float(zusd_str) if zusd_str else 0.0
+        # Total portfolio value for position sizing (ZUSD + all crypto at live prices)
+        if hasattr(self.broker, "compute_total_equity"):
+            equity = self.broker.compute_total_equity()
+        else:
+            equity = float(live_balances.get("ZUSD", "0") or 0)
+
         if equity <= 0:
             print("  [ORDER] No equity available — skipping order conversion")
             return
 
-        spot_positions = getattr(self.broker, "spot_positions", {})
+        # Free USD cash caps buy spending; sells are limited by actual holdings
+        remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
-        # Track cash spent this step so we don't overdraw across multiple orders
-        remaining_usd = equity
+        # Sync spot_positions from live Kraken balances so sells reflect real holdings
+        spot_positions = getattr(self.broker, "spot_positions", {})
+        if hasattr(self.broker, "kraken_balance_keys"):
+            for asset, bal_key in self.broker.kraken_balance_keys.items():
+                qty = float(live_balances.get(bal_key, 0.0) or 0.0)
+                if qty > 0:
+                    spot_positions[asset] = qty
 
         for a in self.assets:
             price = live_prices.get(a, 0.0)
@@ -557,6 +581,12 @@ class ReinforcementLearningTrader(TraderAgent):
             delta_frac  = target_frac - current_frac
             delta_usd   = delta_frac * equity
 
+            # Minimum drift gate — only rebalance if deviation > 8% of equity.
+            # Prevents churning the portfolio on every 5-second RL signal.
+            MIN_DRIFT_FRAC = 0.08
+            if abs(delta_frac) < MIN_DRIFT_FRAC:
+                continue
+
             # Clamp to per-asset notional cap before the order even reaches broker
             max_notional = getattr(self.broker, "max_notional_per_asset", 50.0)
             if delta_usd > 0:
@@ -566,7 +596,13 @@ class ReinforcementLearningTrader(TraderAgent):
 
             delta_units = abs(delta_usd) / price
 
-            if abs(delta_usd) < MIN_TRADE_USD:
+            # For sells: never exceed the units actually held
+            if delta_usd < 0 and current_units > 0:
+                delta_units = min(delta_units, current_units)
+            elif delta_usd < 0 and current_units <= 0:
+                continue   # nothing to sell
+
+            if delta_units * price < MIN_TRADE_USD:
                 continue   # dust — skip
 
             # Stop issuing buy orders if we've exhausted available cash
