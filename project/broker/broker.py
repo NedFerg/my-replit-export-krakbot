@@ -517,6 +517,8 @@ class LiveBroker(SimulatedBroker):
         self.futures_api_key    = self.kraken_api_key
         self.futures_api_secret = self.kraken_api_secret
         self.futures_base_url   = "https://futures.kraken.com/derivatives/api/v3"
+        # Set to False automatically if auth fails (spot bot continues unaffected)
+        self.futures_available  = True
 
         # Map internal asset names → Kraken ticker symbols
         self.kraken_pairs = {
@@ -528,6 +530,19 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
+        }
+
+        # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
+        # Only assets with liquid Kraken Futures contracts are listed here;
+        # assets absent from this map are skipped by run_futures_overlay().
+        self.kraken_futures_pairs = {
+            "BTC":  "PF_XBTUSD",
+            "ETH":  "PF_ETHUSD",
+            "SOL":  "PF_SOLUSD",
+            "XRP":  "PF_XRPUSD",
+            "LINK": "PF_LINKUSD",
+            "AVAX": "PF_AVAXUSD",
+            # HBAR and XLM do not have Kraken Futures perpetuals — skipped.
         }
 
         # Kraken balance-dict keys for each tracked asset
@@ -844,16 +859,13 @@ class LiveBroker(SimulatedBroker):
             except Exception:
                 continue
 
-        # Futures exposure (futures_positions keyed by symbol, e.g. "XBTUSD", "SOLUSD")
-        for symbol, size in (self.futures_positions or {}).items():
-            base  = symbol.replace("USD", "").replace("USDT", "")
-            price = None
-            if self.live_prices:
-                price = self.live_prices.get(base) or self.live_prices.get(symbol)
-            if price is None:
-                continue
+        # Futures exposure.
+        # futures_positions stores fractional deltas (fraction of equity, signed).
+        # Convert to USD by multiplying by total equity so leverage reads correctly.
+        fut_equity = self.compute_total_equity()
+        for asset, frac in (self.futures_positions or {}).items():
             try:
-                futures_exposure[symbol] = float(size) * float(price)
+                futures_exposure[asset] = float(frac) * fut_equity
             except Exception:
                 continue
 
@@ -1110,15 +1122,17 @@ class LiveBroker(SimulatedBroker):
 
     def _build_futures_order(self, asset, price, delta_exposure):
         """
-        Format a Kraken Futures / perps order payload from a fractional delta.
+        Format a Kraken Futures perpetual order payload from a fractional delta.
 
-        Uses the same kraken_pairs symbol mapping as spot for now; the
-        futures-specific symbol format (e.g. PI_XBTUSD) will be adjusted
-        when the real futures endpoint is wired.
-        Returns None for zero-delta or invalid inputs.
+        Uses kraken_futures_pairs (PF_ symbols) for the contract ticker.
+        Assets not listed in that map (e.g. HBAR, XLM) are soft-skipped with
+        None — no kill switch — because Kraken does not list them as futures.
+        Returns None for unknown assets, zero-delta or invalid inputs.
         """
-        if asset not in self.kraken_pairs:
-            self.trigger_kill_switch(f"Unknown asset for futures order: {asset}")
+        futures_symbol = self.kraken_futures_pairs.get(asset)
+        if futures_symbol is None:
+            # Not a kill-switch condition — some assets simply have no futures.
+            print(f"[FUT BUILD] {asset} has no Kraken Futures contract — skipping")
             return None
 
         if price is None or price <= 0:
@@ -1128,11 +1142,19 @@ class LiveBroker(SimulatedBroker):
         if delta_exposure == 0:
             return None
 
+        # Convert fractional delta (fraction of equity) → coin units.
+        # Kraken Futures size is in base currency units (e.g. SOL for PF_SOLUSD).
+        equity    = self.compute_total_equity() or 1.0
+        coin_size = round(abs(delta_exposure * equity) / price, 8)
+
+        if coin_size == 0:
+            return None
+
         return {
-            "symbol":    self.kraken_pairs[asset],
+            "symbol":    futures_symbol,
             "side":      "buy" if delta_exposure > 0 else "sell",
-            "ordertype": "market",
-            "size":      f"{abs(delta_exposure):.8f}",
+            "orderType": "mkt",
+            "size":      coin_size,
         }
 
     # ------------------------------------------------------------------
@@ -1360,67 +1382,91 @@ class LiveBroker(SimulatedBroker):
 
         resp = self._kraken_futures_private("/sendorder", order)
         if not resp:
-            self.trigger_kill_switch("Futures order submission failed — no response")
+            # Soft error — log and skip rather than kill switch
+            print("[LIVE FUTURES] No response from /sendorder — skipping this order")
             return None
 
-        if resp.get("error"):
-            self.trigger_kill_switch(f"Futures order error: {resp['error']}")
+        result_status = resp.get("result", "")
+        error_msg     = resp.get("error", "")
+        if result_status != "success" or error_msg:
+            print(f"[LIVE FUTURES REJECTED] status={result_status!r}  error={error_msg!r}"
+                  f"  order={order}")
+            # Auth failure → futures credentials are wrong / not enabled.
+            # Disable the overlay for the rest of the session so the spot bot
+            # can continue running uninterrupted.  No kill switch.
+            if "authenticationError" in str(error_msg) or "invalidCredentials" in str(error_msg):
+                print("[LIVE FUTURES] Auth failed — futures overlay disabled for this session.")
+                print("  Kraken Futures requires separate credentials from futures.kraken.com")
+                self.futures_available = False
             return None
 
-        result   = resp.get("result", resp)
-        order_id = result.get("order_id") or result.get("orderId")
-        print(f"[LIVE FUTURES SUBMITTED] order_id={order_id}")
-        return result
+        send_status = resp.get("sendStatus", {})
+        order_id    = send_status.get("order_id") or send_status.get("orderId")
+        print(f"[LIVE FUTURES SUBMITTED] order_id={order_id}  status={send_status.get('status')}")
+        return send_status
 
     def _kraken_futures_private(self, path: str, data: dict | None = None):
         """
         Real Kraken Futures private REST request.
 
-        Kraken Futures uses:
-        - Base URL: https://futures.kraken.com/derivatives/api/v3
-        - HMAC-SHA256 signing: endpoint + nonce + JSON payload
-        - Headers: APIKey, Nonce, Authent
+        Kraken Futures signing scheme (different from spot):
+          postData  = URL-encoded form body
+          nonce     = millisecond timestamp string
+          message   = SHA-256(postData + nonce + endpoint)
+          Authent   = Base64( HMAC-SHA512(message, Base64Decode(api_secret)) )
+
+        Ref: https://docs.kraken.com/api/docs/futures-api/authenication
         """
+        import base64
+        import urllib.parse
+
         if not self.futures_api_key or not self.futures_api_secret:
-            self.trigger_kill_switch("Missing Kraken API credentials (shared keypair required for Futures)")
+            self.trigger_kill_switch("Missing Kraken API credentials for Futures")
             return None
 
         if data is None:
             data = {}
 
-        url     = self.futures_base_url + path
-        nonce   = str(int(time.time() * 1000))
-        payload = json.dumps(data, separators=(",", ":"))
+        url      = self.futures_base_url + path
+        nonce    = str(int(time.time() * 1000))
+        postdata = urllib.parse.urlencode(data)
 
-        # Signing message: endpoint + nonce + compact JSON payload
-        message   = path + nonce + payload
-        signature = hmac.new(
-            self.futures_api_secret.encode(),
-            msg=message.encode(),
-            digestmod=hashlib.sha256,
-        ).hexdigest()
+        # 1. SHA-256 of (postData + nonce + endpoint)
+        sha256_hash = hashlib.sha256(
+            (postdata + nonce + path).encode()
+        ).digest()
+
+        # 2. HMAC-SHA512 using base64-decoded secret
+        try:
+            decoded_secret = base64.b64decode(self.futures_api_secret)
+        except Exception:
+            decoded_secret = self.futures_api_secret.encode()
+
+        signature = base64.b64encode(
+            hmac.new(decoded_secret, sha256_hash, hashlib.sha512).digest()
+        ).decode()
 
         headers = {
             "APIKey":       self.futures_api_key,
             "Nonce":        nonce,
             "Authent":      signature,
-            "Content-Type": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
         }
 
         try:
-            resp = requests.post(url, headers=headers, data=payload, timeout=10)
+            resp = requests.post(url, headers=headers, data=postdata, timeout=10)
         except Exception as e:
-            self.trigger_kill_switch(f"Futures request exception: {e}")
+            print(f"[FUTURES REQUEST ERROR] {e}")
             return None
 
         if resp.status_code != 200:
-            self.trigger_kill_switch(f"Futures HTTP error {resp.status_code}")
+            print(f"[FUTURES HTTP ERROR] {resp.status_code}  body={resp.text[:200]}")
             return None
 
         try:
             return resp.json()
         except Exception:
-            self.trigger_kill_switch("Futures JSON decode error")
+            print("[FUTURES] JSON decode error")
             return None
 
     # ------------------------------------------------------------------
@@ -1459,13 +1505,23 @@ class LiveBroker(SimulatedBroker):
         """
         Live futures execution override.
 
-        Flow:  full safety gate → build payload → dry-run log  OR  live submit.
-        Mirrors the spot flow exactly; submission delegates to
-        _submit_futures_order which calls _kraken_futures_private (stub until
-        Futures API credentials are wired).
+        delta_exposure is a FRACTIONAL delta (fraction of equity).
+        Safety checks use equity-based USD notional (not coin × price).
         """
-        if not self._pre_trade_safety(asset, price, delta_exposure):
-            print(f"[LIVE FUTURES BLOCKED SAFETY] {asset}  delta={delta_exposure:+.4f}")
+        if not self.check_health():
+            return 0.0
+
+        if not self._check_trade_rate():
+            return 0.0
+
+        # Compute correct USD notional for fractional futures deltas
+        equity       = self.compute_total_equity() or 1.0
+        usd_notional = abs(delta_exposure) * equity
+
+        if usd_notional > self.max_notional_per_asset:
+            print(f"[SAFETY] Futures notional cap: {asset}"
+                  f"  frac={delta_exposure:+.4f} × equity={equity:.2f}"
+                  f" = ${usd_notional:.2f} > ${self.max_notional_per_asset}")
             return 0.0
 
         order = self._build_futures_order(asset, price, delta_exposure)
@@ -1482,6 +1538,149 @@ class LiveBroker(SimulatedBroker):
         if result is None:
             print(f"[LIVE FUTURES FAILED]  {asset}  order={order}")
         return 0.0
+
+    def run_futures_overlay(self, agent, prices, regime=None):
+        """
+        Futures-only pass — mirrors the futures section of
+        execute_portfolio_exposure() but never touches spot positions.
+
+        Called from the live RL agent after spot orders have been placed,
+        so the spot core stays exactly as filled and the futures layer adds
+        a tactical / hedging overlay on top.
+
+        Parameters
+        ----------
+        agent   : RLAgent — must have .assets, .target_exposures,
+                  .max_long, .max_short
+        prices  : dict {asset: float}  — live prices
+        regime  : dict with optional keys:
+                    cycle_phase (int, 0-3),  vol_scaler (float),
+                    panic_risk  (int, 0-2),  top_risk   (int, 0-2)
+                  Omitted keys default to safe neutral values.
+        """
+        if not self.check_health():
+            return
+
+        if not self.futures_available:
+            return
+
+        regime      = regime or {}
+        cycle_phase = int(regime.get("cycle_phase", 1))   # 1 = late-accum / early-bull
+        vol_scaler  = float(regime.get("vol_scaler",  1.0))
+        panic_risk  = int(regime.get("panic_risk",    0))
+        top_risk    = int(regime.get("top_risk",      0))
+
+        spot_w, fut_w = _get_spot_futures_weights(cycle_phase)
+
+        print(f"[FUT OVERLAY] cycle={cycle_phase}  vol_scaler={vol_scaler:.2f}"
+              f"  panic={panic_risk}  top={top_risk}")
+
+        for a in agent.assets:
+            # Re-check after each asset in case auth failure disabled futures mid-loop
+            if not self.futures_available:
+                break
+
+            price = prices.get(a, 0.0)
+            if price <= 0:
+                continue
+
+            # Lazy-init per-asset state
+            if a not in self.futures_positions:
+                self.futures_positions[a] = 0.0
+                self.funding_rates[a]     = 0.0
+            if a not in self.spot_positions:
+                self.spot_positions[a] = 0.0
+
+            cap_long  = agent.max_long.get(a,  1.0)
+            cap_short = agent.max_short.get(a, -1.0)
+
+            raw_target = max(cap_short,
+                             min(cap_long, agent.target_exposures.get(a, 0.0)))
+
+            # Per-asset beta tilt on top of cycle-phase weights
+            _spot_w, _fut_w = _adjust_weights_for_asset(a, spot_w, fut_w)
+            fut_target = raw_target * _fut_w
+
+            # Global vol scaling
+            fut_target *= vol_scaler
+
+            # Per-asset volatility targeting (EMA of |return|)
+            # In live mode we don't have per-step returns, so we feed 0.0;
+            # existing EMA history (built from previous cycles) still applies.
+            self.update_asset_volatility(a, 0.0)
+            _a_vol     = self.asset_vol_ema.get(a, 0.0)
+            _vol_scale = max(0.5, min(1.5, 1.0 / (1.0 + 5.0 * _a_vol)))
+            fut_target *= _vol_scale
+
+            if _a_vol > 0.05:
+                print(f"  [FUT OVERLAY VolTarget] {a}: vol={_a_vol:.4f}"
+                      f"  scale={_vol_scale:.3f}")
+
+            # Panic de-risking
+            if panic_risk == 1:
+                fut_target *= 0.5
+            elif panic_risk == 2:
+                fut_target *= 0.1
+
+            # Blow-off top trim
+            if top_risk == 1:
+                fut_target *= 0.7
+            elif top_risk == 2:
+                fut_target *= 0.3
+
+            # Funding-aware adjustment
+            _raw_funding = self.funding_rates.get(a, 0.0)
+            self.update_funding_rate(a, _raw_funding)
+            funding     = self.funding_ema.get(a, 0.0)
+            funding_adj = max(0.5, min(1.5, 1.0 - 0.25 * funding))
+            fut_target *= funding_adj
+
+            if abs(funding) > 0.05:
+                print(f"  [FUT OVERLAY Funding] {a}: ema={funding:.4f}"
+                      f"  adj={funding_adj:.3f}")
+
+            # Clamp within per-asset caps
+            fut_target = max(cap_short, min(cap_long, fut_target))
+
+            # Futures-only hedging on severe panic / blow-off top
+            if self.enable_futures_hedging and (panic_risk == 2 or top_risk == 2):
+                net_long = self.spot_positions.get(a, 0.0) + max(fut_target, 0.0)
+                if net_long > 0:
+                    fut_target = -min(self.max_hedge_ratio * net_long, net_long)
+                    print(f"  [FUT OVERLAY Hedge] {a}: net_long={net_long:.3f}"
+                          f"  hedge={fut_target:.3f}")
+
+            current_fut = self.futures_positions[a]
+            delta_fut   = fut_target - current_fut
+
+            # 1. Per-asset futures cap (40 % of equity)
+            fut_target = max(-self.max_asset_futures,
+                             min(self.max_asset_futures, fut_target))
+            delta_fut  = fut_target - current_fut
+
+            # 2. Total futures notional cap
+            _ts, _tf, _te = self._compute_portfolio_exposure()
+            if _tf + abs(delta_fut) > self.max_futures_notional:
+                _allowed  = max(0.0, self.max_futures_notional - _tf)
+                delta_fut = (min(delta_fut, _allowed) if delta_fut > 0
+                             else max(delta_fut, -_allowed))
+                fut_target = current_fut + delta_fut
+
+            # 3. Total portfolio leverage cap (spot + futures)
+            if _te + abs(delta_fut) > self.max_portfolio_leverage:
+                _allowed  = max(0.0, self.max_portfolio_leverage - _te)
+                delta_fut = (min(delta_fut, _allowed) if delta_fut > 0
+                             else max(delta_fut, -_allowed))
+
+            if abs(delta_fut) > 0.01:
+                delta_fut_slipped = self._apply_slippage(delta_fut,
+                                                         self.futures_slippage_bps)
+                print(f"  [FUT OVERLAY] {a}: delta={delta_fut:+.4f}"
+                      f"  slipped={delta_fut_slipped:+.4f}  price={price}")
+                self._execute_futures_trade(a, price, delta_fut_slipped)
+                self.futures_positions[a] = current_fut + delta_fut_slipped
+            else:
+                print(f"  [FUT OVERLAY] {a}: delta={delta_fut:+.5f}  (below 1% — skip)")
 
 
 # ======================================================================

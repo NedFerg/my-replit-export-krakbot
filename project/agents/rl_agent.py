@@ -585,6 +585,16 @@ class ReinforcementLearningTrader(TraderAgent):
             if delta_usd > 0:
                 remaining_usd -= delta_usd
 
+        # ----------------------------------------------------------------
+        # Futures overlay — runs after all spot orders are placed so the
+        # spot core stays exactly as filled.  Uses the same target_exposures
+        # already computed above; the broker applies regime-adaptive sizing,
+        # vol targeting, funding adjustment and leverage caps before sending
+        # any order to Kraken Futures.
+        # ----------------------------------------------------------------
+        if hasattr(self.broker, "run_futures_overlay"):
+            self.broker.run_futures_overlay(self, live_prices)
+
     # ------------------------------------------------------------------
     # Order entry
     # ------------------------------------------------------------------
