@@ -760,6 +760,40 @@ class LiveBroker(SimulatedBroker):
 
         return balances, positions
 
+    def fetch_live_futures_positions(self):
+        """
+        Fetch open futures positions from Kraken Futures.
+
+        Uses the fully wired _kraken_futures_private client.
+        Populates self.futures_positions with {asset: size}.
+        """
+        resp = self._kraken_futures_private("/openpositions", {})
+
+        if not resp:
+            print("[FUTURES POSITIONS] No response from Kraken Futures")
+            return None
+
+        if resp.get("error"):
+            self.trigger_kill_switch(f"Futures positions error: {resp['error']}")
+            return None
+
+        result    = resp.get("result", {})
+        positions = result.get("openPositions", [])
+
+        new_positions = {}
+        for pos in positions:
+            symbol = pos.get("symbol")
+            size   = pos.get("size")
+            if symbol and size:
+                try:
+                    new_positions[symbol] = float(size)
+                except Exception:
+                    print(f"[FUTURES POSITIONS] Could not parse size for {symbol}")
+
+        self.futures_positions = new_positions
+        print(f"[FUTURES POSITIONS] {self.futures_positions}")
+        return new_positions
+
     # ------------------------------------------------------------------
     # Order payload builders (formatting only — nothing is submitted)
     # ------------------------------------------------------------------
