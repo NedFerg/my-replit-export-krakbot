@@ -1,3 +1,4 @@
+import sys; sys.exit(0)  # HALTED — static-extraction mode
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for file output
 import matplotlib.pyplot as plt
