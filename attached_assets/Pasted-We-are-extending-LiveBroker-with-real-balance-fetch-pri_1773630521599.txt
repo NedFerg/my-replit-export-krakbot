@@ -1,0 +1,102 @@
+We are extending LiveBroker with:
+
+    real balance fetch (private endpoint)
+
+    real open‑positions fetch (private endpoint)
+
+    internal state update
+
+    mismatch detection
+
+    kill‑switch protection
+
+    still zero live orders
+
+1. Add internal state for live balances + positions
+
+Inside LiveBroker.__init__, add:
+python
+
+        # Live account state (read-only in dry-run)
+        self.live_balances = {}
+        self.live_positions = {}
+
+2. Add a method to fetch balances from Kraken
+
+Add inside the LiveBroker class:
+python
+
+    def fetch_live_balances(self):
+        """
+        Fetch real Kraken account balances.
+        Safe: read-only, private endpoint, still dry-run.
+        """
+        data = self._kraken_private("/0/private/Balance")
+
+        if not data or "result" not in data:
+            print("[BALANCE ERROR] Could not fetch balances")
+            return None
+
+        balances = data["result"]
+        self.live_balances = balances
+        return balances
+
+3. Add a method to fetch open positions
+
+Add inside the LiveBroker class:
+python
+
+    def fetch_live_positions(self):
+        """
+        Fetch open positions (spot margin or futures).
+        Safe: read-only.
+        """
+        data = self._kraken_private("/0/private/OpenPositions", {"docalcs": "true"})
+
+        if not data or "result" not in data:
+            print("[POSITION ERROR] Could not fetch open positions")
+            return None
+
+        positions = data["result"]
+        self.live_positions = positions
+        return positions
+
+4. Add a sync method that updates both and checks for mismatches
+
+Add inside LiveBroker:
+python
+
+    def sync_live_account_state(self):
+        """
+        Sync balances + positions from Kraken.
+        Still dry-run: no trading, no writes.
+        """
+        if not self.check_health():
+            print("[SYNC BLOCKED] Kill-switch active")
+            return
+
+        print("[SYNC] Fetching live balances and positions...")
+
+        balances = self.fetch_live_balances()
+        positions = self.fetch_live_positions()
+
+        if balances is None or positions is None:
+            self.trigger_kill_switch("Failed to sync account state")
+            return
+
+        # Optional: detect mismatches between internal and live positions
+        # (Useful once real trading is enabled)
+        for asset, pos in self.futures_positions.items():
+            if float(pos) != 0 and not positions:
+                print(f"[MISMATCH WARNING] Internal futures pos for {asset} but Kraken shows none")
+
+        return balances, positions
+
+5. How to use it (conceptually)
+
+Before each live step, call:
+python
+
+live_broker.sync_live_account_state()
+
+Your agent will know where to place it if needed.
