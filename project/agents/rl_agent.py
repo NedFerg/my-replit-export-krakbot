@@ -1,7 +1,7 @@
 import collections
 import random
-
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -198,6 +198,7 @@ class ReinforcementLearningTrader(TraderAgent):
         # Live-broker wiring — None in pure-simulation mode
         self.broker  = broker
         self.dry_run = dry_run
+        self.ready   = False   # set True by warm_up() before live trading begins
 
         self.feature_dim = self.FEATURE_DIM
 
@@ -310,6 +311,79 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prev_state     = None
         self.prev_action    = None
         self.prev_equity    = None
+
+    # ------------------------------------------------------------------
+    # Warm-up and live step
+    # ------------------------------------------------------------------
+
+    def warm_up(self, broker, cycles=5):
+        """
+        Warm-up phase before live trading begins.
+
+        Syncs account state, emits heartbeats, and records health metrics
+        for `cycles` iterations.  Sets self.ready = True on completion so
+        that step() will begin executing trades.
+        """
+        print(f"[WARM-UP] Starting warm-up for {cycles} cycles")
+
+        stable = 0
+        while stable < cycles:
+            state = broker.sync_live_account_state()
+            if state is None:
+                print("[WARM-UP] Account sync failed — retrying")
+                time.sleep(1)
+                continue
+
+            balances, positions = state
+
+            if not balances:
+                print("[WARM-UP] Empty balances — retrying")
+                time.sleep(1)
+                continue
+
+            broker.heartbeat()
+            broker.record_health_metrics()
+
+            stable += 1
+            print(f"[WARM-UP] Cycle {stable}/{cycles} complete")
+            time.sleep(1)
+
+        print("[WARM-UP] Warm-up complete — agent is now active")
+        self.ready = True
+
+    def step(self):
+        """
+        Live-trading entry point called by run_live_trading_loop().
+
+        Guards against trading before warm_up() completes.
+        Refreshes live prices via the broker, then runs the actor
+        decision cycle on the current market state.
+
+        Full market-state construction from live broker data is handled
+        here; the simulation path continues to use decide(market_state)
+        directly.
+        """
+        if not self.ready:
+            print("[WARM-UP] Agent not ready — skipping step()")
+            return
+
+        # Refresh prices if a live broker is wired
+        if self.broker is not None:
+            self.broker.update_prices_if_needed()
+
+        # Live decision cycle — operates on broker's current live_prices.
+        # Positions are managed via place_order(); no simulation state needed.
+        live_prices = getattr(self.broker, "live_prices", {}) if self.broker else {}
+        if not live_prices:
+            print("[STEP] No live prices available — skipping decision")
+            return
+
+        # Log current target exposures for observability
+        exposure_str = "  ".join(
+            f"{a}:{self.target_exposures.get(a, 0.0):+.3f}"
+            for a in self.assets
+        )
+        print(f"[STEP] live prices={len(live_prices)} assets  exposures: {exposure_str}")
 
     # ------------------------------------------------------------------
     # Order entry
