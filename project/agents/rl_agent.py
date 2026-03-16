@@ -519,21 +519,19 @@ class ReinforcementLearningTrader(TraderAgent):
 
         # Fee constants — pulled from the broker so they stay in one place.
         # Kraken spot taker = 0.26 %; round-trip = 0.52 %.
-        TAKER_FEE     = getattr(self.broker, "taker_fee", 0.0026)
-        ROUND_TRIP    = 2.0 * TAKER_FEE          # min gross gain to break even
-        FEE_BUFFER    = 3.0                       # require 3× round-trip to trade
-        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER  # ~1.56 % of notional
+        TAKER_FEE      = getattr(self.broker, "taker_fee", 0.0026)
+        ROUND_TRIP     = 2.0 * TAKER_FEE          # min gross gain to break even
+        FEE_BUFFER     = 1.5                       # require 1.5× round-trip to trade
+        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER   # ~0.78 % of notional
 
-        # Rebalancing cooldown — only execute orders every 5 minutes.
-        # The RL agent generates signals every 5 s; without this gate the bot
-        # would churn the portfolio on every random signal and burn through
-        # the hourly trade-rate limit within a few steps.
-        REBALANCE_COOLDOWN_SEC = 300   # 5 minutes between rebalancing rounds
+        # Rebalancing cooldown — execute orders every 90 seconds.
+        # This is more active than the original 5-minute gate while still
+        # preventing runaway churn against Kraken's hourly rate limit.
+        REBALANCE_COOLDOWN_SEC = 90
         _now = time.time()
         _last_rebal = getattr(self.broker, "_last_rebalance_time", 0.0)
         if _now - _last_rebal < REBALANCE_COOLDOWN_SEC:
             return   # too soon — skip this step
-        # Mark the rebalancing time so the next call respects the cooldown
         if self.broker is not None:
             self.broker._last_rebalance_time = _now
 
@@ -573,88 +571,114 @@ class ReinforcementLearningTrader(TraderAgent):
                 if qty > 0:
                     spot_positions[asset] = qty
 
+        # ----------------------------------------------------------------
+        # Build a candidate list sorted by urgency (|delta_frac| desc) so
+        # the most out-of-target positions get priority within each round.
+        # Within the same round, execute SELLs before BUYs so the freed
+        # cash is available for the subsequent buy orders.
+        # ----------------------------------------------------------------
+        MIN_DRIFT_FRAC = 0.03   # 3 % drift gate (was 8 %)
+        max_notional   = getattr(self.broker, "max_notional_per_asset", 50.0)
+
+        candidates = []
         for a in self.assets:
             price = live_prices.get(a, 0.0)
             if price <= 0:
                 continue
-
-            # Current position as a fraction of equity
-            current_units  = spot_positions.get(a, 0.0)
-            current_frac   = (current_units * price) / equity
-
-            # Target fraction: clip negatives to 0 (spot-only, no shorting)
-            target_frac = max(0.0, self.target_exposures.get(a, 0.0))
-
-            delta_frac  = target_frac - current_frac
-            delta_usd   = delta_frac * equity
-
-            # Minimum drift gate — only rebalance if deviation > 8% of equity.
-            # Prevents churning the portfolio on every 5-second RL signal.
-            MIN_DRIFT_FRAC = 0.08
+            current_units = spot_positions.get(a, 0.0)
+            current_frac  = (current_units * price) / equity
+            # Spot-only: negative target → flatten (0), no shorting
+            target_frac   = max(0.0, self.target_exposures.get(a, 0.0))
+            delta_frac    = target_frac - current_frac
             if abs(delta_frac) < MIN_DRIFT_FRAC:
-                continue
+                continue   # within tolerance — nothing to do
 
-            # Clamp to per-asset notional cap before the order even reaches broker
-            max_notional = getattr(self.broker, "max_notional_per_asset", 50.0)
+            # Confidence ∈ [0, 1] = |raw action|; scale notional cap so
+            # high-conviction signals get larger position moves.
+            confidence    = abs(self.target_exposures.get(a, 0.0))
+            # Scale the cap: 50 % of max_notional at min confidence,
+            # 100 % at confidence ≥ 0.7, linearly interpolated.
+            conf_scale    = min(1.0, max(0.5, confidence / 0.7))
+            scaled_cap    = max_notional * conf_scale
+
+            delta_usd     = delta_frac * equity
             if delta_usd > 0:
-                delta_usd = min(delta_usd, max_notional)
+                delta_usd = min(delta_usd, scaled_cap)
             else:
-                delta_usd = max(delta_usd, -max_notional)
+                delta_usd = max(delta_usd, -scaled_cap)
 
-            notional_usd = abs(delta_usd)
-            delta_units  = notional_usd / price
+            notional_usd  = abs(delta_usd)
+            delta_units   = notional_usd / price
 
-            # For sells: never exceed the units actually held
-            if delta_usd < 0 and current_units > 0:
+            if delta_usd < 0:
+                if current_units <= 0:
+                    continue   # nothing to sell
                 delta_units  = min(delta_units, current_units)
                 notional_usd = delta_units * price
-            elif delta_usd < 0 and current_units <= 0:
-                continue   # nothing to sell
 
             if notional_usd < MIN_TRADE_USD:
                 continue   # dust — skip
 
-            # Fee estimation — Kraken charges taker_fee on the full notional.
+            candidates.append({
+                "asset":        a,
+                "side":         "sell" if delta_usd < 0 else "buy",
+                "delta_frac":   delta_frac,
+                "delta_usd":    delta_usd,
+                "delta_units":  delta_units,
+                "notional_usd": notional_usd,
+                "current_frac": current_frac,
+                "target_frac":  target_frac,
+                "confidence":   confidence,
+                "price":        price,
+            })
+
+        # Sort: SELLs first (frees cash), then BUYs; within each group
+        # order by |delta_frac| descending (most urgent first).
+        candidates.sort(key=lambda c: (0 if c["side"] == "sell" else 1,
+                                       -abs(c["delta_frac"])))
+
+        for c in candidates:
+            a            = c["asset"]
+            side         = c["side"]
+            delta_usd    = c["delta_usd"]
+            delta_units  = c["delta_units"]
+            notional_usd = c["notional_usd"]
+            target_frac  = c["target_frac"]
+            current_frac = c["current_frac"]
+            confidence   = c["confidence"]
+
             est_fee_usd = notional_usd * TAKER_FEE
 
-            # Minimum profit hurdle for SELL orders:
-            # Only sell if the gross move (drift × equity) would clear the
-            # round-trip fee cost (entry fee + exit fee) with a safety buffer.
-            # This prevents selling at a loss just to chase the next random signal.
-            if delta_usd < 0:
-                gross_move_usd = abs(delta_frac) * equity
+            # Sell hurdle: gross position move must cover round-trip fee × buffer
+            if side == "sell":
+                gross_move_usd = abs(c["delta_frac"]) * equity
                 min_required   = notional_usd * MIN_FEE_HURDLE
                 if gross_move_usd < min_required:
-                    print(f"  [ORDER] {a} sell skipped — expected gain "
-                          f"({gross_move_usd:.2f} USD) < fee hurdle "
-                          f"({min_required:.2f} USD)")
+                    print(f"  [ORDER] {a} sell skipped — gain "
+                          f"({gross_move_usd:.2f}) < hurdle ({min_required:.2f})")
                     continue
 
-            # Buy: require the full cost (notional + taker fee) fits in remaining cash
-            if delta_usd > 0:
+            # Buy: full cost must fit in remaining cash
+            if side == "buy":
                 total_cost = notional_usd * (1.0 + TAKER_FEE)
                 if total_cost > remaining_usd:
-                    print(f"  [ORDER] {a} skipped — insufficient remaining cash"
-                          f" (need {total_cost:.2f} incl. fee, have {remaining_usd:.2f})")
+                    print(f"  [ORDER] {a} skipped — need ${total_cost:.2f},"
+                          f" have ${remaining_usd:.2f}")
                     continue
 
-            side = "buy" if delta_usd > 0 else "sell"
             print(f"  [ORDER] {side.upper()} {delta_units:.6f} {a}"
-                  f"  Δ={delta_usd:+.2f} USD  fee≈{est_fee_usd:.3f} USD"
+                  f"  Δ={delta_usd:+.2f} USD  conf={confidence:.2f}"
+                  f"  fee≈{est_fee_usd:.3f} USD"
                   f"  (target={target_frac:.3f}  current={current_frac:.3f}"
                   f"  cash_left={remaining_usd:.2f})")
             self.place_order(a, side, delta_units)
 
-            # Track cumulative fees on the broker
             if hasattr(self.broker, "cumulative_fees_usd"):
                 self.broker.cumulative_fees_usd += est_fee_usd
 
-            if delta_usd > 0:
-                # Deduct full cost of buy (notional + fee) from available cash
+            if side == "buy":
                 remaining_usd -= notional_usd * (1.0 + TAKER_FEE)
             else:
-                # Credit net sell proceeds (notional minus fee) to available cash
-                # so subsequent buys in the same rebalancing round can use them
                 remaining_usd += notional_usd * (1.0 - TAKER_FEE)
 
         # ----------------------------------------------------------------
