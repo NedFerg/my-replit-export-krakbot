@@ -2,6 +2,40 @@ from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 
 
+# --- Per-asset beta categories ----------------------------------------
+# High-beta alts get more futures overlay (tactical/reactive).
+# Low-beta majors get more spot core (stable/conviction).
+# Mid-beta stays at the cycle-phase default.
+HIGH_BETA = {"SOL", "AVAX", "LINK", "HBAR"}
+MID_BETA  = {"XLM", "XRP"}
+LOW_BETA  = {"BTC", "ETH"}
+
+
+def _adjust_weights_for_asset(asset: str, spot_w: float, fut_w: float):
+    """
+    Tilt the cycle-phase base weights by asset beta, then renormalise
+    so spot_w + fut_w == 1.0.
+
+        High-beta alts  → −10 % spot, +10 % futures (more tactical)
+        Low-beta majors → +10 % spot, −10 % futures (more stable)
+        Mid-beta        → no change
+    """
+    if asset in HIGH_BETA:
+        spot_w *= 0.9
+        fut_w  *= 1.1
+    elif asset in LOW_BETA:
+        spot_w *= 1.1
+        fut_w  *= 0.9
+    # MID_BETA: unchanged
+
+    total = spot_w + fut_w
+    if total > 0:
+        spot_w /= total
+        fut_w  /= total
+
+    return spot_w, fut_w
+
+
 def _get_spot_futures_weights(cycle_phase: int):
     """
     Return (spot_weight, futures_weight) based on the long-term cycle phase.
@@ -169,13 +203,16 @@ class SimulatedBroker(Broker):
             # Clamped RL target (pre-split)
             raw_target = max(cap_short, min(cap_long, agent.target_exposures[a]))
 
+            # Per-asset beta tilt on top of cycle-phase base weights
+            _spot_w, _fut_w = _adjust_weights_for_asset(a, spot_w, fut_w)
+
             # --- 1. Spot target (long-only, stable) ----------------------
-            spot_target = raw_target * spot_w
+            spot_target = raw_target * _spot_w
             spot_target = max(0.0, spot_target)              # spot cannot short
             spot_target = max(0.0, min(cap_long, spot_target))
 
             # --- 2. Futures target (tactical) ----------------------------
-            fut_target = raw_target * fut_w
+            fut_target = raw_target * _fut_w
 
             # Volatility scaling — applied to futures only
             fut_target *= vol_scaler
