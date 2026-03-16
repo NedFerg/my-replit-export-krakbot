@@ -1375,3 +1375,62 @@ class LiveBroker(SimulatedBroker):
         if result is None:
             print(f"[LIVE FUTURES FAILED]  {asset}  order={order}")
         return 0.0
+
+
+# ======================================================================
+# Module-level helper — outside LiveBroker class
+# ======================================================================
+
+def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
+    """
+    Main live trading loop.
+
+    Responsibilities per iteration:
+    - Respect kill switch (hard stop)
+    - Let the agent run one decision step
+    - Emit heartbeat + health metrics
+    - Run daily rollover
+    - Evaluate alert conditions
+    """
+    # Initial sync before trading
+    state = broker.sync_live_account_state()
+    if state is None:
+        print("[MAIN LOOP] Failed initial account sync — aborting")
+        return
+
+    balances, positions = state
+    print(f"[MAIN LOOP] Initial balances: {balances}")
+    print(f"[MAIN LOOP] Initial positions: {positions}")
+
+    # Set starting equity anchor on first run if not already set
+    if getattr(broker, "_starting_equity", None) is None:
+        zusd = float(balances.get("ZUSD", 0.0))
+        broker._starting_equity = zusd
+        print(f"[MAIN LOOP] Starting equity set to {zusd}")
+
+    try:
+        while True:
+            # Hard stop if kill switch is active
+            if broker.kill_switch:
+                print("[MAIN LOOP] Kill switch active — exiting loop")
+                break
+
+            # Strategy step
+            try:
+                agent.step()
+            except Exception as e:
+                print(f"[MAIN LOOP] Exception in agent.step(): {e}")
+
+            # Monitoring + ops
+            broker.heartbeat()
+            broker.record_health_metrics()
+            broker.daily_rollover()
+            broker.alerting_loop()
+
+            time.sleep(loop_sleep)
+
+    except KeyboardInterrupt:
+        print("[MAIN LOOP] KeyboardInterrupt — shutting down cleanly")
+    except Exception as e:
+        print(f"[MAIN LOOP] Unhandled exception in main loop: {e}")
+        broker.trigger_kill_switch(f"Main loop exception: {e}")
