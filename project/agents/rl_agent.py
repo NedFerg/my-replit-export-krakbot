@@ -192,8 +192,12 @@ class ReinforcementLearningTrader(TraderAgent):
     # Must match the length of the tuple featurize_state() returns.
     FEATURE_DIM = 88   # 16 SOL-only + 64 cross-asset (8×8) + 7 crypto-regime + 1 macro_regime
 
-    def __init__(self, name, balance, latency=2):
+    def __init__(self, name, balance, latency=2, broker=None, dry_run=True):
         super().__init__(name, balance, latency)
+
+        # Live-broker wiring — None in pure-simulation mode
+        self.broker  = broker
+        self.dry_run = dry_run
 
         self.feature_dim = self.FEATURE_DIM
 
@@ -306,6 +310,35 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prev_state     = None
         self.prev_action    = None
         self.prev_equity    = None
+
+    # ------------------------------------------------------------------
+    # Order entry
+    # ------------------------------------------------------------------
+
+    def place_order(self, symbol, side, size):
+        """
+        Unified order entry point for the agent.
+
+        In dry-run mode (default), logs the intended trade instead of
+        sending it to the broker.  In live mode, delegates to
+        broker.execute_trade() which runs the full safety harness.
+
+        Parameters
+        ----------
+        symbol : str   e.g. "SOL", "ETH"
+        side   : str   "buy" or "sell"
+        size   : float position size in base-asset units
+        """
+        if self.dry_run or self.broker is None:
+            print(f"[DRY RUN] Would place order: {side} {size} {symbol}")
+            return {
+                "status": "dry_run",
+                "symbol": symbol,
+                "side":   side,
+                "size":   size,
+            }
+
+        return self.broker.execute_trade(symbol, side, size)
 
     # ------------------------------------------------------------------
     # Display helpers
