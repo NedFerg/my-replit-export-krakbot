@@ -1,0 +1,73 @@
+We are continuing improvements to the hybrid spot/futures execution engine.
+
+Goal:  
+Add per‑asset volatility targeting, so high‑volatility assets automatically get smaller futures overlays and low‑volatility assets get larger ones.
+
+This makes the hybrid engine more stable and more realistic.
+1. Add per‑asset volatility state
+
+In broker.__init__, add:
+python
+
+# Per-asset volatility tracking (EMA of returns)
+self.asset_vol_ema = {}
+self.asset_vol_alpha = 0.1  # smoothing factor
+
+2. Add helper to update per‑asset volatility
+
+Place this anywhere in broker.py:
+python
+
+def update_asset_volatility(self, asset, ret):
+    # ret = fractional return for this step (simulation provides it)
+    if asset not in self.asset_vol_ema:
+        self.asset_vol_ema[asset] = abs(ret)
+    else:
+        prev = self.asset_vol_ema[asset]
+        self.asset_vol_ema[asset] = prev + self.asset_vol_alpha * (abs(ret) - prev)
+
+This gives you a smooth, stable estimate of each asset’s volatility.
+3. Add volatility‑aware futures scaling inside execute_portfolio_exposure
+
+Inside the hybrid loop, after computing:
+python
+
+futures_exposure *= vol_scaler
+
+insert:
+python
+
+# --- Per-asset volatility targeting ---
+# Get the asset's return for this step
+asset_ret = simulation.asset_returns.get(asset, 0.0)
+
+# Update EMA volatility
+self.update_asset_volatility(asset, asset_ret)
+vol = self.asset_vol_ema[asset]
+
+# Convert volatility into a scaling factor
+# Higher vol → smaller futures overlay
+# Lower vol → larger futures overlay
+vol_scale = 1.0 / (1.0 + 5.0 * vol)
+
+# Clamp to avoid extreme reactions
+vol_scale = max(0.5, min(1.5, vol_scale))
+
+futures_exposure *= vol_scale
+
+This ensures:
+
+    high‑vol assets (SOL, AVAX, LINK) get smaller tactical futures
+
+    low‑vol assets (BTC, ETH) get larger tactical futures
+
+    spot core remains untouched
+
+4. Optional: log when volatility scaling is significant
+
+Add inside the same loop:
+python
+
+if vol > 0.05:
+    print(f"[VolTarget] {asset}: vol={vol:.4f}, scale={vol_scale:.3f}")
+

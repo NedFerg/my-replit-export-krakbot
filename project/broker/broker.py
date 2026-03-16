@@ -143,6 +143,12 @@ class SimulatedBroker(Broker):
         self.max_futures_notional   = 1.5   # total |futures| cap across assets
         self.max_asset_futures      = 0.40  # per-asset futures cap
 
+        # --- Per-asset volatility targeting --------------------------------
+        # EMA of absolute 1-step returns — feeds a per-asset scaling factor
+        # applied to the futures layer.  High-vol assets get smaller overlays.
+        self.asset_vol_ema   = {}   # asset → smoothed |return| estimate
+        self.asset_vol_alpha = 0.1  # EMA decay (slower than funding EMA)
+
     # ------------------------------------------------------------------
     # Standard order-book routing (used by non-RL agents)
     # ------------------------------------------------------------------
@@ -223,6 +229,21 @@ class SimulatedBroker(Broker):
 
             # Volatility scaling — applied to futures only
             fut_target *= vol_scaler
+
+            # --- Per-asset volatility targeting --------------------------
+            # Feeds the latest step return into the EMA, then computes a
+            # scaling factor: high-vol → smaller futures; low-vol → larger.
+            # vol_scale ∈ [0.5, 1.5], clamped to prevent extreme reactions.
+            _a_rets    = (simulation.asset_returns.get(a) or [0.0]) if simulation else [0.0]
+            _asset_ret = _a_rets[-1]
+            self.update_asset_volatility(a, _asset_ret)
+            _a_vol     = self.asset_vol_ema.get(a, 0.0)
+            _vol_scale = max(0.5, min(1.5, 1.0 / (1.0 + 5.0 * _a_vol)))
+            fut_target *= _vol_scale
+
+            # Log when per-asset vol scaling is significant
+            if _a_vol > 0.05:
+                print(f"[VolTarget] {a}: vol={_a_vol:.4f}  scale={_vol_scale:.3f}")
 
             # Panic de-risking — futures collapse first
             if panic_risk == 1:
@@ -312,6 +333,24 @@ class SimulatedBroker(Broker):
         # Keep agent.position (base class, SOL) in sync for display / featurize_state
         agent.position = agent.positions.get("SOL", 0.0)
         return total_cost
+
+    # ------------------------------------------------------------------
+    # Per-asset volatility helpers
+    # ------------------------------------------------------------------
+
+    def update_asset_volatility(self, asset, ret):
+        """
+        Update the EMA of absolute 1-step returns for `asset`.
+
+        `ret` should be the fractional price return for this step.
+        Initialises the EMA on the first call so there is no cold-start spike.
+        """
+        abs_ret = abs(ret)
+        if asset not in self.asset_vol_ema:
+            self.asset_vol_ema[asset] = abs_ret
+        else:
+            prev = self.asset_vol_ema[asset]
+            self.asset_vol_ema[asset] = prev + self.asset_vol_alpha * (abs_ret - prev)
 
     # ------------------------------------------------------------------
     # Portfolio exposure helpers
