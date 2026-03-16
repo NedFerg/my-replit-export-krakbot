@@ -157,6 +157,13 @@ class SimulatedBroker(Broker):
         self.futures_slippage_bps = 20   # 0.20 % for futures
         self.slippage_scale       = 1.0  # multiplier on trade size
 
+        # --- Futures-only hedging configuration ---------------------------
+        # When panic_risk == 2 or top_risk == 2, the broker can flip the
+        # futures layer net-short to hedge the long spot core — without
+        # ever touching spot positions.
+        self.enable_futures_hedging = True
+        self.max_hedge_ratio        = 1.0   # 1.0 = up to 100 % of net long hedged
+
     # ------------------------------------------------------------------
     # Standard order-book routing (used by non-RL agents)
     # ------------------------------------------------------------------
@@ -282,6 +289,18 @@ class SimulatedBroker(Broker):
 
             # Clamp futures within caps
             fut_target = max(cap_short, min(cap_long, fut_target))
+
+            # --- Futures-only hedging mode --------------------------------
+            # Activates only on severe panic (panic_risk == 2) or severe
+            # blow-off top (top_risk == 2).  The spot core stays untouched;
+            # the futures layer flips toward a short hedge position.
+            # Leverage enforcement and slippage still apply afterward.
+            if self.enable_futures_hedging and (panic_risk == 2 or top_risk == 2):
+                net_long = spot_target + max(fut_target, 0.0)
+                if net_long > 0:
+                    desired_hedge = -min(self.max_hedge_ratio * net_long, net_long)
+                    fut_target    = desired_hedge
+                    print(f"[Hedge] {a}: net_long={net_long:.3f}  fut_hedge={fut_target:.3f}")
 
             # --- 3. Execute spot (slow — 2% threshold) -------------------
             delta_spot = spot_target - self.spot_positions[a]
