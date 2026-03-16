@@ -1009,6 +1009,48 @@ class LiveBroker(SimulatedBroker):
         # Outside rollover hour: no action needed — next day's rollover will
         # fire because _last_rollover_day will no longer equal current_day.
 
+    def check_alerts(self,
+                     max_leverage:       float = 3.0,
+                     max_drawdown:       float = -500.0,
+                     max_exposure:       float = 5000.0,
+                     heartbeat_timeout:  float = 600.0):
+        """
+        Evaluate alert conditions and print alerts when thresholds are crossed.
+        Intended to be called inside the main loop.
+        """
+        # --- 1. Kill switch alert ---
+        if self.kill_switch:
+            print("[ALERT] Kill switch active — trading halted")
+
+        # --- 2. Leverage alert ---
+        pnl = self.compute_unified_pnl_snapshot()
+        lev = pnl.get("leverage")
+        if lev is not None and lev > max_leverage:
+            print(f"[ALERT] Leverage {lev:.2f} exceeds limit {max_leverage}")
+
+        # --- 3. Drawdown alert (session PnL) ---
+        session_pnl = pnl.get("session_pnl")
+        if session_pnl is not None and session_pnl < max_drawdown:
+            print(f"[ALERT] Drawdown {session_pnl:.2f} below limit {max_drawdown}")
+
+        # --- 4. Exposure alert ---
+        net_exp = pnl.get("net_exposure")
+        if net_exp is not None and abs(net_exp) > max_exposure:
+            print(f"[ALERT] Net exposure {net_exp:.2f} exceeds limit {max_exposure}")
+
+        # --- 5. Heartbeat silence alert ---
+        now = time.time()
+        if hasattr(self, "_last_heartbeat"):
+            if now - self._last_heartbeat > heartbeat_timeout:
+                print("[ALERT] Heartbeat silence — engine may be frozen")
+
+    def alerting_loop(self):
+        """
+        Lightweight wrapper to be called each iteration of the main loop.
+        Keeps alerting logic clean and centralized.
+        """
+        self.check_alerts()
+
     # ------------------------------------------------------------------
     # Order payload builders (formatting only — nothing is submitted)
     # ------------------------------------------------------------------
