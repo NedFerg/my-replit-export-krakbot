@@ -1,0 +1,93 @@
+Insert the following two methods immediately after fetch_live_futures_positions and before the order-builder section break:
+
+    def compute_unified_exposure(self):
+        """
+        Compute spot + futures exposure in USD terms.
+
+        Returns a dict with:
+        - spot_exposure:   {asset: usd_exposure}
+        - futures_exposure:{symbol: usd_exposure}
+        - net_exposure:    float (sum of all exposures, signed)
+        - total_notional:  float (sum of absolute exposures)
+        """
+        spot_exposure = {}
+        futures_exposure = {}
+
+        # Spot / margin exposure (live_positions keyed by asset, e.g. "BTC")
+        for asset, size in (self.live_positions or {}).items():
+            price = (self.live_prices or {}).get(asset)
+            if price is None:
+                continue
+            try:
+                spot_exposure[asset] = float(size) * float(price)
+            except Exception:
+                continue
+
+        # Futures exposure (futures_positions keyed by symbol, e.g. "XBTUSD", "SOLUSD")
+        for symbol, size in (self.futures_positions or {}).items():
+            base = symbol.replace("USD", "").replace("USDT", "")
+            price = None
+
+            # Try base asset first (e.g. "XBT" or "SOL")
+            if self.live_prices:
+                price = self.live_prices.get(base) or self.live_prices.get(symbol)
+
+            if price is None:
+                continue
+
+            try:
+                futures_exposure[symbol] = float(size) * float(price)
+            except Exception:
+                continue
+
+        net_exposure = sum(spot_exposure.values()) + sum(futures_exposure.values())
+        total_notional = sum(abs(v) for v in spot_exposure.values()) + \
+                         sum(abs(v) for v in futures_exposure.values())
+
+        snapshot = {
+            "spot_exposure": spot_exposure,
+            "futures_exposure": futures_exposure,
+            "net_exposure": net_exposure,
+            "total_notional": total_notional,
+        }
+
+        print(f"[UNIFIED EXPOSURE] {snapshot}")
+        return snapshot
+
+    def compute_unified_pnl_snapshot(self):
+        """
+        Compute a simple PnL + risk snapshot for the current session.
+
+        Uses:
+        - ZUSD balance as current equity
+        - _starting_equity (set on first live trade) as session anchor
+        - compute_unified_exposure() for notional and leverage estimate
+        """
+        balances = self.live_balances or {}
+        equity = float(balances.get("ZUSD", 0.0))
+
+        exposure = self.compute_unified_exposure()
+        total_notional = exposure.get("total_notional", 0.0)
+
+        starting = self._starting_equity
+        session_pnl = None
+        if starting is not None:
+            session_pnl = equity - float(starting)
+
+        leverage = None
+        if equity > 0:
+            leverage = total_notional / equity
+
+        snapshot = {
+            "equity": equity,
+            "starting_equity": starting,
+            "session_pnl": session_pnl,
+            "total_notional": total_notional,
+            "net_exposure": exposure.get("net_exposure", 0.0),
+            "leverage": leverage,
+            "spot_exposure": exposure.get("spot_exposure", {}),
+            "futures_exposure": exposure.get("futures_exposure", {}),
+        }
+
+        print(f"[UNIFIED PNL] {snapshot}")
+        return snapshot
