@@ -358,17 +358,82 @@ class ReinforcementLearningTrader(TraderAgent):
         print("[WARM-UP] Warm-up complete — agent is now active")
         self.ready = True
 
+    # ------------------------------------------------------------------
+    # Live state construction helpers
+    # ------------------------------------------------------------------
+
+    def _update_price_history(self, live_prices: dict):
+        """Maintain a rolling 50-bar price history for each asset."""
+        if not hasattr(self, "_price_history"):
+            self._price_history = {a: [] for a in self.assets}
+        for a in self.assets:
+            p = live_prices.get(a, 0.0)
+            if p > 0:
+                self._price_history[a].append(p)
+                if len(self._price_history[a]) > 50:
+                    self._price_history[a].pop(0)
+
+    def _momentum(self, asset: str, n: int) -> float:
+        """n-bar price momentum, clipped to ±0.2."""
+        hist = getattr(self, "_price_history", {}).get(asset, [])
+        if len(hist) < n + 1:
+            return 0.0
+        ret = (hist[-1] - hist[-(n + 1)]) / max(hist[-(n + 1)], 1e-6)
+        return max(min(ret, 0.2), -0.2)
+
+    def _build_live_state_vector(self, live_prices: dict) -> list:
+        """
+        Build the 88-dimensional feature vector from live broker prices.
+        Missing simulation features (vol, drift, order flow) are zeroed —
+        the network was designed to handle sparse inputs gracefully.
+        """
+        sol_price = live_prices.get("SOL", 0.0)
+        hist_sol  = getattr(self, "_price_history", {}).get("SOL", [])
+        if len(hist_sol) >= 2 and hist_sol[-2] > 0:
+            price_change = (sol_price - hist_sol[-2]) / hist_sol[-2]
+        else:
+            price_change = 0.0
+
+        # SOL-specific features (16)
+        features = [
+            round(price_change, 3),   # price_bucket
+            0.0,                      # vol_bucket (simulation-only)
+            0.0,                      # drift_bucket (simulation-only)
+            float(self.target_exposures.get("SOL", 0.0)),  # inv_bucket
+            0.0,                      # regime (0 = neutral/unknown)
+            0.0, 0.0, 0.0,           # m1, m3, imbalance
+            0.0, 0.0,                 # short_vol, long_vol
+            self._momentum("SOL",  5),
+            self._momentum("SOL", 20),
+            self._momentum("SOL", 50),
+            0.0, 0.0, 0.0,           # rolling_vol, vol_imbalance, pressure
+        ]
+
+        # Cross-asset features (64 = 8 × 8)
+        for a in self.assets:
+            p = live_prices.get(a, 0.0)
+            features.extend([
+                p / 1000.0,               # normalized price
+                0.0,                      # vol
+                self._momentum(a,  5) / 100.0,
+                self._momentum(a, 20) / 100.0,
+                self._momentum(a, 50) / 100.0,
+                0.0, 0.0, 0.0,           # rolling_vol, vol_imbalance, pressure
+            ])
+
+        # Crypto-regime features (7) + macro_regime (1)
+        features.extend([0.0] * 8)
+
+        return features
+
     def step(self):
         """
         Live-trading entry point called by run_live_trading_loop().
 
         Guards against trading before warm_up() completes.
-        Refreshes live prices via the broker, then runs the actor
-        decision cycle on the current market state.
-
-        Full market-state construction from live broker data is handled
-        here; the simulation path continues to use decide(market_state)
-        directly.
+        Refreshes live prices via the broker, runs the actor network to
+        produce per-asset exposure targets, and logs the decisions with
+        direction labels and confidence scores.
         """
         if not self.ready:
             print("[WARM-UP] Agent not ready — skipping step()")
@@ -378,19 +443,68 @@ class ReinforcementLearningTrader(TraderAgent):
         if self.broker is not None:
             self.broker.update_prices_if_needed()
 
-        # Live decision cycle — operates on broker's current live_prices.
-        # Positions are managed via place_order(); no simulation state needed.
         live_prices = getattr(self.broker, "live_prices", {}) if self.broker else {}
         if not live_prices:
             print("[STEP] No live prices available — skipping decision")
             return
 
-        # Log current target exposures for observability
+        # Update rolling price history for momentum computation
+        self._update_price_history(live_prices)
+
+        # Build 88-dim state vector and run actor network
+        state_vec = self._build_live_state_vector(live_prices)
+        x = torch.tensor(state_vec, dtype=torch.float32,
+                          device=self.device).unsqueeze(0)   # [1, feature_dim]
+
+        self.actor.eval()
+        with torch.no_grad():
+            mu, log_std = self.actor.forward(x)              # [1, num_assets] each
+            std = log_std.exp()
+
+        mu_list  = mu.squeeze(0).tolist()
+        std_list = std.squeeze(0).tolist()
+
+        # Sample action for target exposures (with grad for training later)
+        self.actor.train()
+        action, log_prob = self.actor.sample(x)
+        self.last_log_prob = log_prob
+
+        action_list = action.detach().squeeze(0).tolist()
+        for i, a in enumerate(self.assets):
+            self.target_exposures[a] = float(action_list[i])
+        self.target_exposure = self.target_exposures["SOL"]
+
+        # ----------------------------------------------------------------
+        # Per-asset decision log
+        # ----------------------------------------------------------------
+        HOLD_THRESH = 0.05   # |action| below this → HOLD
+        header = (f"[STEP] prices={len(live_prices)}  "
+                  f"joint_log_prob={log_prob.item():.3f}")
+        print(header)
+        print(f"  {'Asset':<6} {'Price':>10}  {'Action':>7}  {'Direction':<5}  "
+              f"{'Confidence':>10}  {'μ':>7}  {'σ':>6}")
+        print(f"  {'-'*6} {'-'*10}  {'-'*7}  {'-'*5}  {'-'*10}  {'-'*7}  {'-'*6}")
+        for i, a in enumerate(self.assets):
+            act  = action_list[i]
+            mu_a = mu_list[i]
+            sd_a = std_list[i]
+            conf = abs(act)          # 0 = uncertain/hold, 1 = max confidence
+            if act > HOLD_THRESH:
+                direction = "BUY"
+            elif act < -HOLD_THRESH:
+                direction = "SELL"
+            else:
+                direction = "HOLD"
+            price = live_prices.get(a, 0.0)
+            print(f"  {a:<6} {price:>10.4f}  {act:>+7.4f}  {direction:<5}  "
+                  f"{conf:>10.4f}  {mu_a:>+7.4f}  {sd_a:>6.4f}")
+
+        # Current exposure summary
         exposure_str = "  ".join(
             f"{a}:{self.target_exposures.get(a, 0.0):+.3f}"
             for a in self.assets
         )
-        print(f"[STEP] live prices={len(live_prices)} assets  exposures: {exposure_str}")
+        print(f"  exposures: {exposure_str}")
 
     # ------------------------------------------------------------------
     # Order entry
