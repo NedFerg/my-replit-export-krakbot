@@ -1,0 +1,143 @@
+We are continuing RL improvements.
+
+Goal:  
+Replace static per‑asset exposure caps with dynamic caps that adjust automatically based on:
+
+    volatility regime
+
+    liquidity regime
+
+    altseason index
+
+    internal_regime (AUTO mode)
+
+    macro_regime (manual override)
+
+Dynamic caps allow the system to:
+
+    increase risk in smooth bull trends
+
+    reduce risk in high‑volatility or low‑liquidity conditions
+
+    scale exposure intelligently during altseason
+
+    behave differently in bull, neutral, bear, and AUTO modes
+
+All RL core logic (actor, critic, replay, microstructure, etc.) stays unchanged.
+1. Add dynamic cap computation
+
+In simulation.py, after computing regime features and internal_regime, add:
+python
+
+# --- Dynamic exposure caps per asset ---
+# Base caps (fallback)
+base_caps = {
+    "SOL": 1.0,
+    "XRP": 0.8,
+    "LINK": 0.7,
+    "ETH": 0.6,
+    "BTC": 0.3,
+}
+
+# Read signals
+alt = self.altseason_index
+vol = self.vol_regime
+liq = self.liq_regime
+macro = self.macro_regime
+internal = self.internal_regime
+
+# Determine effective regime (AUTO or manual)
+if macro == 2:
+    regime = internal
+else:
+    regime = macro
+
+self.dynamic_caps = {}
+
+for asset, base_cap in base_caps.items():
+
+    # Start from base
+    cap = base_cap
+
+    # --- Bullish regime: allow higher caps ---
+    if regime > 0:
+        # Increase cap in strong altseason
+        cap *= (1.0 + 0.5 * alt)
+
+        # Reduce cap if volatility is high
+        if vol > 0.02:
+            cap *= 0.7
+
+        # Increase cap if liquidity is strong
+        if liq > 0.5:
+            cap *= 1.2
+
+    # --- Bearish regime: reduce caps ---
+    elif regime < 0:
+        cap *= 0.5  # general reduction
+        if vol > 0.02:
+            cap *= 0.5  # even lower in high vol
+        if liq < 0.3:
+            cap *= 0.7  # thin liquidity → reduce risk
+
+    # --- Neutral regime: moderate scaling ---
+    else:
+        if vol > 0.02:
+            cap *= 0.7
+        if liq > 0.5:
+            cap *= 1.1
+
+    # Clamp to reasonable bounds
+    cap = max(0.1, min(1.5 * base_cap, cap))
+
+    self.dynamic_caps[asset] = cap
+
+Attach to state if needed:
+python
+
+setattr(state, "dynamic_caps", self.dynamic_caps)
+
+2. Apply dynamic caps in the broker
+
+In broker.execute_portfolio_exposure, replace the static cap logic with:
+python
+
+# dynamic_caps is provided by simulation each step
+cap_long = simulation.dynamic_caps[asset]
+cap_short = -0.5 * cap_long  # allow smaller shorting
+
+# Clamp target exposure
+target_exposure = max(cap_short, min(cap_long, target_exposure))
+
+Also clamp final positions:
+python
+
+positions[asset] = max(cap_short, min(cap_long, positions[asset]))
+
+3. Add dynamic cap feedback (optional but helpful)
+
+In simulation.py, after computing dynamic_caps:
+python
+
+# Detect major cap changes for feedback
+if not hasattr(self, "prev_dynamic_caps"):
+    self.prev_dynamic_caps = {}
+
+for asset in self.assets:
+    old = self.prev_dynamic_caps.get(asset, None)
+    new = self.dynamic_caps[asset]
+
+    if old is not None and abs(new - old) > 0.2 * old:
+        msg = f"Dynamic cap shift for {asset}: {old:.2f} → {new:.2f} (regime={regime}, vol={vol:.3f}, alt={alt:.3f})"
+        self.macro_messages.append(msg)
+        print(msg)
+
+self.prev_dynamic_caps = self.dynamic_caps.copy()
+
+This logs meaningful transitions without spamming.
+4. No changes needed in RL agent
+
+The actor still outputs exposures in [−1,+1].
+The broker now clamps them dynamically based on market conditions.
+
+This keeps the RL policy stable while giving the system adaptive risk control.

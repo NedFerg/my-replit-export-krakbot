@@ -160,6 +160,10 @@ class Simulation:
         self.macro_regime    = 0
         self.internal_regime = 0   # computed each step in AUTO mode
 
+        # --- Dynamic exposure caps (updated every step) -------------------
+        self.dynamic_caps      = {}   # asset → current cap
+        self.prev_dynamic_caps = {}   # asset → cap from previous step
+
         # --- Macro feedback message log -----------------------------------
         # Populated each step when manual flag conflicts with signals,
         # or when AUTO mode detects uncertain / mixed conditions.
@@ -524,6 +528,63 @@ class Simulation:
             state.macro_regime     = self.macro_regime
             state.internal_regime  = self.internal_regime
 
+            # --- Dynamic exposure caps ------------------------------------
+            # Per-asset caps that adapt each step to volatility, liquidity,
+            # altseason momentum, and the effective macro regime.
+            _base_caps = {
+                "SOL":  1.0,
+                "XRP":  0.8,
+                "LINK": 0.7,
+                "ETH":  0.6,
+                "BTC":  0.3,
+            }
+            _alt = self.altseason_index
+            _vol = self.vol_regime
+            _liq = self.liq_regime
+            _regime = self.internal_regime if self.macro_regime == 2 else self.macro_regime
+
+            self.dynamic_caps = {}
+            for _asset, _base in _base_caps.items():
+                _cap = _base
+
+                if _regime > 0:
+                    _cap *= (1.0 + 0.5 * _alt)
+                    if _vol > 0.02:
+                        _cap *= 0.7
+                    if _liq > 0.5:
+                        _cap *= 1.2
+                elif _regime < 0:
+                    _cap *= 0.5
+                    if _vol > 0.02:
+                        _cap *= 0.5
+                    if _liq < 0.3:
+                        _cap *= 0.7
+                else:
+                    if _vol > 0.02:
+                        _cap *= 0.7
+                    if _liq > 0.5:
+                        _cap *= 1.1
+
+                # Clamp to [0.1, 1.5 × base]
+                self.dynamic_caps[_asset] = max(0.1, min(1.5 * _base, _cap))
+
+            setattr(state, "dynamic_caps", self.dynamic_caps)
+
+            # --- Dynamic cap change feedback ------------------------------
+            for _asset in self.assets:
+                _old = self.prev_dynamic_caps.get(_asset)
+                _new = self.dynamic_caps[_asset]
+                if _old is not None and abs(_new - _old) > 0.2 * _old:
+                    _cmsg = (
+                        f"Dynamic cap shift for {_asset}: "
+                        f"{_old:.2f} → {_new:.2f} "
+                        f"(regime={_regime:+d}, vol={_vol:.3f}, alt={_alt:.3f})"
+                    )
+                    self.macro_messages.append(_cmsg)
+                    print(_cmsg)
+
+            self.prev_dynamic_caps = self.dynamic_caps.copy()
+
             # --- Macro feedback: signal / manual-call conflict detection --
             _msg = None
             if self.macro_regime in (-1, 0, +1):
@@ -608,7 +669,8 @@ class Simulation:
                         for a in agent.assets
                     }
                     cost = self.broker.execute_portfolio_exposure(
-                        agent, _asset_prices, self.apply_microstructure
+                        agent, _asset_prices, self.apply_microstructure,
+                        simulation=self,
                     )
                     rl_txn_costs[agent] = cost
 

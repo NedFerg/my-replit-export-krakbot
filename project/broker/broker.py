@@ -29,7 +29,7 @@ class Broker(ABC):
         Returns a list of Fill objects from the final match."""
 
     @abstractmethod
-    def execute_portfolio_exposure(self, agent, prices, microstructure_fn=None) -> float:
+    def execute_portfolio_exposure(self, agent, prices, microstructure_fn=None, simulation=None) -> float:
         """
         For each asset in agent.assets, ramp agent.positions[asset] toward
         agent.target_exposures[asset] and apply microstructure costs.
@@ -77,15 +77,14 @@ class SimulatedBroker(Broker):
     def fill_resting_orders(self, price) -> list:
         return self._exchange.fill_resting_orders(price)
 
-    def execute_portfolio_exposure(self, agent, prices, microstructure_fn=None) -> float:
+    def execute_portfolio_exposure(self, agent, prices, microstructure_fn=None, simulation=None) -> float:
         """
         For each asset in agent.assets, ramp agent.positions[asset] toward
         agent.target_exposures[asset] using up to max_steps increments.
 
-        The same dead-band (< 0.05), ramp logic, and microstructure cost
-        model that the single-asset execute_exposure used are applied
-        independently per asset.  agent.position is kept in sync with the
-        SOL position for backward-compatible display and featurize_state().
+        When `simulation` is provided, uses simulation.dynamic_caps for
+        per-asset exposure limits (regime-adaptive).  Falls back to the
+        agent's static max_long / max_short dicts when not available.
 
         Returns
         -------
@@ -100,10 +99,16 @@ class SimulatedBroker(Broker):
                 continue
 
             current = agent.positions[a]
-            # Clamp the actor's raw target to the agent's per-asset exposure caps
-            # before computing the delta so the broker never executes beyond them.
-            cap_long  = agent.max_long.get(a,  1.0)
-            cap_short = agent.max_short.get(a, -1.0)
+
+            # Dynamic caps (regime-adaptive) take priority; fall back to
+            # agent's static per-asset caps when not provided.
+            if simulation is not None and simulation.dynamic_caps.get(a) is not None:
+                cap_long  = simulation.dynamic_caps[a]
+                cap_short = -0.5 * cap_long
+            else:
+                cap_long  = agent.max_long.get(a,  1.0)
+                cap_short = agent.max_short.get(a, -1.0)
+
             target = max(cap_short, min(cap_long, agent.target_exposures[a]))
             delta  = target - current
 
