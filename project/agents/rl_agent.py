@@ -506,6 +506,72 @@ class ReinforcementLearningTrader(TraderAgent):
         )
         print(f"  exposures: {exposure_str}")
 
+        # ----------------------------------------------------------------
+        # Action → order conversion
+        #
+        # target_exposures[a] ∈ [-1, +1] is a fraction of total equity.
+        # Positive = long, negative = close/flatten (spot-only, no shorting).
+        # Delta vs current tracked position drives the actual order size.
+        #
+        # Min trade: $1 USD notional (avoids API rejection for dust orders).
+        # ----------------------------------------------------------------
+        MIN_TRADE_USD = 5.0   # Kraken per-asset minimums; keep well above them
+
+        # Equity available for sizing
+        zusd_str = getattr(self.broker, "live_balances", {}).get("ZUSD", "0")
+        equity   = float(zusd_str) if zusd_str else 0.0
+        if equity <= 0:
+            print("  [ORDER] No equity available — skipping order conversion")
+            return
+
+        spot_positions = getattr(self.broker, "spot_positions", {})
+
+        # Track cash spent this step so we don't overdraw across multiple orders
+        remaining_usd = equity
+
+        for a in self.assets:
+            price = live_prices.get(a, 0.0)
+            if price <= 0:
+                continue
+
+            # Current position as a fraction of equity
+            current_units  = spot_positions.get(a, 0.0)
+            current_frac   = (current_units * price) / equity
+
+            # Target fraction: clip negatives to 0 (spot-only, no shorting)
+            target_frac = max(0.0, self.target_exposures.get(a, 0.0))
+
+            delta_frac  = target_frac - current_frac
+            delta_usd   = delta_frac * equity
+
+            # Clamp to per-asset notional cap before the order even reaches broker
+            max_notional = getattr(self.broker, "max_notional_per_asset", 50.0)
+            if delta_usd > 0:
+                delta_usd = min(delta_usd, max_notional)
+            else:
+                delta_usd = max(delta_usd, -max_notional)
+
+            delta_units = abs(delta_usd) / price
+
+            if abs(delta_usd) < MIN_TRADE_USD:
+                continue   # dust — skip
+
+            # Stop issuing buy orders if we've exhausted available cash
+            if delta_usd > 0 and delta_usd > remaining_usd:
+                print(f"  [ORDER] {a} skipped — insufficient remaining cash"
+                      f" (need {delta_usd:.2f}, have {remaining_usd:.2f})")
+                continue
+
+            side = "buy" if delta_usd > 0 else "sell"
+            print(f"  [ORDER] {side.upper()} {delta_units:.6f} {a}"
+                  f"  Δ={delta_usd:+.2f} USD  (target={target_frac:.3f}"
+                  f"  current={current_frac:.3f}  cash_left={remaining_usd:.2f})")
+            self.place_order(a, side, delta_units)
+
+            # Deduct from remaining cash only for buy orders
+            if delta_usd > 0:
+                remaining_usd -= delta_usd
+
     # ------------------------------------------------------------------
     # Order entry
     # ------------------------------------------------------------------

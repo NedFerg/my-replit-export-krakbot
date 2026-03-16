@@ -1187,21 +1187,18 @@ class LiveBroker(SimulatedBroker):
         if not self._check_trade_rate():
             return False
 
-        # Per-asset notional cap
+        # Per-asset notional cap — soft reject (skip this order, don't halt the bot)
         if price and abs(delta_exposure * price) > self.max_notional_per_asset:
-            self.trigger_kill_switch(
-                f"Notional cap exceeded for {asset}: "
-                f"|{delta_exposure:.4f}| × {price:.2f} = "
-                f"{abs(delta_exposure * price):.2f} > {self.max_notional_per_asset}"
-            )
+            print(f"[SAFETY] Per-asset cap: skipping {asset} "
+                  f"(|{delta_exposure:.4f}| × {price:.2f}"
+                  f" = {abs(delta_exposure * price):.2f}"
+                  f" > {self.max_notional_per_asset} USD)")
             return False
 
-        # Total portfolio notional cap
+        # Total portfolio notional cap — soft reject
         if self._current_notional() > self.max_total_notional:
-            self.trigger_kill_switch(
-                f"Total notional cap exceeded: "
-                f"{self._current_notional():.2f} > {self.max_total_notional}"
-            )
+            print(f"[SAFETY] Total notional cap: skipping order "
+                  f"({self._current_notional():.2f} > {self.max_total_notional} USD)")
             return False
 
         # Daily loss cap
@@ -1209,6 +1206,64 @@ class LiveBroker(SimulatedBroker):
             return False
 
         return True
+
+    # ------------------------------------------------------------------
+    # Unified live execution entry point
+    # ------------------------------------------------------------------
+
+    def execute_trade(self, symbol: str, side: str, size: float):
+        """
+        Unified live-trade execution called by agent.place_order().
+
+        Parameters
+        ----------
+        symbol : str   Internal asset name e.g. "SOL", "BTC"
+        side   : str   "buy" or "sell"
+        size   : float Position size in base-asset units (positive)
+
+        Flow
+        ----
+        1. Dry-run guard — logs and returns immediately if dry_run=True
+        2. Price validation — kill switch on missing / zero price
+        3. Pre-trade safety harness — notional cap, rate limit, daily loss
+        4. Build spot market-order payload
+        5. Submit to Kraken /AddOrder
+        6. Update internal position tracker on success
+
+        Returns the Kraken result dict on success, None on any failure.
+        """
+        if self.dry_run:
+            print(f"[DRY RUN] execute_trade skipped: {side} {size:.6f} {symbol}")
+            return None
+
+        price = self.live_prices.get(symbol)
+        if not price or price <= 0:
+            self.trigger_kill_switch(
+                f"No valid live price for {symbol} — order aborted"
+            )
+            return None
+
+        # Signed delta: positive = long / buy, negative = short / sell
+        delta = size if side == "buy" else -size
+
+        if not self._pre_trade_safety(symbol, price, delta):
+            return None
+
+        order = self._build_spot_order(symbol, price, delta)
+        if order is None:
+            return None
+
+        result = self._submit_spot_order(order)
+        if result is not None:
+            # Track position internally so _current_notional() stays accurate
+            self.spot_positions[symbol] = (
+                self.spot_positions.get(symbol, 0.0) + delta
+            )
+            notional = abs(delta * price)
+            print(f"[EXECUTE] {side.upper()} {size:.6f} {symbol} @ {price:.4f}"
+                  f"  notional={notional:.2f} USD"
+                  f"  pos={self.spot_positions[symbol]:+.6f}")
+        return result
 
     # ------------------------------------------------------------------
     # Spot order submission (live path only — dry_run must be False)
@@ -1228,12 +1283,25 @@ class LiveBroker(SimulatedBroker):
 
         resp = self._kraken_private("/0/private/AddOrder", order)
 
-        if not resp or "result" not in resp:
-            self.trigger_kill_switch("Spot order submission failed — no result from Kraken")
+        if not resp:
+            self.trigger_kill_switch("Spot order submission failed — no response from Kraken")
             return None
 
-        if resp.get("error"):
-            self.trigger_kill_switch(f"Spot order error: {resp['error']}")
+        # Check API-level errors before checking for "result"
+        # (Kraken error responses have no "result" key)
+        errors = resp.get("error", [])
+        if errors:
+            soft = {"EOrder:Insufficient funds", "EOrder:Order minimum not met",
+                    "EOrder:Orders limit exceeded",
+                    "EGeneral:Invalid arguments:volume minimum not met"}
+            if any(any(s in e for s in soft) for e in errors):
+                print(f"[SAFETY] Order skipped (soft error): {errors}")
+                return None
+            self.trigger_kill_switch(f"Spot order error: {errors}")
+            return None
+
+        if "result" not in resp:
+            self.trigger_kill_switch("Spot order submission failed — no result from Kraken")
             return None
 
         result = resp["result"]

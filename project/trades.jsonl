@@ -1,0 +1,19 @@
+{"status": "live", "symbol": "SOL", "side": "buy", "size": 0.8179689271428711, "result": null, "timestamp": 1773639251.0283246}
+{"status": "live", "symbol": "LINK", "side": "buy", "size": 6.84089757903814, "result": null, "timestamp": 1773639251.0287402}
+{"status": "live", "symbol": "ETH", "side": "buy", "size": 0.0053224104531050705, "result": null, "timestamp": 1773639251.0288317}
+{"status": "live", "symbol": "BTC", "side": "buy", "size": 0.0013526415256611833, "result": null, "timestamp": 1773639251.0288985}
+{"status": "live", "symbol": "XLM", "side": "buy", "size": 118.00815189138966, "result": null, "timestamp": 1773639251.0289614}
+{"status": "live", "symbol": "HBAR", "side": "buy", "size": 907.7999621502017, "result": null, "timestamp": 1773639251.0290284}
+{"status": "live", "symbol": "AVAX", "side": "buy", "size": 1.949321852916736, "result": null, "timestamp": 1773639251.0290918}
+{"status": "live", "symbol": "LINK", "side": "buy", "size": 2.3769481179314798, "result": {"txid": ["OJCVSV-HXUDP-V4Q2T5"], "descr": {"order": "buy 2.37694 LINKUSD @ market"}}, "timestamp": 1773639313.9452016}
+{"status": "live", "symbol": "BTC", "side": "buy", "size": 0.0006774250801732583, "result": {"txid": ["OMICRA-LX3BA-WSUTPY"], "descr": {"order": "buy 0.00067 XBTUSD @ market"}}, "timestamp": 1773639314.1078467}
+{"status": "live", "symbol": "AVAX", "side": "buy", "size": 4.798464491362764, "result": null, "timestamp": 1773639314.2674463}
+{"status": "live", "symbol": "XRP", "side": "buy", "size": 4.833743938420773, "result": {"txid": ["O2JVPV-EQP55-GYOR2X"], "descr": {"order": "buy 4.83374 XRPUSD @ market"}}, "timestamp": 1773639398.178408}
+{"status": "live", "symbol": "ETH", "side": "buy", "size": 0.002557977279789054, "result": {"txid": ["O42YYR-4S2BR-VNZD23"], "descr": {"order": "buy 0.00255 ETHUSD @ market"}}, "timestamp": 1773639398.3392158}
+{"status": "live", "symbol": "BTC", "side": "buy", "size": 8.566722806654826e-05, "result": {"txid": ["OYQANZ-Q34EV-YW6UMA"], "descr": {"order": "buy 0.00008 XBTUSD @ market"}}, "timestamp": 1773639398.497081}
+{"status": "live", "symbol": "XRP", "side": "buy", "size": 10.618134968713859, "result": null, "timestamp": 1773639399.6698577}
+{"status": "live", "symbol": "ETH", "side": "sell", "size": 0.002557977279789054, "result": null, "timestamp": 1773639399.6700132}
+{"status": "live", "symbol": "BTC", "side": "buy", "size": 5.740015716721485e-05, "result": null, "timestamp": 1773639399.670098}
+{"status": "live", "symbol": "HBAR", "side": "buy", "size": 61.45226536363126, "result": null, "timestamp": 1773639399.6702}
+{"status": "live", "symbol": "ETH", "side": "buy", "size": 0.0023966166347930045, "result": {"txid": ["OBILNL-VG3AB-VNQJXM"], "descr": {"order": "buy 0.00239 ETHUSD @ market"}}, "timestamp": 1773639478.5852482}
+{"status": "live", "symbol": "HBAR", "side": "buy", "size": 10.99479964547409, "result": null, "timestamp": 1773639478.757574}
