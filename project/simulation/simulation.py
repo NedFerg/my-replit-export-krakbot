@@ -154,13 +154,19 @@ class Simulation:
         self.liq_regime       = 0.0   # cross-market average rolling volume
 
         # --- Macro regime flag (set externally or via config) -------------
-        # +1 = bull, 0 = neutral, -1 = bear
-        # Can be changed between episodes or during a run from main.py.
-        self.macro_regime = 0
+        # -1 = bear, 0 = neutral, +1 = bull, +2 = AUTO (hands-off)
+        # AUTO: system ignores the manual override and derives its own
+        #       internal regime from market signals each step.
+        self.macro_regime    = 0
+        self.internal_regime = 0   # computed each step in AUTO mode
 
         # --- Macro feedback message log -----------------------------------
-        # Populated each step when macro flag conflicts with market signals.
-        self.macro_messages = []
+        # Populated each step when manual flag conflicts with signals,
+        # or when AUTO mode detects uncertain / mixed conditions.
+        # Console print is throttled to only fire on *transitions*
+        # (when the message changes) to avoid per-step noise.
+        self.macro_messages      = []
+        self._last_macro_message = None   # dedup: only print on change
 
     # ------------------------------------------------------------------
     # Microstructure helper
@@ -469,6 +475,44 @@ class Simulation:
                 _rvols = [self.asset_rolling_vol[a] for a in self.assets if self.asset_rolling_vol[a] > 0]
                 self.liq_regime = sum(_rvols) / len(_rvols) if _rvols else 0.0
 
+            # --- Internal regime scoring (used by AUTO mode) --------------
+            # Scores are computed every step so they're always up-to-date
+            # and can be exposed to the state for diagnostics.
+            _alt     = self.altseason_index
+            _vol     = self.vol_regime
+            _liq     = self.liq_regime
+            _btc_dom = self.btc_dominance
+
+            _bull_score = 0.0
+            _bear_score = 0.0
+
+            # Bullish signals
+            if _alt > 0.5:
+                _bull_score += 1.0   # strong altcoin momentum
+            if _vol < 0.01:
+                _bull_score += 1.0   # low cross-market volatility
+            if _btc_dom < 0.45:
+                _bull_score += 1.0   # capital rotating into alts
+            if _liq > 0.5 * max(1e-6, _liq):   # placeholder: any liquidity
+                _bull_score += 0.5
+
+            # Bearish signals
+            if _vol > 0.02:
+                _bear_score += 1.0   # elevated cross-market stress
+            if _btc_dom > 0.55:
+                _bear_score += 1.0   # capital fleeing to BTC (risk-off)
+            if _alt < 0.2:
+                _bear_score += 1.0   # weak altcoin momentum
+            if _liq < 0.3 * max(1e-6, _liq):   # placeholder: thin liquidity
+                _bear_score += 0.5
+
+            if _bull_score - _bear_score > 0.5:
+                self.internal_regime = +1
+            elif _bear_score - _bull_score > 0.5:
+                self.internal_regime = -1
+            else:
+                self.internal_regime = 0
+
             # Attach regime features to state for featurize_state() to consume
             state.btc_dominance    = self.btc_dominance
             state.eth_btc_ratio    = self.eth_btc_ratio
@@ -478,36 +522,35 @@ class Simulation:
             state.vol_regime       = self.vol_regime
             state.liq_regime       = self.liq_regime
             state.macro_regime     = self.macro_regime
+            state.internal_regime  = self.internal_regime
 
-            # --- Macro feedback: detect signal / macro conflicts ----------
-            _mac = self.macro_regime
-            _alt = self.altseason_index
-            _vol = self.vol_regime
-            _btc = self.btc_dominance
-            _btc_rising  = _btc > 0.5
-            _btc_falling = _btc < 0.4
+            # --- Macro feedback: signal / manual-call conflict detection --
             _msg = None
-            if _mac > 0:
-                # You say bull, but signals look stressed
-                if (_vol > VOL_HIGH_THRESHOLD
-                        and _alt < ALT_LOW_THRESHOLD
-                        and _btc_rising):
+            if self.macro_regime in (-1, 0, +1):
+                # Manual mode: warn when internal regime disagrees
+                if self.internal_regime != self.macro_regime:
                     _msg = (
-                        "Signals conflict with your macro call: bull vs stress "
-                        "(high vol, weak alts, rising BTC dominance)."
+                        f"Signals conflict with your macro call: "
+                        f"you set {self.macro_regime:+d}, "
+                        f"signals suggest {self.internal_regime:+d}."
                     )
-            elif _mac < 0:
-                # You say bear, but signals look risk-on
-                if (_vol < VOL_LOW_THRESHOLD
-                        and _alt > ALT_HIGH_THRESHOLD
-                        and _btc_falling):
+            elif self.macro_regime == 2:
+                # AUTO mode: warn when signals are uncertain / evenly split
+                if abs(_bull_score - _bear_score) < 0.5:
                     _msg = (
-                        "Signals conflict with your macro call: bear vs risk-on "
-                        "(low vol, strong alts, falling BTC dominance)."
+                        f"AUTO mode: signals uncertain or mixed "
+                        f"(bull={_bull_score:.1f}, bear={_bear_score:.1f})."
                     )
             if _msg:
-                self.macro_messages.append(_msg)
-                print(f"[MacroFeedback] {_msg}")
+                # Store and print only on transitions (new or changed message)
+                # so the log reflects regime changes, not per-step repetitions.
+                if _msg != self._last_macro_message:
+                    self.macro_messages.append(_msg)
+                    print(f"[MacroFeedback] {_msg}")
+                    self._last_macro_message = _msg
+            else:
+                # Reset: the same message will re-fire if conditions return
+                self._last_macro_message = None
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order
@@ -632,14 +675,19 @@ class Simulation:
                         base_reward = step_return - step_txn_cost
 
                         macro = self.macro_regime
-                        alt   = getattr(state, "altseason_index", 0.0)
-                        vol   = getattr(state, "vol_regime", 0.0)
+                        # AUTO mode: ignore manual call, use internally
+                        # derived regime so reward shaping is fully signal-driven.
+                        macro_effective = (
+                            self.internal_regime if macro == 2 else macro
+                        )
+                        alt = getattr(state, "altseason_index", 0.0)
+                        vol = getattr(state, "vol_regime", 0.0)
 
-                        if macro > 0:
+                        if macro_effective > 0:
                             # Bull: encourage upside capture, light turnover penalty
                             turnover_penalty = 0.001 * turnover
                             reward = base_reward * (1.0 + 0.5 * alt) - turnover_penalty
-                        elif macro < 0:
+                        elif macro_effective < 0:
                             # Bear: heavily penalize drawdowns and churn
                             turnover_penalty = 0.005 * turnover
                             downside = min(pnl_reward, 0.0)
@@ -649,7 +697,7 @@ class Simulation:
                                 - turnover_penalty
                             )
                         else:
-                            # Neutral: balanced middle ground
+                            # Neutral / AUTO-neutral: balanced middle ground
                             turnover_penalty = 0.003 * turnover
                             reward = base_reward - turnover_penalty
                         # --- Critic: N-step replay buffer update ----------

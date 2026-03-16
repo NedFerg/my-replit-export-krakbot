@@ -1,0 +1,159 @@
+We are continuing RL improvements.
+
+Goal:  
+Add a fourth macro mode called AUTO, represented by macro_regime = +2.
+
+AUTO mode means:
+
+    The system ignores manual macro overrides
+
+    It computes its own internal regime score from existing signals
+
+    It uses that score to adjust reward shaping and exposure behavior
+
+    It generates feedback messages when AUTO’s internal regime disagrees with market conditions
+
+This requires four additions:
+
+    Add AUTO mode constant
+
+    Add internal regime scoring
+
+    Modify reward shaping to use AUTO’s inferred regime
+
+    Add macro conflict feedback messages
+
+All RL core logic (actor, critic, replay, microstructure, etc.) stays unchanged.
+1. Add AUTO mode constant
+
+In simulation.py, inside __init__:
+python
+
+# macro_regime:
+# -1 = bear, 0 = neutral, +1 = bull, +2 = AUTO (hands-off)
+self.macro_regime = 0
+
+AUTO mode is +2.
+
+Attach it to the state before returning:
+python
+
+setattr(state, "macro_regime", self.macro_regime)
+
+2. Add internal regime scoring (AUTO mode logic)
+
+After computing regime features (altseason_index, vol_regime, liq_regime, btc_dominance, etc.), add:
+python
+
+# --- Internal regime scoring for AUTO mode ---
+alt = self.altseason_index
+vol = self.vol_regime
+liq = self.liq_regime
+btc_dom = self.btc_dominance
+
+# Simple interpretable scoring:
+bull_score = 0.0
+bear_score = 0.0
+
+# Bullish signals
+if alt > 0.5:
+    bull_score += 1.0
+if vol < 0.01:
+    bull_score += 1.0
+if btc_dom < 0.45:
+    bull_score += 1.0
+if liq > 0.5 * max(1e-6, liq):  # placeholder, agent can refine
+    bull_score += 0.5
+
+# Bearish signals
+if vol > 0.02:
+    bear_score += 1.0
+if btc_dom > 0.55:
+    bear_score += 1.0
+if alt < 0.2:
+    bear_score += 1.0
+if liq < 0.3 * max(1e-6, liq):
+    bear_score += 0.5
+
+# Decide internal regime
+if bull_score - bear_score > 0.5:
+    self.internal_regime = +1   # bullish
+elif bear_score - bull_score > 0.5:
+    self.internal_regime = -1   # bearish
+else:
+    self.internal_regime = 0    # neutral
+
+Attach it to the state:
+python
+
+setattr(state, "internal_regime", self.internal_regime)
+
+3. Modify reward shaping to use AUTO mode
+
+In the reward section:
+python
+
+macro = self.macro_regime
+
+# If AUTO mode, override macro with internal regime
+if macro == 2:
+    macro_effective = self.internal_regime
+else:
+    macro_effective = macro
+
+Then use macro_effective in all reward logic:
+
+    bull → reward upside more, lighter turnover penalty
+
+    bear → penalize drawdowns heavily
+
+    neutral → balanced
+
+Example:
+python
+
+if macro_effective > 0:
+    reward = base_reward * (1.0 + 0.5 * alt) - turnover_penalty
+elif macro_effective < 0:
+    downside = min(step_return, 0.0)
+    reward = base_reward - 2.0 * abs(downside) * (1.0 + 5.0 * vol) - turnover_penalty
+else:
+    reward = base_reward - turnover_penalty
+
+4. Add macro conflict feedback messages
+
+Create a list in __init__:
+python
+
+self.macro_messages = []
+
+After computing internal_regime:
+python
+
+message = None
+
+# Manual macro vs signals
+if self.macro_regime in [-1, 0, +1]:
+    if self.macro_regime != self.internal_regime:
+        message = f"Signals conflict with your macro call: you set {self.macro_regime}, signals suggest {self.internal_regime}."
+
+# AUTO mode vs signals (optional)
+if self.macro_regime == 2:
+    # AUTO mode can still warn about instability
+    if abs(bull_score - bear_score) < 0.5:
+        message = "AUTO mode: signals uncertain or mixed."
+
+if message:
+    self.macro_messages.append(message)
+    print(message)
+
+5. Expose macro messages in main.py
+
+At the end of each episode:
+python
+
+if hasattr(simulation, "macro_messages") and simulation.macro_messages:
+    print("Macro feedback (recent):")
+    for msg in simulation.macro_messages[-5:]:
+        print("  -", msg)
+
