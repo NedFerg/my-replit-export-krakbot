@@ -1,0 +1,99 @@
+We are extending LiveBroker with Kraken REST client scaffolding, but:
+
+    still no real trading
+
+    still dry_run = True
+
+    this is just the HTTP + signing structure we’ll later plug into real calls
+
+1. Extend imports at the top of broker.py
+
+Add these alongside the existing imports:
+python
+
+import time
+import hmac
+import hashlib
+import base64
+import urllib.parse
+import requests
+
+2. Add Kraken client fields to LiveBroker.init
+
+Inside LiveBroker.__init__, after loading the API keys, add:
+python
+
+        # Kraken REST configuration
+        self.kraken_base_url = "https://api.kraken.com"
+        self.kraken_session  = requests.Session()
+
+3. Add low-level Kraken request helpers to LiveBroker
+
+Inside the LiveBroker class, add these methods (e.g., after trigger_kill_switch):
+python
+
+    # --------- Kraken REST client (scaffolding) ---------
+
+    def _kraken_public(self, path: str, params: dict | None = None):
+        """
+        Public Kraken endpoint (no auth).
+        For now, this is scaffolding; we won't wire it into the main loop yet.
+        """
+        url = self.kraken_base_url + path
+        params = params or {}
+        try:
+            t0 = time.time()
+            resp = self.kraken_session.get(url, params=params, timeout=5)
+            self.last_latency_sec = time.time() - t0
+            data = resp.json()
+            if data.get("error"):
+                self.last_api_error = data["error"]
+                print(f"[KRAKEN PUBLIC ERROR] {data['error']}")
+            return data
+        except Exception as e:
+            self.trigger_kill_switch(f"Kraken public request failed: {e}")
+            return None
+
+    def _kraken_private(self, path: str, data: dict | None = None):
+        """
+        Private Kraken endpoint (auth required).
+        This is scaffolding only; order placement will call this later.
+        """
+        if not self.kraken_api_key or not self.kraken_api_secret:
+            self.trigger_kill_switch("Missing Kraken API credentials")
+            return None
+
+        url = self.kraken_base_url + path
+        data = data or {}
+        data["nonce"] = str(int(time.time() * 1000))
+
+        post_data = urllib.parse.urlencode(data)
+        message   = (path.encode("utf-8") +
+                     hashlib.sha256((data["nonce"] + post_data).encode("utf-8")).digest())
+
+        secret = base64.b64decode(self.kraken_api_secret)
+        sig    = hmac.new(secret, message, hashlib.sha512)
+        sig_b64 = base64.b64encode(sig.digest())
+
+        headers = {
+            "API-Key": self.kraken_api_key,
+            "API-Sign": sig_b64.decode(),
+        }
+
+        try:
+            t0 = time.time()
+            resp = self.kraken_session.post(url, data=data, headers=headers, timeout=5)
+            self.last_latency_sec = time.time() - t0
+            data = resp.json()
+            if data.get("error"):
+                self.last_api_error = data["error"]
+                print(f"[KRAKEN PRIVATE ERROR] {data['error']}")
+            return data
+        except Exception as e:
+            self.trigger_kill_switch(f"Kraken private request failed: {e}")
+            return None
+
+4. Keep execution dry‑run only
+
+Do not change self.dry_run = True yet.
+_execute_spot_trade and _execute_futures_trade should still only log, not call _kraken_private.

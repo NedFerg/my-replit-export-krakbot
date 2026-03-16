@@ -1,4 +1,10 @@
 import os
+import time
+import hmac
+import hashlib
+import base64
+import urllib.parse
+import requests
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 
@@ -498,6 +504,10 @@ class LiveBroker(SimulatedBroker):
         self.last_latency_sec = 0.0    # round-trip latency of last API call
         self.kill_switch      = False  # set True to halt all order flow immediately
 
+        # Kraken REST configuration
+        self.kraken_base_url = "https://api.kraken.com"
+        self.kraken_session  = requests.Session()
+
     # ------------------------------------------------------------------
     # Health / kill-switch
     # ------------------------------------------------------------------
@@ -521,6 +531,75 @@ class LiveBroker(SimulatedBroker):
         self.kill_switch    = True
         self.last_api_error = reason
         print(f"[KILL SWITCH] Triggered: {reason}")
+
+    # ------------------------------------------------------------------
+    # Kraken REST client (scaffolding — not yet wired into the main loop)
+    # ------------------------------------------------------------------
+
+    def _kraken_public(self, path: str, params: dict | None = None):
+        """
+        Call a public (unauthenticated) Kraken REST endpoint.
+
+        Scaffolding only — not yet wired into price feeds or the main loop.
+        Any network error triggers the kill switch to keep the system safe.
+        """
+        url    = self.kraken_base_url + path
+        params = params or {}
+        try:
+            t0 = time.time()
+            resp = self.kraken_session.get(url, params=params, timeout=5)
+            self.last_latency_sec = time.time() - t0
+            data = resp.json()
+            if data.get("error"):
+                self.last_api_error = data["error"]
+                print(f"[KRAKEN PUBLIC ERROR] {data['error']}")
+            return data
+        except Exception as e:
+            self.trigger_kill_switch(f"Kraken public request failed: {e}")
+            return None
+
+    def _kraken_private(self, path: str, data: dict | None = None):
+        """
+        Call a private (authenticated) Kraken REST endpoint.
+
+        Scaffolding only — not yet called by _execute_spot_trade or
+        _execute_futures_trade (both remain dry-run).
+        Signs the request using the HMAC-SHA512 scheme Kraken requires.
+        Any missing credentials or network error triggers the kill switch.
+        """
+        if not self.kraken_api_key or not self.kraken_api_secret:
+            self.trigger_kill_switch("Missing Kraken API credentials")
+            return None
+
+        url  = self.kraken_base_url + path
+        data = data or {}
+        data["nonce"] = str(int(time.time() * 1000))
+
+        post_data = urllib.parse.urlencode(data)
+        message   = (path.encode("utf-8") +
+                     hashlib.sha256((data["nonce"] + post_data).encode("utf-8")).digest())
+
+        secret  = base64.b64decode(self.kraken_api_secret)
+        sig     = hmac.new(secret, message, hashlib.sha512)
+        sig_b64 = base64.b64encode(sig.digest())
+
+        headers = {
+            "API-Key":  self.kraken_api_key,
+            "API-Sign": sig_b64.decode(),
+        }
+
+        try:
+            t0 = time.time()
+            resp = self.kraken_session.post(url, data=data, headers=headers, timeout=5)
+            self.last_latency_sec = time.time() - t0
+            result = resp.json()
+            if result.get("error"):
+                self.last_api_error = result["error"]
+                print(f"[KRAKEN PRIVATE ERROR] {result['error']}")
+            return result
+        except Exception as e:
+            self.trigger_kill_switch(f"Kraken private request failed: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Live data / position sync (stubs — simulation still drives prices)
