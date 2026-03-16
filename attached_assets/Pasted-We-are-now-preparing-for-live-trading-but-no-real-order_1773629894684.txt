@@ -1,0 +1,132 @@
+We are now preparing for live trading, but no real orders yet.
+
+Goal:  
+Create a LiveBroker skeleton that:
+
+    cleanly separates simulation vs live
+
+    loads Kraken API keys from environment variables
+
+    defines the methods we’ll later wire to real endpoints
+
+    includes a basic kill‑switch hook
+
+No real trading logic yet — just structure.
+1. Import os at the top of broker.py
+python
+
+import os
+
+2. Create a LiveBroker class skeleton
+
+At the bottom of broker.py (after SimulatedBroker), add:
+python
+
+class LiveBroker(SimulatedBroker):
+    """
+    Live trading broker skeleton.
+
+    - Loads API keys from environment variables
+    - Provides stubs for price feed, position sync, and order placement
+    - Shares hybrid execution logic with SimulatedBroker for now
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Load Kraken API keys from environment variables
+        self.kraken_api_key    = os.getenv("KRAKEN_API_KEY", "")
+        self.kraken_api_secret = os.getenv("KRAKEN_API_SECRET", "")
+
+        # Safety: start in dry-run mode
+        self.dry_run = True
+
+        # Basic health/kill-switch state
+        self.last_api_error   = None
+        self.last_latency_sec = 0.0
+        self.kill_switch      = False
+
+    # --------- Health / kill-switch ---------
+
+    def check_health(self):
+        """
+        Basic health checks before sending any live orders.
+        Extend this later with:
+        - latency thresholds
+        - position mismatches
+        - leverage checks
+        - bad data detection
+        """
+        if self.kill_switch:
+            return False
+        return True
+
+    def trigger_kill_switch(self, reason: str):
+        self.kill_switch = True
+        self.last_api_error = reason
+        print(f"[KILL SWITCH] Triggered: {reason}")
+
+    # --------- Live data / positions (stubs) ---------
+
+    def fetch_live_prices(self):
+        """
+        Stub: fetch latest prices from Kraken.
+        For now, this is a placeholder. Simulation still drives prices.
+        """
+        pass
+
+    def sync_live_positions(self):
+        """
+        Stub: sync positions/balances from Kraken.
+        For now, we rely on internal state only.
+        """
+        pass
+
+    # --------- Live order placement (stubs) ---------
+
+    def _execute_spot_trade(self, asset, delta_exposure):
+        """
+        Override spot execution for live mode.
+
+        For now:
+        - respect dry_run flag
+        - just log the intent
+        """
+        if not self.check_health():
+            print(f"[LIVE SPOT BLOCKED] {asset} delta={delta_exposure:.4f}")
+            return
+
+        if self.dry_run:
+            print(f"[LIVE SPOT DRY-RUN] {asset} delta={delta_exposure:.4f}")
+            return
+
+        # TODO: implement real Kraken spot order here
+        print(f"[LIVE SPOT ORDER] {asset} delta={delta_exposure:.4f}")
+
+    def _execute_futures_trade(self, asset, delta_exposure):
+        """
+        Override futures execution for live mode.
+
+        For now:
+        - respect dry_run flag
+        - just log the intent
+        """
+        if not self.check_health():
+            print(f"[LIVE FUTURES BLOCKED] {asset} delta={delta_exposure:.4f}")
+            return
+
+        if self.dry_run:
+            print(f"[LIVE FUTURES DRY-RUN] {asset} delta={delta_exposure:.4f}")
+            return
+
+        # TODO: implement real Kraken futures/perps order here
+        print(f"[LIVE FUTURES ORDER] {asset} delta={delta_exposure:.4f}")
+
+3. Important constraints
+
+    Do not hard‑code API keys.
+    They must come from environment variables:
+    KRAKEN_API_KEY, KRAKEN_API_SECRET.
+
+    dry_run must stay True for now.
+    We’ll flip it only after test wiring and sanity checks.

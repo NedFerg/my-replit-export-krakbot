@@ -1,3 +1,4 @@
+import os
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 
@@ -457,3 +458,127 @@ class SimulatedBroker(Broker):
     @property
     def trade_log(self):
         return self._exchange.trade_log
+
+
+# ==========================================================================
+# LiveBroker — live-trading skeleton (no real orders yet)
+# ==========================================================================
+
+class LiveBroker(SimulatedBroker):
+    """
+    Live trading broker skeleton.
+
+    Inherits the full hybrid execution engine from SimulatedBroker so that
+    strategy logic (vol targeting, leverage limits, hedging, slippage) is
+    shared between sim and live modes without duplication.
+
+    In the current state:
+    - API keys are loaded from environment variables (never hard-coded).
+    - All execution methods log intent only; no real orders are sent.
+    - dry_run is permanently True until wiring and sanity checks are complete.
+    - A kill-switch can halt all order flow immediately.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Load Kraken API credentials from the environment — never hard-coded.
+        self.kraken_api_key    = os.getenv("KRAKEN_API_KEY", "")
+        self.kraken_api_secret = os.getenv("KRAKEN_API_SECRET", "")
+
+        if not self.kraken_api_key or not self.kraken_api_secret:
+            print("[LiveBroker] WARNING: KRAKEN_API_KEY / KRAKEN_API_SECRET not set. "
+                  "Running in dry-run mode with no credentials.")
+
+        # Safety: always start in dry-run — flip only after full wiring + checks.
+        self.dry_run = True
+
+        # Health and kill-switch state
+        self.last_api_error   = None   # last exception or error message from API
+        self.last_latency_sec = 0.0    # round-trip latency of last API call
+        self.kill_switch      = False  # set True to halt all order flow immediately
+
+    # ------------------------------------------------------------------
+    # Health / kill-switch
+    # ------------------------------------------------------------------
+
+    def check_health(self) -> bool:
+        """
+        Gate called before every live order.  Returns False to block execution.
+
+        Extend later with:
+        - Latency threshold checks (e.g. reject if > 2 s)
+        - Position mismatch detection (internal vs exchange state)
+        - Per-asset leverage sanity checks
+        - Stale / bad price data detection
+        """
+        if self.kill_switch:
+            return False
+        return True
+
+    def trigger_kill_switch(self, reason: str):
+        """Immediately halt all order flow and log the reason."""
+        self.kill_switch    = True
+        self.last_api_error = reason
+        print(f"[KILL SWITCH] Triggered: {reason}")
+
+    # ------------------------------------------------------------------
+    # Live data / position sync (stubs — simulation still drives prices)
+    # ------------------------------------------------------------------
+
+    def fetch_live_prices(self):
+        """
+        Stub: fetch latest mid-prices from Kraken REST or WebSocket.
+        Not yet implemented — simulation still provides price data.
+        """
+        pass
+
+    def sync_live_positions(self):
+        """
+        Stub: reconcile internal position state with Kraken account state.
+        Not yet implemented — internal state is authoritative for now.
+        """
+        pass
+
+    # ------------------------------------------------------------------
+    # Live order execution (overrides SimulatedBroker private helpers)
+    # Signature must match the parent: (asset, price, delta_exposure, microstructure_fn)
+    # ------------------------------------------------------------------
+
+    def _execute_spot_trade(self, asset, price, delta_exposure, microstructure_fn=None):
+        """
+        Override spot execution for live mode.
+
+        Health-checked and dry-run gated.  Logs intent; no real order yet.
+        TODO: call Kraken spot REST endpoint when dry_run is disabled.
+        """
+        if not self.check_health():
+            print(f"[LIVE SPOT BLOCKED]   {asset}  delta={delta_exposure:+.4f}")
+            return 0.0
+
+        if self.dry_run:
+            print(f"[LIVE SPOT DRY-RUN]   {asset}  delta={delta_exposure:+.4f}  price={price:.4f}")
+            return 0.0
+
+        # TODO: place real Kraken spot order here
+        print(f"[LIVE SPOT ORDER]     {asset}  delta={delta_exposure:+.4f}  price={price:.4f}")
+        return 0.0
+
+    def _execute_futures_trade(self, asset, price, delta_exposure, microstructure_fn=None):
+        """
+        Override futures execution for live mode.
+
+        Health-checked and dry-run gated.  Logs intent; no real order yet.
+        TODO: call Kraken Futures (or perps) endpoint when dry_run is disabled.
+        """
+        if not self.check_health():
+            print(f"[LIVE FUTURES BLOCKED] {asset}  delta={delta_exposure:+.4f}")
+            return 0.0
+
+        if self.dry_run:
+            print(f"[LIVE FUTURES DRY-RUN] {asset}  delta={delta_exposure:+.4f}  price={price:.4f}")
+            return 0.0
+
+        # TODO: place real Kraken futures/perps order here
+        print(f"[LIVE FUTURES ORDER]   {asset}  delta={delta_exposure:+.4f}  price={price:.4f}")
+        return 0.0
