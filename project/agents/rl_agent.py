@@ -164,7 +164,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
-    FEATURE_DIM = 56   # 16 SOL-only + 40 cross-asset (8 features × 5 assets)
+    FEATURE_DIM = 63   # 16 SOL-only + 40 cross-asset (8×5) + 7 crypto-regime
 
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
@@ -403,6 +403,22 @@ class ReinforcementLearningTrader(TraderAgent):
                 getattr(market_state, f"{a}_vol_imbalance",0.0) / 1000.0,
                 getattr(market_state, f"{a}_pressure",     0.0),
             ])
+
+        # Crypto-regime features (7): market-structure signals that give the
+        # agent context about the broader macro regime.
+        # btc_dominance / altseason_index are already in [0,1] naturally.
+        # Ratios (eth_btc, sol_btc, sol_eth) are normalised by /100 to bring
+        # them from their raw float range into a consistent magnitude.
+        # vol_regime and liq_regime mirror the per-asset normalisations above.
+        features.extend([
+            getattr(market_state, "btc_dominance",    0.0),           # [0,1]
+            getattr(market_state, "eth_btc_ratio",    0.0) / 100.0,   # raw ratio → small
+            getattr(market_state, "sol_btc_strength", 0.0) / 100.0,
+            getattr(market_state, "sol_eth_strength", 0.0) / 100.0,
+            getattr(market_state, "altseason_index",  0.0),           # [0,1]
+            getattr(market_state, "vol_regime",       0.0),           # small (like vol)
+            getattr(market_state, "liq_regime",       0.0) / 1000.0, # like rolling_vol
+        ])
 
         return tuple(features)
 

@@ -136,6 +136,15 @@ class Simulation:
         self.asset_vol_imbalance      = {a: 0.0 for a in self.assets}
         self.asset_pressure           = {a: 0.0 for a in self.assets}
 
+        # --- Crypto-regime feature buffers --------------------------------
+        self.btc_dominance    = 0.0   # BTC market-cap share of total
+        self.eth_btc_ratio    = 0.0   # ETH price / BTC price
+        self.sol_btc_strength = 0.0   # SOL price / BTC price
+        self.sol_eth_strength = 0.0   # SOL price / ETH price
+        self.altseason_index  = 0.0   # composite altcoin momentum signal
+        self.vol_regime       = 0.0   # cross-market realized volatility
+        self.liq_regime       = 0.0   # cross-market average rolling volume
+
     # ------------------------------------------------------------------
     # Microstructure helper
     # ------------------------------------------------------------------
@@ -382,6 +391,75 @@ class Simulation:
                 setattr(state, f"{a}_rolling_vol",   self.asset_rolling_vol[a])
                 setattr(state, f"{a}_vol_imbalance", self.asset_vol_imbalance[a])
                 setattr(state, f"{a}_pressure",      self.asset_pressure[a])
+
+            # --- Crypto-regime features -----------------------------------
+            # All five assets must have at least one price before we compute;
+            # guard with a short-circuit so step-1 stays safe.
+            if all(self.asset_prices[a] for a in self.assets):
+                _btc = self.asset_prices["BTC"][-1]
+                _eth = self.asset_prices["ETH"][-1]
+                _sol = self.asset_prices["SOL"][-1]
+                _xrp = self.asset_prices["XRP"][-1]
+                _lnk = self.asset_prices["LINK"][-1]
+
+                # --- BTC dominance (synthetic market caps) ----------------
+                _btc_mc  = _btc * 19_000_000
+                _eth_mc  = _eth * 120_000_000
+                _sol_mc  = _sol * 440_000_000
+                _xrp_mc  = _xrp * 50_000_000_000
+                _lnk_mc  = _lnk * 587_000_000
+                _total_mc = _btc_mc + _eth_mc + _sol_mc + _xrp_mc + _lnk_mc
+                self.btc_dominance = _btc_mc / _total_mc if _total_mc > 0 else 0.0
+
+                # --- Cross-asset ratios -----------------------------------
+                self.eth_btc_ratio    = _eth / _btc if _btc > 0 else 0.0
+                self.sol_btc_strength = _sol / _btc if _btc > 0 else 0.0
+                self.sol_eth_strength = _sol / _eth if _eth > 0 else 0.0
+
+                # --- Altseason index (three-component composite) ----------
+                # Component 1: ETH/BTC ratio (already computed above)
+                _eth_vs_btc = self.eth_btc_ratio
+
+                # Component 2: altcoin volume share (SOL + XRP + LINK)
+                # Use most-recent step volume from volume history; default 0.
+                _bvol = self.asset_volume_history["BTC"][-1]  if self.asset_volume_history["BTC"]  else 0.0
+                _evol = self.asset_volume_history["ETH"][-1]  if self.asset_volume_history["ETH"]  else 0.0
+                _svol = self.asset_volume_history["SOL"][-1]  if self.asset_volume_history["SOL"]  else 0.0
+                _xvol = self.asset_volume_history["XRP"][-1]  if self.asset_volume_history["XRP"]  else 0.0
+                _lvol = self.asset_volume_history["LINK"][-1] if self.asset_volume_history["LINK"] else 0.0
+                _total_vol = _bvol + _evol + _svol + _xvol + _lvol
+                _alt_vol   = _svol + _xvol + _lvol
+                _alt_vol_share = _alt_vol / _total_vol if _total_vol > 0 else 0.0
+
+                # Component 3: fraction of alts beating BTC this step
+                _btc_ret = self.asset_returns["BTC"][-1] if self.asset_returns["BTC"] else 0.0
+                _alts_outperform = sum(
+                    1 for a in ["SOL", "XRP", "LINK", "ETH"]
+                    if self.asset_returns[a] and self.asset_returns[a][-1] > _btc_ret
+                )
+                _alts_outperform_norm = _alts_outperform / 4
+
+                self.altseason_index = (
+                    0.4 * _eth_vs_btc
+                    + 0.3 * _alt_vol_share
+                    + 0.3 * _alts_outperform_norm
+                )
+
+                # --- Volatility regime: avg BTC + ETH realized vol -------
+                self.vol_regime = (self.asset_vol["BTC"] + self.asset_vol["ETH"]) / 2.0
+
+                # --- Liquidity regime: mean rolling vol across all assets -
+                _rvols = [self.asset_rolling_vol[a] for a in self.assets if self.asset_rolling_vol[a] > 0]
+                self.liq_regime = sum(_rvols) / len(_rvols) if _rvols else 0.0
+
+            # Attach regime features to state for featurize_state() to consume
+            state.btc_dominance    = self.btc_dominance
+            state.eth_btc_ratio    = self.eth_btc_ratio
+            state.sol_btc_strength = self.sol_btc_strength
+            state.sol_eth_strength = self.sol_eth_strength
+            state.altseason_index  = self.altseason_index
+            state.vol_regime       = self.vol_regime
+            state.liq_regime       = self.liq_regime
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order

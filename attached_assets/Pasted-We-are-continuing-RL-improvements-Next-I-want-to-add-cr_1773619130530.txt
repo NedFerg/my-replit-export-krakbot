@@ -1,0 +1,173 @@
+We are continuing RL improvements.
+Next, I want to add crypto‑specific regime features to the RL state:
+
+    BTC dominance
+
+    ETH/BTC ratio
+
+    SOL/BTC relative strength
+
+    SOL/ETH relative strength
+
+    Altseason index
+
+    Market volatility regime
+
+    Market liquidity regime
+
+These should be computed each step in the simulation and attached to the state object.
+All RL logic (C51, Dueling, PER, NoisyNets, N‑step, etc.) stays unchanged.
+
+Make the following edits:
+1. Add regime feature buffers to simulation
+
+In simulation.py, inside __init__, add:
+python
+
+# --- Regime feature buffers ---
+self.btc_dominance = 0.0
+self.eth_btc_ratio = 0.0
+self.sol_btc_strength = 0.0
+self.sol_eth_strength = 0.0
+self.altseason_index = 0.0
+self.vol_regime = 0.0
+self.liq_regime = 0.0
+
+2. Compute BTC dominance
+
+After all asset prices are updated:
+python
+
+# --- BTC dominance ---
+btc_price = self.asset_prices["BTC"][-1]
+eth_price = self.asset_prices["ETH"][-1]
+sol_price = self.asset_prices["SOL"][-1]
+xrp_price = self.asset_prices["XRP"][-1]
+link_price = self.asset_prices["LINK"][-1]
+
+# synthetic market caps (price × constant supply)
+btc_mc = btc_price * 19_000_000
+eth_mc = eth_price * 120_000_000
+sol_mc = sol_price * 440_000_000
+xrp_mc = xrp_price * 50_000_000_000
+link_mc = link_price * 587_000_000
+
+total_mc = btc_mc + eth_mc + sol_mc + xrp_mc + link_mc
+self.btc_dominance = btc_mc / total_mc if total_mc > 0 else 0.0
+
+3. Compute ETH/BTC ratio
+python
+
+self.eth_btc_ratio = eth_price / btc_price if btc_price > 0 else 0.0
+
+4. Compute SOL relative strength vs BTC and ETH
+python
+
+self.sol_btc_strength = sol_price / btc_price if btc_price > 0 else 0.0
+self.sol_eth_strength = sol_price / eth_price if eth_price > 0 else 0.0
+
+5. Compute Altseason Index
+
+Use three components:
+
+    ETH outperforming BTC
+
+    Altcoin volume share
+
+    Number of alts outperforming BTC
+
+Add:
+python
+
+# 1. ETH outperforming BTC (normalized)
+eth_vs_btc = self.eth_btc_ratio
+
+# 2. Altcoin volume share
+btc_vol = self.asset_volume_history["BTC"][-1]
+eth_vol = self.asset_volume_history["ETH"][-1]
+sol_vol = self.asset_volume_history["SOL"][-1]
+xrp_vol = self.asset_volume_history["XRP"][-1]
+link_vol = self.asset_volume_history["LINK"][-1]
+
+total_vol = btc_vol + eth_vol + sol_vol + xrp_vol + link_vol
+alt_vol = sol_vol + xrp_vol + link_vol
+
+alt_vol_share = alt_vol / total_vol if total_vol > 0 else 0.0
+
+# 3. Number of alts outperforming BTC this step
+alts = ["SOL", "XRP", "LINK", "ETH"]
+btc_ret = self.asset_returns["BTC"][-1] if len(self.asset_returns["BTC"]) > 0 else 0.0
+
+alts_outperform = sum(
+    1 for a in alts
+    if len(self.asset_returns[a]) > 0 and self.asset_returns[a][-1] > btc_ret
+)
+
+alts_outperform_norm = alts_outperform / len(alts)
+
+# Final altseason index
+self.altseason_index = (
+    0.4 * eth_vs_btc +
+    0.3 * alt_vol_share +
+    0.3 * alts_outperform_norm
+)
+
+6. Compute volatility regime
+
+Use BTC + ETH realized volatility:
+python
+
+btc_vol = self.asset_vol["BTC"]
+eth_vol = self.asset_vol["ETH"]
+
+self.vol_regime = (btc_vol + eth_vol) / 2.0
+
+7. Compute liquidity regime
+
+Use rolling volume across all assets:
+python
+
+rolling_vols = [
+    self.asset_rolling_vol[a]
+    for a in self.assets
+    if self.asset_rolling_vol[a] > 0
+]
+
+self.liq_regime = (
+    sum(rolling_vols) / len(rolling_vols)
+    if len(rolling_vols) > 0 else 0.0
+)
+
+8. Attach regime features to the state object
+
+Before returning the state:
+python
+
+setattr(state, "btc_dominance", self.btc_dominance)
+setattr(state, "eth_btc_ratio", self.eth_btc_ratio)
+setattr(state, "sol_btc_strength", self.sol_btc_strength)
+setattr(state, "sol_eth_strength", self.sol_eth_strength)
+setattr(state, "altseason_index", self.altseason_index)
+setattr(state, "vol_regime", self.vol_regime)
+setattr(state, "liq_regime", self.liq_regime)
+
+9. Extend featurize_state in rl_agent.py
+
+At the end of featurize_state, append:
+python
+
+features.extend([
+    getattr(state, "btc_dominance", 0.0),
+    getattr(state, "eth_btc_ratio", 0.0),
+    getattr(state, "sol_btc_strength", 0.0),
+    getattr(state, "sol_eth_strength", 0.0),
+    getattr(state, "altseason_index", 0.0),
+    getattr(state, "vol_regime", 0.0),
+    getattr(state, "liq_regime", 0.0),
+])
+
+10. Increase FEATURE_DIM by +7
+python
+
+FEATURE_DIM = OLD_FEATURE_DIM + 7
+
