@@ -1,0 +1,75 @@
+We are extending LiveBroker so that:
+
+    spot orders can be submitted to Kraken when dry_run=False
+
+    futures orders remain dry‑run only (separate API, wired later)
+
+    kill‑switch + error handling guard every submission
+
+1. Add a spot submission helper
+
+Inside LiveBroker, add:
+python
+
+    # --------- Spot order submission (Kraken AddOrder) ---------
+
+    def _submit_spot_order(self, order: dict):
+        """
+        Submit a spot order to Kraken.
+        Only used when dry_run is False.
+        """
+        if not order:
+            return None
+
+        resp = self._kraken_private("/0/private/AddOrder", order)
+        if not resp or "result" not in resp:
+            self.trigger_kill_switch("Spot order submission failed")
+            return None
+
+        if resp.get("error"):
+            # Kraken-style error array
+            self.trigger_kill_switch(f"Spot order error: {resp['error']}")
+            return None
+
+        result = resp["result"]
+        txids = result.get("txid", [])
+        print(f"[LIVE SPOT SUBMITTED] txid={txids}")
+        return result
+
+2. Wire _execute_spot_trade to call the submit helper when not dry‑run
+
+Replace your current LiveBroker._execute_spot_trade with:
+python
+
+    def _execute_spot_trade(self, asset, price, delta_exposure, microstructure_fn=None):
+        """
+        Live spot execution override.
+
+        Flow:
+        - health-gated
+        - build order
+        - dry-run: log payload only
+        - live: submit via _submit_spot_order
+        """
+        if not self.check_health():
+            print(f"[LIVE SPOT BLOCKED] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        order = self._build_spot_order(asset, price, delta_exposure)
+        if order is None:
+            print(f"[LIVE SPOT NO-OP] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        if self.dry_run:
+            print(f"[LIVE SPOT DRY-RUN] {asset} order={order}")
+            return 0.0
+
+        # Live path: actually submit
+        result = self._submit_spot_order(order)
+        if result is None:
+            print(f"[LIVE SPOT FAILED] {asset} order={order}")
+        return 0.0
+
+3. Keep futures execution dry‑run for now
+
+Leave _execute_futures_trade as it is (logging only), with the TODO comment for wiring Kraken Futures later.

@@ -800,6 +800,37 @@ class LiveBroker(SimulatedBroker):
         }
 
     # ------------------------------------------------------------------
+    # Spot order submission (live path only — dry_run must be False)
+    # ------------------------------------------------------------------
+
+    def _submit_spot_order(self, order: dict):
+        """
+        Submit a formatted spot order dict to Kraken's AddOrder endpoint.
+
+        Only called from _execute_spot_trade when dry_run is False.
+        Any API-level failure or missing result triggers the kill switch so
+        the system never silently drops an order.
+        Returns the Kraken result dict on success, or None on failure.
+        """
+        if not order:
+            return None
+
+        resp = self._kraken_private("/0/private/AddOrder", order)
+
+        if not resp or "result" not in resp:
+            self.trigger_kill_switch("Spot order submission failed — no result from Kraken")
+            return None
+
+        if resp.get("error"):
+            self.trigger_kill_switch(f"Spot order error: {resp['error']}")
+            return None
+
+        result = resp["result"]
+        txids  = result.get("txid", [])
+        print(f"[LIVE SPOT SUBMITTED] txid={txids}")
+        return result
+
+    # ------------------------------------------------------------------
     # Live order execution (overrides SimulatedBroker private helpers)
     # Signature must match the parent: (asset, price, delta_exposure, microstructure_fn)
     # ------------------------------------------------------------------
@@ -808,9 +839,9 @@ class LiveBroker(SimulatedBroker):
         """
         Live spot execution override.
 
-        Gate order: health check → build payload → dry-run log.
-        TODO: when dry_run is disabled, submit via
-              _kraken_private("/0/private/AddOrder", order)
+        Flow:  health check → build payload → dry-run log  OR  live submit.
+        Futures execution stays dry-run only until the Kraken Futures
+        endpoint is separately wired.
         """
         if not self.check_health():
             print(f"[LIVE SPOT BLOCKED]   {asset}  delta={delta_exposure:+.4f}")
@@ -825,8 +856,10 @@ class LiveBroker(SimulatedBroker):
             print(f"[LIVE SPOT DRY-RUN]   {asset}  order={order}")
             return 0.0
 
-        # TODO: submit to Kraken spot endpoint
-        print(f"[LIVE SPOT ORDER]     {asset}  order={order}")
+        # Live path — actually submit to Kraken
+        result = self._submit_spot_order(order)
+        if result is None:
+            print(f"[LIVE SPOT FAILED]    {asset}  order={order}")
         return 0.0
 
     def _execute_futures_trade(self, asset, price, delta_exposure, microstructure_fn=None):
