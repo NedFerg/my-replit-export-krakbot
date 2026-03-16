@@ -170,6 +170,12 @@ class Simulation:
         self.top_risk      = 0
         self.prev_top_risk = 0
 
+        # --- Flash-crash / panic risk flag --------------------------------
+        # 0 = normal, 1 = warning (instability rising), 2 = panic (flash-crash)
+        self.panic_risk      = 0
+        self.prev_panic_risk = 0
+        self.prev_vol_regime = 0.0   # needed to detect sudden vol spikes
+
         # --- Multi-asset rotation engine ----------------------------------
         # rotation_score[asset] ∈ [0, ~4.5] — higher = current leader
         self.rotation_score      = {}   # asset → score this step
@@ -641,6 +647,55 @@ class Simulation:
                 print(_tmsg)
             self.prev_top_risk = self.top_risk
 
+            # --- Flash-crash / panic detection ----------------------------
+            # Uses existing vol_regime, liq_regime, and per-asset prices —
+            # no new data sources needed.
+            _pc_vol = self.vol_regime
+            _pc_liq = self.liq_regime
+
+            # 1. Sudden volatility spike vs the previous step
+            _vol_spike = (_pc_vol - self.prev_vol_regime) > 0.015
+
+            # 2. Liquidity collapse
+            _liq_crash = _pc_liq < 0.2
+
+            # 3. Broad simultaneous selloff across assets
+            _drop_count = 0
+            for _a in self.assets:
+                _ap = self.asset_prices[_a]
+                if len(_ap) > 1:
+                    _r = (_ap[-1] - _ap[-2]) / max(_ap[-2], 1e-6)
+                    if _r < -0.03:   # ≥3% drop in one step
+                        _drop_count += 1
+            _broad_selloff = _drop_count >= 3   # at least 3 assets nuking
+
+            _panic_score = 0
+            if _vol_spike:     _panic_score += 1
+            if _liq_crash:     _panic_score += 1
+            if _broad_selloff: _panic_score += 2   # stronger weight
+
+            if _panic_score >= 3:
+                self.panic_risk = 2   # flash-crash
+            elif _panic_score >= 1:
+                self.panic_risk = 1   # warning
+            else:
+                self.panic_risk = 0   # normal
+
+            setattr(state, "panic_risk", self.panic_risk)
+
+            # Panic feedback: print only on transitions
+            if self.panic_risk != self.prev_panic_risk:
+                if self.panic_risk == 1:
+                    _pmsg = "Panic risk rising — volatility spike detected."
+                elif self.panic_risk == 2:
+                    _pmsg = "Flash-crash conditions detected — emergency de-risking."
+                else:
+                    _pmsg = "Panic risk normalized."
+                self.macro_messages.append(_pmsg)
+                print(_pmsg)
+            self.prev_panic_risk = self.panic_risk
+            self.prev_vol_regime = self.vol_regime   # keep for next-step spike calc
+
             # --- Dynamic exposure caps ------------------------------------
             # Per-asset caps that adapt each step to volatility, liquidity,
             # altseason momentum, and the effective macro regime.
@@ -686,6 +741,12 @@ class Simulation:
                     _cap *= 0.8   # early warning: moderate reduction
                 elif self.top_risk == 2:
                     _cap *= 0.5   # blow-off: de-risk hard
+
+                # Panic mode tightening (stacks with blow-off and regime scaling)
+                if self.panic_risk == 1:
+                    _cap *= 0.6   # warning: cut exposure significantly
+                elif self.panic_risk == 2:
+                    _cap *= 0.3   # emergency: emergency de-risk
 
                 # Rotation tilt: leaders get up to +20% cap
                 # BTC is the anchor so has no rotation score entry (returns 0.0)
@@ -899,6 +960,16 @@ class Simulation:
                             reward -= 1.0 * turnover
                             if step_return < 0:
                                 reward -= 2.0 * abs(step_return)
+
+                        # --- Panic mode reward penalties ------------------
+                        # Teach the agent: don't add size, don't fight the
+                        # crash, cut risk quickly.
+                        if self.panic_risk == 1:
+                            reward -= 0.5 * turnover
+                        elif self.panic_risk == 2:
+                            reward -= 1.5 * turnover
+                            if step_return < 0:
+                                reward -= 3.0 * abs(step_return)
 
                         # --- Rotation leader bonus ------------------------
                         # Small positive signal toward overweighting leaders;

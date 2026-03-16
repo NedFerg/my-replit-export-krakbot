@@ -1,0 +1,141 @@
+We are continuing RL improvements.
+
+Goal:  
+Add a flash‑crash detection module that identifies sudden, violent market stress and produces a panic_risk flag:
+
+    0 = normal
+
+    1 = elevated (instability rising)
+
+    2 = panic (flash‑crash conditions)
+
+This module should:
+
+    use existing features (no new data sources)
+
+    detect sudden volatility spikes, liquidity collapse, and sharp price drops
+
+    tighten dynamic caps aggressively
+
+    penalize adding exposure during panic
+
+    generate feedback messages like:
+
+        “Panic risk rising — volatility spike detected.”
+
+        “Flash‑crash conditions detected — emergency de‑risking.”
+
+All RL core logic stays unchanged.
+1. Add panic_risk flag
+
+In simulation.py, inside __init__:
+python
+
+# Flash-crash panic risk: 0=normal, 1=warning, 2=panic
+self.panic_risk = 0
+
+Attach to state:
+python
+
+setattr(state, "panic_risk", self.panic_risk)
+
+2. Compute panic risk each step
+
+Insert this after regime features and blow‑off detection:
+python
+
+# --- Flash-crash / panic detection ---
+vol = self.vol_regime
+liq = self.liq_regime
+alt = self.altseason_index
+
+# 1. Sudden volatility spike (fast-moving)
+vol_spike = (vol - self.prev_vol_regime) > 0.015
+
+# 2. Liquidity collapse
+liq_crash = liq < 0.2
+
+# 3. Sharp price drop across multiple assets
+drop_count = 0
+for a in self.assets:
+    if len(self.asset_prices[a]) > 2:
+        r = (self.asset_prices[a][-1] - self.asset_prices[a][-2]) / max(self.asset_prices[a][-2], 1e-6)
+        if r < -0.03:  # 3% drop in one step
+            drop_count += 1
+
+broad_selloff = drop_count >= 3  # at least 3 assets nuking simultaneously
+
+# Score panic conditions
+panic_score = 0
+if vol_spike: panic_score += 1
+if liq_crash: panic_score += 1
+if broad_selloff: panic_score += 2
+
+# Convert to panic_risk
+if panic_score >= 3:
+    self.panic_risk = 2
+elif panic_score >= 1:
+    self.panic_risk = 1
+else:
+    self.panic_risk = 0
+
+Attach to state:
+python
+
+setattr(state, "panic_risk", self.panic_risk)
+
+3. Integrate panic_risk into dynamic caps
+
+In the dynamic caps block, after blow‑off scaling:
+python
+
+# Panic mode tightening
+if self.panic_risk == 1:
+    cap *= 0.6   # warning
+elif self.panic_risk == 2:
+    cap *= 0.3   # emergency de-risking
+
+This stacks with blow‑off and regime scaling.
+4. Integrate panic_risk into reward shaping
+
+After blow‑off penalties:
+python
+
+# Panic mode reward penalties
+if self.panic_risk == 1:
+    reward -= 0.5 * turnover  # discourage repositioning
+elif self.panic_risk == 2:
+    reward -= 1.5 * turnover  # strong penalty for adding exposure
+    if step_return < 0:
+        reward -= 3.0 * abs(step_return)  # punish losses during panic
+
+This teaches the agent:
+
+    don’t add size
+
+    don’t fight the crash
+
+    cut risk quickly
+
+5. Add panic feedback messages
+
+After computing panic_risk:
+python
+
+if not hasattr(self, "prev_panic_risk"):
+    self.prev_panic_risk = 0
+
+if self.panic_risk != self.prev_panic_risk:
+    if self.panic_risk == 1:
+        msg = "Panic risk rising — volatility spike detected."
+    elif self.panic_risk == 2:
+        msg = "Flash-crash conditions detected — emergency de-risking."
+    else:
+        msg = "Panic risk normalized."
+
+    self.macro_messages.append(msg)
+    print(msg)
+
+self.prev_panic_risk = self.panic_risk
+
+This prints only on transitions.
