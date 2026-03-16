@@ -1,0 +1,92 @@
+JSONL Trade Journal Block
+Code
+
+Insert the following into your agent class, immediately after place_order():
+
+    def log_trade(self, record: dict, filename="trades.jsonl"):
+        """
+        Append a single trade record to a JSONL journal.
+        Each line is one JSON object for easy real-time viewing.
+        """
+        import json
+        import time
+
+        # Add timestamp if not already present
+        if "timestamp" not in record:
+            record["timestamp"] = time.time()
+
+        try:
+            with open(filename, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            print(f"[JOURNAL] Failed to write trade record: {e}")
+
+Now modify place_order() so it logs every trade (dry-run or live):
+
+def place_order(self, symbol, side, size):
+"""
+Unified order entry point for the agent.
+In dry-run mode, logs the intended trade instead of sending it.
+"""
+import time
+Dry-run path
+
+if self.dry_run or self.broker is None:
+print(f"[DRY RUN] Would place order: {side} {size} {symbol}")
+record = {
+"status": "dry_run",
+"symbol": symbol,
+"side": side,
+"size": size,
+"timestamp": time.time(),
+}
+self.log_trade(record)
+return record
+Live mode
+
+result = self.broker.execute_trade(symbol, side, size)
+Journal the live trade
+
+record = {
+"status": "live",
+"symbol": symbol,
+"side": side,
+"size": size,
+"result": result,
+"timestamp": time.time(),
+}
+self.log_trade(record)
+
+return result
+Code
+
+
+---
+
+# ⭐ What this gives you immediately
+
+### 🟩 A real‑time, append‑only trade log  
+Every trade — dry‑run or live — becomes one JSON object per line.
+
+### 🟩 Perfect for live monitoring  
+Run this in a terminal:
+
+tail -f trades.jsonl
+Code
+
+
+You’ll see trades scroll by as they happen.
+
+### 🟩 Perfect for analysis  
+Load it later with:
+
+```python
+import pandas as pd
+df = pd.read_json("trades.jsonl", lines=True)
+
+🟩 Zero interference with your simulation
+
+Simulation uses decide() and never touches place_order(), so nothing breaks.
+🟩 Zero interference with your live loop
+
+run_live_trading_loop() doesn’t need to change at all.

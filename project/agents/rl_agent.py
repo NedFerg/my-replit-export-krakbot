@@ -2,6 +2,7 @@ import collections
 import random
 import math
 import time
+import json
 
 import torch
 import torch.nn as nn
@@ -396,6 +397,7 @@ class ReinforcementLearningTrader(TraderAgent):
         In dry-run mode (default), logs the intended trade instead of
         sending it to the broker.  In live mode, delegates to
         broker.execute_trade() which runs the full safety harness.
+        Every call (dry-run or live) is appended to the JSONL journal.
 
         Parameters
         ----------
@@ -405,14 +407,46 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         if self.dry_run or self.broker is None:
             print(f"[DRY RUN] Would place order: {side} {size} {symbol}")
-            return {
-                "status": "dry_run",
-                "symbol": symbol,
-                "side":   side,
-                "size":   size,
+            record = {
+                "status":    "dry_run",
+                "symbol":    symbol,
+                "side":      side,
+                "size":      size,
+                "timestamp": time.time(),
             }
+            self.log_trade(record)
+            return record
 
-        return self.broker.execute_trade(symbol, side, size)
+        result = self.broker.execute_trade(symbol, side, size)
+        record = {
+            "status":    "live",
+            "symbol":    symbol,
+            "side":      side,
+            "size":      size,
+            "result":    result,
+            "timestamp": time.time(),
+        }
+        self.log_trade(record)
+        return result
+
+    def log_trade(self, record: dict, filename="trades.jsonl"):
+        """
+        Append a single trade record to a JSONL journal.
+        Each line is one JSON object for easy real-time viewing.
+
+        Usage
+        -----
+        tail -f trades.jsonl              # live monitoring
+        pd.read_json("trades.jsonl", lines=True)  # analysis
+        """
+        if "timestamp" not in record:
+            record["timestamp"] = time.time()
+
+        try:
+            with open(filename, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            print(f"[JOURNAL] Failed to write trade record: {e}")
 
     # ------------------------------------------------------------------
     # Display helpers
