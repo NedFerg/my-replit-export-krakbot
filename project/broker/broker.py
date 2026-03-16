@@ -481,7 +481,10 @@ class LiveBroker(SimulatedBroker):
 
     Safety defaults
     ---------------
-    - KRAKEN_SANDBOX=true  (default) → connects to api.sandbox.kraken.com.
+    - KRAKEN_SANDBOX=true  (default) → connects to api.kraken.com but sends
+      validate=true on all order submissions so Kraken validates the payload
+      without executing it.  Read operations (prices, balances) hit the real
+      API so data is accurate.
       Set KRAKEN_SANDBOX=false in Replit Secrets only when ready for live money.
     - ENABLE_FUTURES=False (class constant) → all futures code paths are fully
       disabled.  US residents cannot legally trade Kraken Futures.  Set to True
@@ -529,12 +532,15 @@ class LiveBroker(SimulatedBroker):
         # in Replit Secrets.  This is intentional — sandbox is the safe default.
         _use_sandbox = os.getenv("KRAKEN_SANDBOX", "true").strip().lower()
         self._sandbox_mode = _use_sandbox not in ("false", "0", "no")
+        # Kraken has no separate sandbox domain.  In sandbox mode we still
+        # connect to api.kraken.com for price/balance reads, but every order
+        # submission carries validate=true so Kraken validates the payload
+        # without executing it.
+        self.kraken_base_url = "https://api.kraken.com"
         if self._sandbox_mode:
-            self.kraken_base_url = "https://api.sandbox.kraken.com"
-            print("[LiveBroker] SANDBOX MODE — connected to api.sandbox.kraken.com")
+            print("[LiveBroker] SANDBOX MODE — api.kraken.com (validate=true on orders).")
             print("  To go live: set KRAKEN_SANDBOX=false in Replit Secrets.")
         else:
-            self.kraken_base_url = "https://api.kraken.com"
             print("[LiveBroker] LIVE MODE — connected to api.kraken.com")
 
         # Limit-order tolerance: how far from mid-price the limit is placed.
@@ -1577,9 +1583,22 @@ class LiveBroker(SimulatedBroker):
         Any API-level failure or missing result triggers the kill switch so
         the system never silently drops an order.
         Returns the Kraken result dict on success, or None on failure.
+
+        Sandbox mode: injects validate=true so Kraken validates the payload
+        server-side without creating a real order.  This confirms the order
+        structure, API credentials, pair name, and volume minimums are all
+        correct — without spending money.
         """
         if not order:
             return None
+
+        # Inject Kraken's validate flag in sandbox mode so the order is
+        # checked but never executed.  Remove this field on the live path.
+        if self._sandbox_mode:
+            order = dict(order)      # shallow copy — don't mutate the caller's dict
+            order["validate"] = "true"
+            print(f"[SANDBOX] Order submitted with validate=true (no fill): "
+                  f"{order.get('pair')} {order.get('type')} {order.get('volume')}")
 
         resp = self._kraken_private("/0/private/AddOrder", order)
 

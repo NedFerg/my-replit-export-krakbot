@@ -3,6 +3,7 @@ import random
 import math
 import time
 import json
+import os
 
 import torch
 import torch.nn as nn
@@ -193,6 +194,27 @@ class ReinforcementLearningTrader(TraderAgent):
     # Must match the length of the tuple featurize_state() returns.
     FEATURE_DIM = 88   # 16 SOL-only + 64 cross-asset (8×8) + 7 crypto-regime + 1 macro_regime
 
+    # ------------------------------------------------------------------
+    # Safety gate — RL is off by default.
+    #
+    # The actor network initialises with random weights.  Allowing it to
+    # produce live trades before training would be equivalent to trading
+    # at random.  Keep USE_RL_AGENT=false until:
+    #   1. A checkpoint exists at CHECKPOINT_PATH (or KRAKBOT_CHECKPOINT_PATH
+    #      env var), AND
+    #   2. You have validated the actor's behaviour in sandbox mode.
+    #
+    # To enable: set env var USE_RL_AGENT=true (or flip the default below).
+    # ------------------------------------------------------------------
+    USE_RL_AGENT: bool = os.environ.get("USE_RL_AGENT", "false").lower() == "true"
+
+    # File path for loading/saving actor+critic weights.
+    # Override with the KRAKBOT_CHECKPOINT_PATH environment variable.
+    CHECKPOINT_PATH: str = os.environ.get(
+        "KRAKBOT_CHECKPOINT_PATH",
+        os.path.join(os.path.dirname(__file__), "..", "checkpoints", "krakbot_actor.pt"),
+    )
+
     def __init__(self, name, balance, latency=2, broker=None, dry_run=True):
         super().__init__(name, balance, latency)
 
@@ -200,6 +222,10 @@ class ReinforcementLearningTrader(TraderAgent):
         self.broker  = broker
         self.dry_run = dry_run
         self.ready   = False   # set True by warm_up() before live trading begins
+
+        # Checkpoint flag — must be True before the actor can produce trades.
+        # Set by load_checkpoint(); never set manually.
+        self._checkpoint_loaded: bool = False
 
         self.feature_dim = self.FEATURE_DIM
 
@@ -313,6 +339,158 @@ class ReinforcementLearningTrader(TraderAgent):
         self.prev_action    = None
         self.prev_equity    = None
 
+        # ------------------------------------------------------------------
+        # Auto-load checkpoint (silent — does not raise if file is absent).
+        # load_checkpoint() sets _checkpoint_loaded = True on success.
+        # ------------------------------------------------------------------
+        self.load_checkpoint(self.CHECKPOINT_PATH, silent=True)
+
+        # ------------------------------------------------------------------
+        # Startup status banner
+        # ------------------------------------------------------------------
+        if not self.USE_RL_AGENT:
+            print(
+                "[RL AGENT] USE_RL_AGENT=false — actor is DISABLED.\n"
+                "           step() will return zero deltas (no live trades).\n"
+                "           Set USE_RL_AGENT=true in Replit Secrets after a\n"
+                "           checkpoint has been validated in sandbox mode."
+            )
+        elif not self._checkpoint_loaded:
+            print(
+                "[RL AGENT] USE_RL_AGENT=true but NO CHECKPOINT FOUND at:\n"
+                f"           {self.CHECKPOINT_PATH}\n"
+                "           step() will return zero deltas until a trained\n"
+                "           checkpoint is saved and the bot is restarted.\n"
+                "           To generate one: run simulation mode with training\n"
+                "           enabled, then call agent.save_checkpoint()."
+            )
+        else:
+            print(
+                f"[RL AGENT] Checkpoint loaded — actor is ENABLED.\n"
+                f"           Path: {self.CHECKPOINT_PATH}"
+            )
+
+    # ------------------------------------------------------------------
+    # Checkpoint save / load
+    # ------------------------------------------------------------------
+
+    def save_checkpoint(self, path: str | None = None) -> bool:
+        """
+        Persist actor and value-network weights to disk.
+
+        Saves a dict containing:
+          - actor_state_dict
+          - value_net_state_dict
+          - replay_steps       (training progress counter)
+          - assets             (sanity-check: must match on load)
+          - feature_dim        (sanity-check)
+
+        Parameters
+        ----------
+        path : file path to write.  Defaults to self.CHECKPOINT_PATH.
+
+        Returns True on success, False on error.
+        """
+        path = path or self.CHECKPOINT_PATH
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            payload = {
+                "actor_state_dict":     self.actor.state_dict(),
+                "value_net_state_dict": self.value_net.state_dict(),
+                "replay_steps":         self.replay_steps,
+                "assets":               self.assets,
+                "feature_dim":          self.feature_dim,
+            }
+            torch.save(payload, path)
+            print(f"[CHECKPOINT] Saved to {path}  (replay_steps={self.replay_steps})")
+            return True
+        except Exception as exc:
+            print(f"[CHECKPOINT] Save failed: {exc}")
+            return False
+
+    def load_checkpoint(self, path: str | None = None, silent: bool = False) -> bool:
+        """
+        Restore actor and value-network weights from disk.
+
+        Sets self._checkpoint_loaded = True only when the file is read
+        successfully AND passes the architecture sanity checks.
+
+        Parameters
+        ----------
+        path   : file path to read.  Defaults to self.CHECKPOINT_PATH.
+        silent : if True, suppress the "file not found" log line (used
+                 during __init__ auto-load so startup is not noisy when
+                 no checkpoint has been created yet).
+
+        Returns True on success, False on any error.
+        """
+        path = path or self.CHECKPOINT_PATH
+
+        if not os.path.isfile(path):
+            if not silent:
+                print(f"[CHECKPOINT] File not found: {path}")
+            return False
+
+        try:
+            payload = torch.load(path, map_location=self.device)
+        except Exception as exc:
+            print(f"[CHECKPOINT] Load failed (corrupt file?): {exc}")
+            return False
+
+        # Sanity-check architecture compatibility
+        saved_assets   = payload.get("assets", [])
+        saved_feat_dim = payload.get("feature_dim", -1)
+        if saved_assets != self.assets:
+            print(
+                f"[CHECKPOINT] Asset mismatch — checkpoint has {saved_assets},\n"
+                f"             agent expects {self.assets}. Ignoring."
+            )
+            return False
+        if saved_feat_dim != self.feature_dim:
+            print(
+                f"[CHECKPOINT] Feature-dim mismatch — checkpoint={saved_feat_dim}, "
+                f"agent={self.feature_dim}. Ignoring."
+            )
+            return False
+
+        try:
+            self.actor.load_state_dict(payload["actor_state_dict"])
+            self.value_net.load_state_dict(payload["value_net_state_dict"])
+            self.target_value_net.load_state_dict(payload["value_net_state_dict"])
+            self.replay_steps = payload.get("replay_steps", 0)
+        except Exception as exc:
+            print(f"[CHECKPOINT] Weight-load error: {exc}")
+            return False
+
+        self._checkpoint_loaded = True
+        print(
+            f"[CHECKPOINT] Loaded from {path}  "
+            f"(replay_steps={self.replay_steps})"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Internal helper: zero all target exposures and return cleanly
+    # ------------------------------------------------------------------
+
+    def _zero_exposures(self, reason: str) -> None:
+        """
+        Set every target exposure to 0.0 and log the reason.
+        Called by step() whenever the RL gate blocks execution.
+
+        Logging is rate-gated to once every 60 seconds so the message is
+        visible in the console without flooding it on every tick.
+        """
+        for a in self.assets:
+            self.target_exposures[a] = 0.0
+        self.target_exposure = 0.0
+
+        now = time.time()
+        last = getattr(self, "_last_zero_log_ts", 0.0)
+        if now - last >= 60.0:
+            print(f"[RL AGENT] step() → ZERO DELTAS ({reason})")
+            self._last_zero_log_ts = now
+
     # ------------------------------------------------------------------
     # Warm-up and live step
     # ------------------------------------------------------------------
@@ -324,7 +502,26 @@ class ReinforcementLearningTrader(TraderAgent):
         Syncs account state, emits heartbeats, and records health metrics
         for `cycles` iterations.  Sets self.ready = True on completion so
         that step() will begin executing trades.
+
+        Gate: if USE_RL_AGENT is False OR no checkpoint is loaded, this
+        method returns immediately without setting self.ready = True, so
+        step() will never produce orders.
         """
+        if not self.USE_RL_AGENT:
+            print(
+                "[WARM-UP] Skipped — USE_RL_AGENT=false.\n"
+                "          The bot is running in safe/passive mode; no trades\n"
+                "          will be placed until RL is enabled and validated."
+            )
+            return
+
+        if not self._checkpoint_loaded:
+            print(
+                "[WARM-UP] Skipped — no trained checkpoint is loaded.\n"
+                "          Train the actor in simulation mode first, call\n"
+                "          agent.save_checkpoint(), then restart the bot."
+            )
+            return
         print(f"[WARM-UP] Starting warm-up for {cycles} cycles")
 
         stable = 0
@@ -430,11 +627,25 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         Live-trading entry point called by run_live_trading_loop().
 
-        Guards against trading before warm_up() completes.
-        Refreshes live prices via the broker, runs the actor network to
-        produce per-asset exposure targets, and logs the decisions with
-        direction labels and confidence scores.
+        Three-layer safety gate (all three must pass to produce orders):
+          1. USE_RL_AGENT must be True
+          2. A trained checkpoint must be loaded (_checkpoint_loaded)
+          3. warm_up() must have completed (self.ready)
+
+        On any failure the method returns immediately after zeroing all
+        target_exposures — the broker will receive no rebalance signals.
         """
+        # Gate 1 — RL feature flag
+        if not self.USE_RL_AGENT:
+            self._zero_exposures("USE_RL_AGENT=false")
+            return
+
+        # Gate 2 — trained weights required
+        if not self._checkpoint_loaded:
+            self._zero_exposures("no checkpoint loaded — actor weights are random")
+            return
+
+        # Gate 3 — warm-up must have completed
         if not self.ready:
             print("[WARM-UP] Agent not ready — skipping step()")
             return

@@ -1,4 +1,3 @@
-import sys; sys.exit(0)  # HALTED — static-extraction mode
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for file output
 import matplotlib.pyplot as plt
@@ -163,12 +162,35 @@ def run_live():
         print("[MAIN] Futures overlay: LIVE mode — fetching real collateral from futures.kraken.com.")
     broker.fetch_futures_wallet()
 
-    agent  = ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False)
+    agent = ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False)
     agent.warm_up(broker, cycles=5)
+
     if not agent.ready:
-        print("[MAIN] Warm-up failed — aborting live launch.")
-        return
-    print("[MAIN] Warm-up complete — entering live trading loop (Ctrl-C to stop)")
+        # Two distinct reasons warm_up() exits without setting ready=True:
+        #
+        #   A) USE_RL_AGENT=false or no checkpoint → passive/safe mode.
+        #      The loop still runs so health metrics and price polling
+        #      continue; step() returns zero deltas so no orders fire.
+        #
+        #   B) Broker connectivity failure inside the warm_up cycles.
+        #      The broker's kill-switch would have fired; abort cleanly.
+        #
+        # Distinguish by checking the RL gate flags, not the broker state.
+        if not agent.USE_RL_AGENT or not agent._checkpoint_loaded:
+            print(
+                "[MAIN] Entering passive monitoring mode — RL agent is inactive.\n"
+                "       The loop will poll prices and log health metrics.\n"
+                "       No orders will be placed until RL is enabled and validated."
+            )
+            # Fall through — run_live_trading_loop will call step() which
+            # returns zero deltas on every tick.
+        else:
+            print("[MAIN] Warm-up failed (broker/connectivity issue) — aborting.")
+            return
+
+    else:
+        print("[MAIN] Warm-up complete — entering live trading loop (Ctrl-C to stop)")
+
     run_live_trading_loop(broker, agent)
 
 
