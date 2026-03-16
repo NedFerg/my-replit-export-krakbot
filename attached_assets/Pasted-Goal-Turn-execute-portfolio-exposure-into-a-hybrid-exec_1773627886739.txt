@@ -1,0 +1,146 @@
+Goal:  
+Turn execute_portfolio_exposure into a hybrid execution engine:
+
+    Spot core = slow, stable, conviction exposure
+
+    Futures overlay = fast, tactical, high‑conviction exposure
+
+    Combined exposure ≈ RL target, but safer and more expressive.
+
+All RL logic stays unchanged — this is execution‑layer only.
+1. Add hybrid state to broker
+
+In broker.py, inside __init__:
+python
+
+# Hybrid execution state
+self.spot_positions = {a: 0.0 for a in self.assets}
+self.futures_positions = {a: 0.0 for a in self.assets}
+
+# Optional: per-asset funding rates (placeholder, can be wired later)
+self.funding_rates = {a: 0.0 for a in self.assets}
+
+If you already track a single positions dict, keep it, but treat it as combined or deprecate it in favor of the two‑layer view.
+2. Define cycle‑based spot/futures weights
+
+In simulation.py (or a shared config), add:
+python
+
+def get_spot_futures_weights(cycle_phase: int):
+    # 0=early,1=mid,2=late,3=reset
+    if cycle_phase == 0:
+        return 0.70, 0.30
+    elif cycle_phase == 1:
+        return 0.60, 0.40
+    elif cycle_phase == 2:
+        return 0.50, 0.50
+    else:
+        return 0.40, 0.60
+
+You can place this as a method on Simulation or as a standalone helper.
+3. Replace single‑layer execution with hybrid logic
+
+In broker.execute_portfolio_exposure(simulation, target_exposures)  
+replace the old exposure logic with this block:
+python
+
+def execute_portfolio_exposure(self, simulation, target_exposures):
+    cycle_phase = simulation.cycle_phase
+    vol_scaler = simulation.vol_scaler
+    panic_risk = simulation.panic_risk
+    top_risk = simulation.top_risk
+
+    spot_weight, futures_weight = get_spot_futures_weights(cycle_phase)
+
+    for asset, target in target_exposures.items():
+        cap_long, cap_short = simulation.get_caps_for_asset(asset)  # existing helper
+
+        # --- 1) Split into spot + futures ---
+        spot_exposure = target * spot_weight
+        futures_exposure = target * futures_weight
+
+        # Spot cannot short
+        if spot_exposure < 0:
+            spot_exposure = 0.0
+
+        # --- 2) Apply volatility targeting to futures only ---
+        futures_exposure *= vol_scaler
+
+        # --- 3) Apply panic mode to futures only ---
+        if panic_risk == 1:
+            futures_exposure *= 0.5
+        elif panic_risk == 2:
+            futures_exposure *= 0.1
+
+        # --- 4) Apply blow-off top risk to futures only ---
+        if top_risk == 1:
+            futures_exposure *= 0.7
+        elif top_risk == 2:
+            futures_exposure *= 0.3
+
+        # --- 5) Optional: funding-aware adjustment (placeholder) ---
+        funding = self.funding_rates.get(asset, 0.0)
+        if funding != 0.0:
+            # Small linear adjustment, clamped
+            k = 0.2
+            adj = max(0.5, min(1.5, 1.0 - k * funding))
+            futures_exposure *= adj
+
+        # --- 6) Apply dynamic caps to each layer ---
+        spot_exposure = max(cap_short, min(cap_long, spot_exposure))
+        futures_exposure = max(cap_short, min(cap_long, futures_exposure))
+
+        # --- 7) Compute deltas vs current positions ---
+        current_spot = self.spot_positions[asset]
+        current_fut = self.futures_positions[asset]
+
+        delta_spot = spot_exposure - current_spot
+        delta_fut = futures_exposure - current_fut
+
+        # --- 8) Execute spot trades (slow, thresholded) ---
+        spot_threshold = 0.02  # 2% exposure change
+        if abs(delta_spot) > spot_threshold:
+            self._execute_spot_trade(asset, delta_spot)
+            self.spot_positions[asset] = spot_exposure
+
+        # --- 9) Execute futures trades (fast, every step) ---
+        self._execute_futures_trade(asset, delta_fut)
+        self.futures_positions[asset] = futures_exposure
+
+You likely already have some _execute_trade logic — split it into:
+python
+
+def _execute_spot_trade(self, asset, delta_exposure):
+    # Map delta_exposure → notional/quantity and send spot order
+    pass
+
+def _execute_futures_trade(self, asset, delta_exposure):
+    # Map delta_exposure → notional/quantity and send futures/perps order
+    pass
+
+Keep them as stubs if you’re still in simulation.
+4. Keep combined exposure consistent (optional)
+
+If you still use a single positions dict elsewhere, update it at the end of execute_portfolio_exposure:
+python
+
+        combined = self.spot_positions[asset] + self.futures_positions[asset]
+        self.positions[asset] = combined
+
+This keeps the rest of the system seeing the total exposure as before.
+5. Sanity checks you should see in logs
+
+Once this is in and you run a few episodes, you should observe:
+
+    In early cycle, spot positions are larger than futures.
+
+    In late/reset, futures positions become more active.
+
+    During panic_risk=2, futures exposures collapse while spot stays mostly intact.
+
+    During top_risk=2, futures trim aggressively into strength.
+
+    vol_scaler < 1 shrinks futures when realized vol spikes.
+
+    Combined exposure (spot + futures) stays close to the RL target, but smoother and safer.
+
