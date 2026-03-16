@@ -99,6 +99,12 @@ class Simulation:
         self.equity_peak = None
         self.equity_history = []
 
+        # Fractional drawdown [0, 1] for reward-refinement penalties.
+        # Separate from state.drawdown (absolute $) used in risk_adj.
+        self.frac_drawdown      = 0.0
+        self.prev_frac_drawdown = 0.0
+        self.prev_dd_flag       = 0
+
         # --- Multi-timeframe trend windows --------------------------------
         self.trend_windows = [5, 20, 50]
         # price_history (defined in __init__ above) stores raw prices per step
@@ -957,6 +963,27 @@ class Simulation:
                         self.equity_peak = new_equity
                     state.drawdown = max(0.0, self.equity_peak - new_equity)
 
+                    # Fractional drawdown [0, 1] for reward shaping
+                    self.prev_frac_drawdown = self.frac_drawdown
+                    self.frac_drawdown = max(
+                        0.0, 1.0 - (new_equity / max(self.equity_peak, 1e-6))
+                    )
+
+                    # Drawdown severity feedback (transition-only)
+                    _dd_flag = 0
+                    if self.frac_drawdown > 0.20: _dd_flag = 1
+                    if self.frac_drawdown > 0.35: _dd_flag = 2
+                    if _dd_flag != self.prev_dd_flag:
+                        if _dd_flag == 1:
+                            _ddmsg = "Drawdown warning: portfolio down more than 20% from peak."
+                        elif _dd_flag == 2:
+                            _ddmsg = "Severe drawdown: portfolio down more than 35%."
+                        else:
+                            _ddmsg = "Drawdown normalized."
+                        self.macro_messages.append(_ddmsg)
+                        print(_ddmsg)
+                    self.prev_dd_flag = _dd_flag
+
                     # --- Rolling equity-return volatility -----------------
                     # Computed over the last vol_window 1-step equity returns.
                     # Returns < 2 data points → vol is zero (no variance yet).
@@ -1073,6 +1100,27 @@ class Simulation:
                             if step_return > 0:
                                 reward += 0.001 * step_return
                             reward -= 0.0005 * turnover
+
+                        # --- Drawdown penalties ---------------------------
+                        # 1. Depth penalty: discourage deep drawdowns
+                        reward -= 2.0 * self.frac_drawdown
+                        # 2. Acceleration penalty: punish rapidly worsening DDs
+                        _dd_delta = self.frac_drawdown - self.prev_frac_drawdown
+                        if _dd_delta > 0:
+                            reward -= 5.0 * _dd_delta
+
+                        # --- Turnover efficiency -------------------------
+                        # High churn with low return → penalise
+                        if turnover > 0.02 and abs(step_return) < 0.002:
+                            reward -= 0.5 * turnover
+                        # Low churn with positive return → reward stability
+                        if turnover < 0.01 and step_return > 0:
+                            reward += 0.1 * step_return
+
+                        # --- Stability bonus ------------------------------
+                        # Nudge agent toward maintaining gains near new highs
+                        if new_equity >= 0.995 * (self.equity_peak or new_equity):
+                            reward += 0.001
 
                         # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)

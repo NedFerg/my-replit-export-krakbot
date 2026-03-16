@@ -1,0 +1,157 @@
+We are continuing RL improvements.
+
+Goal:  
+Refine the reward function to encourage:
+
+    smoother equity curves
+
+    lower drawdowns
+
+    less overtrading
+
+    more stable exposure patterns
+
+    better risk‑adjusted returns
+
+This module adds:
+
+    running equity tracking
+
+    drawdown depth penalty
+
+    drawdown acceleration penalty
+
+    turnover efficiency scoring
+
+    stability bonus for consistent profitable states
+
+All RL core logic stays unchanged.
+1. Add equity + drawdown tracking
+
+In simulation.py, inside __init__:
+python
+
+# Reward refinement state
+self.equity = 10000.0
+self.peak_equity = 10000.0
+self.prev_equity = 10000.0
+self.drawdown = 0.0
+self.prev_drawdown = 0.0
+
+Attach to state:
+python
+
+setattr(state, "equity", self.equity)
+setattr(state, "drawdown", self.drawdown)
+
+2. Update equity + drawdown each step
+
+Right after computing step_return:
+python
+
+# Update equity
+self.prev_equity = self.equity
+self.equity *= (1.0 + step_return)
+
+# Update peak
+self.peak_equity = max(self.peak_equity, self.equity)
+
+# Compute drawdown (0 to 1)
+self.prev_drawdown = self.drawdown
+self.drawdown = 1.0 - (self.equity / max(self.peak_equity, 1e-6))
+
+Attach to state again:
+python
+
+setattr(state, "drawdown", self.drawdown)
+
+3. Add drawdown penalties to reward
+
+After your existing reward logic (regime, blow‑off, panic, rotation, cycle):
+python
+
+# --- Drawdown penalties ---
+# 1. Depth penalty (encourage shallow drawdowns)
+reward -= 2.0 * self.drawdown
+
+# 2. Acceleration penalty (punish rapidly worsening drawdowns)
+dd_delta = self.drawdown - self.prev_drawdown
+if dd_delta > 0:
+    reward -= 5.0 * dd_delta
+
+This teaches the agent:
+
+    avoid deep drawdowns
+
+    avoid accelerating losses
+
+    cut risk early
+
+4. Add turnover efficiency scoring
+
+After drawdown penalties:
+python
+
+# --- Turnover efficiency ---
+# If turnover is high but return is low → penalize
+if turnover > 0.02 and abs(step_return) < 0.002:
+    reward -= 0.5 * turnover
+
+# If turnover is low and return is positive → reward stability
+if turnover < 0.01 and step_return > 0:
+    reward += 0.1 * step_return
+
+This encourages:
+
+    fewer pointless trades
+
+    more conviction
+
+    smoother exposure patterns
+
+5. Add stability bonus for consistent profitable states
+
+After turnover efficiency:
+python
+
+# --- Stability bonus ---
+# Reward being near new highs
+if self.equity >= 0.995 * self.peak_equity:
+    reward += 0.001
+
+This is tiny but directional — it nudges the agent toward:
+
+    maintaining gains
+
+    avoiding unnecessary churn
+
+    respecting momentum
+
+6. Optional: feedback on major drawdown transitions
+
+After updating drawdown:
+python
+
+if not hasattr(self, "prev_dd_flag"):
+    self.prev_dd_flag = 0
+
+dd_flag = 0
+if self.drawdown > 0.20:
+    dd_flag = 1
+if self.drawdown > 0.35:
+    dd_flag = 2
+
+if dd_flag != self.prev_dd_flag:
+    if dd_flag == 1:
+        msg = "Drawdown warning: portfolio down more than 20% from peak."
+    elif dd_flag == 2:
+        msg = "Severe drawdown: portfolio down more than 35%."
+    else:
+        msg = "Drawdown normalized."
+
+    self.macro_messages.append(msg)
+    print(msg)
+
+self.prev_dd_flag = dd_flag
+
+This prints only on transitions.
