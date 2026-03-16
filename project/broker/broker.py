@@ -473,18 +473,24 @@ class SimulatedBroker(Broker):
 
 class LiveBroker(SimulatedBroker):
     """
-    Live trading broker skeleton.
+    Live trading broker for Kraken spot.
 
     Inherits the full hybrid execution engine from SimulatedBroker so that
     strategy logic (vol targeting, leverage limits, hedging, slippage) is
     shared between sim and live modes without duplication.
 
-    In the current state:
-    - API keys are loaded from environment variables (never hard-coded).
-    - All execution methods log intent only; no real orders are sent.
-    - dry_run is permanently True until wiring and sanity checks are complete.
-    - A kill-switch can halt all order flow immediately.
+    Safety defaults
+    ---------------
+    - KRAKEN_SANDBOX=true  (default) → connects to api.sandbox.kraken.com.
+      Set KRAKEN_SANDBOX=false in Replit Secrets only when ready for live money.
+    - ENABLE_FUTURES=False (class constant) → all futures code paths are fully
+      disabled.  US residents cannot legally trade Kraken Futures.  Set to True
+      only if you are in a permitted jurisdiction and have separate futures keys.
+    - dry_run=True by default; set False only after confirming credentials.
+    - kill-switch halts all order flow immediately.
     """
+
+    ENABLE_FUTURES: bool = False
 
     def __init__(self, *args, dry_run=True, **kwargs):
         super().__init__(*args, **kwargs)
@@ -511,49 +517,64 @@ class LiveBroker(SimulatedBroker):
 
         # Fee accounting
         # Kraken spot taker fee for standard volume tier (< $50k/month).
-        # Maker = 0.16 %, taker = 0.26 %.  We always use market/taker orders.
-        # Round-trip cost = 2 × taker_fee = 0.52 % per trade.
-        self.taker_fee           = 0.0026   # 0.26 %
-        self.cumulative_fees_usd = 0.0      # total fees paid this session
+        # Maker = 0.16 %, taker = 0.26 %.  Limit orders earn maker rebate when
+        # they rest on the book; we default to limit orders now.
+        # Round-trip taker cost = 2 × 0.26 % = 0.52 % per trade.
+        self.taker_fee           = 0.0026   # 0.26 % taker
+        self.maker_fee           = 0.0016   # 0.16 % maker (earned on limit orders)
+        self.cumulative_fees_usd = 0.0      # total estimated fees paid this session
 
-        # Kraken spot REST configuration
-        self.kraken_base_url = "https://api.kraken.com"
-        self.kraken_session  = requests.Session()
-
-        # Kraken Futures REST configuration.
-        # Futures.kraken.com uses SEPARATE API credentials from spot.
-        # Generate them at: https://futures.kraken.com → Settings → API Keys
-        # Store as KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET.
-        #
-        # If dedicated futures keys are absent, the overlay runs in PAPER mode:
-        # full sizing/hedging/regime logic executes and is logged, but no orders
-        # are sent to Kraken.  Add the two secrets to switch to live futures.
-        has_futures_keys = bool(os.getenv("KRAKEN_FUTURES_API_KEY"))
-        self.futures_paper_mode = not has_futures_keys
-
-        self.futures_api_key    = (os.getenv("KRAKEN_FUTURES_API_KEY")
-                                   or self.kraken_api_key)
-        self.futures_api_secret = (os.getenv("KRAKEN_FUTURES_API_SECRET")
-                                   or self.kraken_api_secret)
-        self.futures_base_url   = "https://futures.kraken.com/derivatives/api/v3"
-        # Paper mode: always available (never auth-fails).
-        # Live mode: set to False on auth failure so spot bot continues.
-        self.futures_available  = True
-
-        if self.futures_paper_mode:
-            print("[FUTURES] No KRAKEN_FUTURES_API_KEY found — running in PAPER mode.")
-            print("  Full sizing/hedging logic is active; orders are logged but NOT sent to Kraken.")
-            print("  To enable live futures: add KRAKEN_FUTURES_API_KEY + KRAKEN_FUTURES_API_SECRET")
-            print("  (generate at https://futures.kraken.com → Settings → API Keys)")
+        # --- Sandbox vs. Production ------------------------------------------
+        # Default: SANDBOX.  Switch to live only by setting KRAKEN_SANDBOX=false
+        # in Replit Secrets.  This is intentional — sandbox is the safe default.
+        _use_sandbox = os.getenv("KRAKEN_SANDBOX", "true").strip().lower()
+        self._sandbox_mode = _use_sandbox not in ("false", "0", "no")
+        if self._sandbox_mode:
+            self.kraken_base_url = "https://api.sandbox.kraken.com"
+            print("[LiveBroker] SANDBOX MODE — connected to api.sandbox.kraken.com")
+            print("  To go live: set KRAKEN_SANDBOX=false in Replit Secrets.")
         else:
-            print("[FUTURES] Dedicated futures API keys found — LIVE mode enabled.")
+            self.kraken_base_url = "https://api.kraken.com"
+            print("[LiveBroker] LIVE MODE — connected to api.kraken.com")
 
-        # Futures wallet balance (USD collateral in the Kraken Futures account).
-        # Refreshed at startup and after each rebalancing window.
-        # Futures position sizing is capped to futures_wallet_usd × max_leverage.
+        # Limit-order tolerance: how far from mid-price the limit is placed.
+        # 0.1 % keeps fills fast on liquid pairs while protecting against
+        # wide-spread/thin-book execution on HBAR and XLM.
+        self.limit_order_tolerance = float(
+            os.getenv("LIMIT_ORDER_TOLERANCE", "0.001")
+        )
+
+        self.kraken_session = requests.Session()
+
+        # --- Futures configuration -------------------------------------------
+        # ENABLE_FUTURES is a class-level constant (False by default).
+        # US residents CANNOT legally trade Kraken Futures.
+        # To enable: change the class constant to True AND add dedicated
+        # KRAKEN_FUTURES_API_KEY / KRAKEN_FUTURES_API_SECRET secrets.
+        # All futures attributes are still initialised to safe zero-state so
+        # the rest of the class does not need None-guards everywhere.
+        self.futures_available      = False   # hard gate: mirrors ENABLE_FUTURES
+        self.futures_paper_mode     = True    # always paper when disabled
+        self.futures_api_key        = ""
+        self.futures_api_secret     = ""
+        self.futures_base_url       = "https://futures.kraken.com/derivatives/api/v3"
         self.futures_wallet_usd     = 0.0
-        self.futures_max_leverage   = 2.0    # max 2× the futures wallet collateral
-        self.last_futures_wallet_ts = 0.0    # Unix timestamp of last balance fetch
+        self.futures_max_leverage   = 2.0
+        self.last_futures_wallet_ts = 0.0
+
+        if self.ENABLE_FUTURES:
+            has_futures_keys = bool(os.getenv("KRAKEN_FUTURES_API_KEY"))
+            self.futures_paper_mode = not has_futures_keys
+            self.futures_api_key    = (os.getenv("KRAKEN_FUTURES_API_KEY") or "")
+            self.futures_api_secret = (os.getenv("KRAKEN_FUTURES_API_SECRET") or "")
+            self.futures_available  = True
+            if self.futures_paper_mode:
+                print("[FUTURES] PAPER mode — no live orders sent to Kraken.")
+            else:
+                print("[FUTURES] LIVE mode — dedicated futures keys found.")
+        else:
+            print("[FUTURES] DISABLED — ENABLE_FUTURES=False. "
+                  "All futures code paths are fully suppressed.")
 
         # Map internal asset names → Kraken ticker symbols
         self.kraken_pairs = {
@@ -605,10 +626,25 @@ class LiveBroker(SimulatedBroker):
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
         self.max_total_notional     = 200.0   # USD cap across all open positions
         self.max_trades_per_hour    = 50      # 5-min cooldown × 4 orders/round = 48 max/hr
-        self.max_daily_loss         = 50.0    # USD drawdown cap from session start (true P&L, not cash)
+
+        # Daily loss cap expressed as a fraction of starting equity.
+        # 10 % of equity is a sensible hard stop for an algorithmic bot.
+        # The absolute USD cap is computed dynamically once starting equity is
+        # known (see _check_daily_loss).  This avoids the "fixed $50 cap on a
+        # $136 account = 37 % drawdown" bug from the previous hard-coded value.
+        self.max_daily_loss_pct  = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.10"))
+        self._max_daily_loss_usd = None   # set dynamically from starting equity
+
+        # Rate-gate intervals for monitoring calls (seconds).
+        # Prevents record_health_metrics() and alerting_loop() from printing
+        # verbose output and running equity calculations every 1-second loop tick.
+        self._health_metrics_interval = int(os.getenv("HEALTH_METRICS_INTERVAL", "60"))
+        self._alerting_interval       = int(os.getenv("ALERTING_INTERVAL",       "60"))
+        self._last_health_metrics_ts  = 0.0
+        self._last_alerting_ts        = 0.0
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
-        self._starting_equity    = None # ZUSD balance at first trade of the session
+        self._starting_equity    = None # total equity at first live trade of the session
 
     # ------------------------------------------------------------------
     # Portfolio exposure — live override
@@ -733,33 +769,54 @@ class LiveBroker(SimulatedBroker):
 
     def fetch_live_prices(self):
         """
-        Fetch the latest mid-price for all tracked assets via Kraken's
-        public Ticker endpoint.  No authentication required; no orders placed.
-        Updates self.live_prices and self.last_price_timestamp on success.
+        Fetch the latest last-trade price for all tracked assets via Kraken's
+        public Ticker endpoint in a SINGLE batched HTTP request.
+
+        Previous implementation made 8 separate calls (one per asset).  Kraken
+        accepts a comma-separated pair list, returning all tickers in one
+        response — 8× fewer API calls, much lower rate-limit risk.
+
+        'c' field = last trade closed: [price, lot_volume].
+        Returns the result dict and updates self.live_prices on success.
         """
-        result = {}
+        # Build comma-separated pair string once
+        pairs_str = ",".join(self.kraken_pairs.values())
+        data = self._kraken_public("/0/public/Ticker", {"pair": pairs_str})
 
-        for asset, pair in self.kraken_pairs.items():
-            data = self._kraken_public("/0/public/Ticker", {"pair": pair})
-            if not data or "result" not in data:
-                print(f"[PRICE FEED ERROR] No data for {asset} ({pair})")
+        if not data or "result" not in data:
+            print("[PRICE FEED ERROR] Batch ticker request failed or returned no result")
+            return {}
+
+        ticker_data = data["result"]
+        result      = {}
+
+        # Build a reverse map: Kraken-normalised-pair → internal asset name.
+        # Kraken may change the pair key (e.g. XBTUSD → XXBTZUSD) so we match
+        # on the pair value we sent, case-insensitively as a fallback.
+        pair_to_asset = {v.upper(): k for k, v in self.kraken_pairs.items()}
+
+        for kraken_key, ticker in ticker_data.items():
+            asset = pair_to_asset.get(kraken_key.upper())
+            if asset is None:
+                # Try partial match (e.g. "XXBTZUSD" contains "XBTUSD")
+                for sent_pair, a in self.kraken_pairs.items():
+                    if sent_pair.upper() in kraken_key.upper() or kraken_key.upper() in sent_pair.upper():
+                        asset = sent_pair
+                        break
+            if asset is None:
+                print(f"[PRICE FEED] Unknown pair key from Kraken: {kraken_key!r}")
                 continue
-
-            # Kraken keys the result by the normalised pair name (may differ from request)
-            ticker_key = list(data["result"].keys())[0]
-            ticker     = data["result"][ticker_key]
-
-            # 'c' = last trade closed: [price, lot_volume]
             try:
-                price          = float(ticker["c"][0])
-                result[asset]  = price
+                result[asset] = float(ticker["c"][0])
             except Exception:
-                print(f"[PRICE PARSE ERROR] Could not parse last trade for {asset}")
-                continue
+                print(f"[PRICE PARSE ERROR] Could not parse last trade for {kraken_key}")
 
         if result:
             self.live_prices          = result
             self.last_price_timestamp = time.time()
+            missing = [a for a in self.kraken_pairs if a not in result]
+            if missing:
+                print(f"[PRICE FEED] Missing prices for: {missing}")
 
         return result
 
@@ -1036,16 +1093,26 @@ class LiveBroker(SimulatedBroker):
     def record_health_metrics(self):
         """
         Record a single snapshot of key risk metrics.
-        Called automatically by heartbeat() or manually.
-        Stores a rolling in-memory log for morning summaries.
+
+        Rate-gated: fires at most once per _health_metrics_interval seconds
+        (default 60 s).  This prevents the 1-second main loop from filling the
+        health log in 33 minutes and spamming the console with equity printouts.
+        At 60-second cadence the 2000-entry log covers ~33 hours of history.
+
+        Called automatically by heartbeat() or manually for forced snapshots.
         """
+        now = time.time()
+        if now - self._last_health_metrics_ts < self._health_metrics_interval:
+            return
+        self._last_health_metrics_ts = now
+
         if not hasattr(self, "_health_log"):
             self._health_log = []
 
         snapshot = self.emit_health_check()
-        snapshot["timestamp"] = time.time()
+        snapshot["timestamp"] = now
 
-        # Keep last ~2000 entries (roughly 24h at 40s cadence)
+        # Keep last 2000 entries (~33 h at 60 s cadence)
         self._health_log.append(snapshot)
         if len(self._health_log) > 2000:
             self._health_log.pop(0)
@@ -1121,32 +1188,40 @@ class LiveBroker(SimulatedBroker):
 
     def check_alerts(self,
                      max_leverage:       float = 3.0,
-                     max_drawdown:       float = -500.0,
-                     max_exposure:       float = 5000.0,
                      heartbeat_timeout:  float = 600.0):
         """
         Evaluate alert conditions and print alerts when thresholds are crossed.
-        Intended to be called inside the main loop.
+
+        Drawdown and exposure thresholds are derived from live account equity so
+        they scale correctly regardless of account size.  No more hard-coded
+        $500 drawdown limit that would never fire on a $136 account.
         """
         # --- 1. Kill switch alert ---
         if self.kill_switch:
             print("[ALERT] Kill switch active — trading halted")
 
-        # --- 2. Leverage alert ---
         pnl = self.compute_unified_pnl_snapshot()
+
+        # --- 2. Leverage alert ---
         lev = pnl.get("leverage")
         if lev is not None and lev > max_leverage:
-            print(f"[ALERT] Leverage {lev:.2f} exceeds limit {max_leverage}")
+            print(f"[ALERT] Leverage {lev:.2f} exceeds limit {max_leverage:.1f}×")
 
-        # --- 3. Drawdown alert (session PnL) ---
-        session_pnl = pnl.get("session_pnl")
-        if session_pnl is not None and session_pnl < max_drawdown:
-            print(f"[ALERT] Drawdown {session_pnl:.2f} below limit {max_drawdown}")
+        # --- 3. Drawdown alert — uses the same equity-scaled cap as _check_daily_loss ---
+        session_pnl   = pnl.get("session_pnl")
+        equity        = pnl.get("equity") or 0.0
+        # Alert at 50 % of the kill-switch cap so there is advance warning
+        alert_cap_usd = (self._max_daily_loss_usd or (equity * self.max_daily_loss_pct)) * 0.5
+        if session_pnl is not None and alert_cap_usd > 0 and session_pnl < -alert_cap_usd:
+            print(f"[ALERT] Drawdown ${session_pnl:.2f} — approaching daily loss cap "
+                  f"(alert at ${alert_cap_usd:.2f}, kill at "
+                  f"${(self._max_daily_loss_usd or alert_cap_usd * 2):.2f})")
 
-        # --- 4. Exposure alert ---
-        net_exp = pnl.get("net_exposure")
-        if net_exp is not None and abs(net_exp) > max_exposure:
-            print(f"[ALERT] Net exposure {net_exp:.2f} exceeds limit {max_exposure}")
+        # --- 4. Exposure alert — 150 % of account equity is a sensible ceiling ---
+        net_exp    = pnl.get("net_exposure")
+        exp_limit  = equity * 1.5 if equity > 0 else self.max_total_notional
+        if net_exp is not None and abs(net_exp) > exp_limit:
+            print(f"[ALERT] Net exposure ${net_exp:.2f} exceeds {exp_limit:.2f} (150% equity)")
 
         # --- 5. Heartbeat silence alert ---
         now = time.time()
@@ -1156,40 +1231,100 @@ class LiveBroker(SimulatedBroker):
 
     def alerting_loop(self):
         """
-        Lightweight wrapper to be called each iteration of the main loop.
-        Keeps alerting logic clean and centralized.
+        Rate-gated wrapper — fires at most once per _alerting_interval seconds.
+        Prevents check_alerts() from running expensive equity calculations every
+        1-second loop tick.
         """
+        now = time.time()
+        if now - self._last_alerting_ts < self._alerting_interval:
+            return
+        self._last_alerting_ts = now
         self.check_alerts()
 
     # ------------------------------------------------------------------
     # Order payload builders (formatting only — nothing is submitted)
     # ------------------------------------------------------------------
 
-    def _build_spot_order(self, asset, price, delta_exposure):
+    @staticmethod
+    def _fractional_to_coin_units(delta_frac: float, equity_usd: float,
+                                  price: float) -> float:
         """
-        Format a Kraken spot market-order payload from a fractional delta.
+        Convert a fractional exposure delta to base-asset coin units.
 
-        |delta_exposure| is treated as a synthetic size (fractional unit).
-        Mapping to real notional (equity × |delta| / price) will be added
-        when dry_run is disabled and real sizing logic is wired in.
-        Returns None for zero-delta or invalid inputs.
+        delta_frac  : signed fraction of total equity  (e.g. +0.06 = buy 6% of equity)
+        equity_usd  : total portfolio value in USD
+        price       : current asset price in USD/coin
+
+        Returns the unsigned coin quantity; sign is communicated separately
+        as the order side ("buy" / "sell").
+
+        This function is the single authoritative conversion point — every code
+        path that builds a Kraken order payload MUST go through here so there
+        is no ambiguity about what `volume` means.
+        """
+        notional_usd = abs(delta_frac) * equity_usd
+        if price <= 0:
+            return 0.0
+        return notional_usd / price
+
+    def _build_spot_order(self, asset: str, price: float,
+                          coin_units: float, side: str) -> dict | None:
+        """
+        Format a Kraken spot LIMIT-order payload.
+
+        Parameters
+        ----------
+        asset      : internal asset name (e.g. "SOL")
+        price      : current mid-price in USD
+        coin_units : unsigned quantity in BASE-ASSET UNITS (e.g. 0.5 SOL).
+                     Must already be converted from fractional exposure via
+                     _fractional_to_coin_units().  Never pass a raw fraction here.
+        side       : "buy" or "sell"
+
+        Limit price
+        -----------
+        Buys  → mid × (1 + tolerance)  : we pay up to tolerance% above mid.
+        Sells → mid × (1 - tolerance)  : we accept down to tolerance% below mid.
+        Default tolerance = 0.1% (self.limit_order_tolerance).
+
+        This replaces unconditional market orders.  On liquid pairs the limit
+        fills immediately at or better than the limit price; on thin books it
+        prevents catastrophic slippage on HBAR/XLM.
+        Limit orders also qualify for maker fee (0.16%) rather than taker (0.26%)
+        when they rest on the book.
+
+        Returns None for invalid inputs (triggers kill switch on unknown asset or
+        bad price, so the caller does not need to check).
         """
         if asset not in self.kraken_pairs:
             self.trigger_kill_switch(f"Unknown asset for spot order: {asset}")
             return None
 
         if price is None or price <= 0:
-            self.trigger_kill_switch(f"Invalid price for spot order: {asset} price={price}")
+            self.trigger_kill_switch(
+                f"Invalid price for spot order: {asset} price={price}"
+            )
             return None
 
-        if delta_exposure == 0:
+        if coin_units <= 0:
             return None
+
+        if side not in ("buy", "sell"):
+            self.trigger_kill_switch(f"Invalid side for spot order: {side!r}")
+            return None
+
+        tol = self.limit_order_tolerance
+        if side == "buy":
+            limit_price = round(price * (1.0 + tol), 8)
+        else:
+            limit_price = round(price * (1.0 - tol), 8)
 
         return {
             "pair":      self.kraken_pairs[asset],
-            "type":      "buy" if delta_exposure > 0 else "sell",
-            "ordertype": "market",
-            "volume":    f"{abs(delta_exposure):.8f}",
+            "type":      side,
+            "ordertype": "limit",
+            "price":     f"{limit_price:.8f}",
+            "volume":    f"{coin_units:.8f}",
         }
 
     def _build_futures_order(self, asset, price, delta_exposure):
@@ -1290,32 +1425,53 @@ class LiveBroker(SimulatedBroker):
         """
         Compare current total portfolio value to the session-start value.
         Uses compute_total_equity() so that buying crypto is not counted as a loss.
-        Triggers kill switch if the drawdown exceeds max_daily_loss.
+
+        The loss cap is computed as (max_daily_loss_pct × starting_equity) the
+        first time starting_equity is set, giving a threshold that scales with
+        actual account size rather than a fixed dollar figure.
+
+        Triggers kill switch if the drawdown exceeds the computed cap.
         """
         equity = self.compute_total_equity()
 
         if self._starting_equity is None:
             if equity > 0:
-                self._starting_equity = equity
+                self._starting_equity    = equity
+                self._max_daily_loss_usd = round(equity * self.max_daily_loss_pct, 2)
+                print(f"[LOSS CAP] Starting equity anchored at ${equity:.2f}  "
+                      f"→ daily loss cap = ${self._max_daily_loss_usd:.2f} "
+                      f"({self.max_daily_loss_pct:.0%})")
             return True
 
         if equity <= 0:
             return True   # no balance info yet — permissive
 
-        if equity < self._starting_equity - self.max_daily_loss:
+        loss_cap = self._max_daily_loss_usd or (self._starting_equity * self.max_daily_loss_pct)
+        if equity < self._starting_equity - loss_cap:
             self.trigger_kill_switch(
-                f"Daily loss limit exceeded: balance={equity:.2f}  "
-                f"start={self._starting_equity:.2f}  limit={self.max_daily_loss:.2f}"
+                f"Daily loss limit exceeded: equity={equity:.2f}  "
+                f"start={self._starting_equity:.2f}  cap=${loss_cap:.2f} "
+                f"({self.max_daily_loss_pct:.0%})"
             )
             return False
 
         return True
 
-    def _pre_trade_safety(self, asset, price, delta_exposure) -> bool:
+    def _pre_trade_safety(self, asset: str, price: float,
+                          notional_usd: float) -> bool:
         """
         Unified pre-trade gate — runs all safety checks in priority order.
         Returns False (and triggers the kill switch where appropriate) if any
-        check fails.  Called at the top of every live execution override.
+        check fails.  Called at the top of every live execution path.
+
+        Parameters
+        ----------
+        asset        : internal asset name ("SOL", "BTC", …)
+        price        : current mid-price in USD (used only for logging)
+        notional_usd : UNSIGNED USD notional of the proposed order.
+                       Both callers must pass the same unit:
+                         execute_trade      → size_coins × price
+                         _execute_spot_trade → abs(delta_frac) × equity
         """
         if not self.check_health():
             return False
@@ -1324,18 +1480,18 @@ class LiveBroker(SimulatedBroker):
             return False
 
         # Per-asset notional cap — soft reject (skip this order, don't halt the bot)
-        # Use 1.001× threshold to absorb floating-point boundary rounding
-        if price and abs(delta_exposure * price) > self.max_notional_per_asset * 1.001:
+        # 1.001× threshold absorbs floating-point boundary rounding
+        abs_notional = abs(notional_usd)
+        if abs_notional > self.max_notional_per_asset * 1.001:
             print(f"[SAFETY] Per-asset cap: skipping {asset} "
-                  f"(|{delta_exposure:.4f}| × {price:.2f}"
-                  f" = {abs(delta_exposure * price):.2f}"
-                  f" > {self.max_notional_per_asset} USD)")
+                  f"(${abs_notional:.2f} > ${self.max_notional_per_asset:.2f}  "
+                  f"price=${price:.4f})")
             return False
 
         # Total portfolio notional cap — soft reject
         if self._current_notional() > self.max_total_notional:
             print(f"[SAFETY] Total notional cap: skipping order "
-                  f"({self._current_notional():.2f} > {self.max_total_notional} USD)")
+                  f"(${self._current_notional():.2f} > ${self.max_total_notional:.2f})")
             return False
 
         # Daily loss cap
@@ -1356,21 +1512,25 @@ class LiveBroker(SimulatedBroker):
         ----------
         symbol : str   Internal asset name e.g. "SOL", "BTC"
         side   : str   "buy" or "sell"
-        size   : float Position size in base-asset units (positive)
+        size   : float Position size in BASE-ASSET COIN UNITS (positive).
+                       The agent computes this via (notional_usd / price)
+                       before calling place_order().
 
         Flow
         ----
         1. Dry-run guard — logs and returns immediately if dry_run=True
         2. Price validation — kill switch on missing / zero price
         3. Pre-trade safety harness — notional cap, rate limit, daily loss
-        4. Build spot market-order payload
+        4. Build spot limit-order payload (coin units, correct side)
         5. Submit to Kraken /AddOrder
-        6. Update internal position tracker on success
+        6. Update internal position tracker and cumulative fee on success
 
         Returns the Kraken result dict on success, None on any failure.
         """
         if self.dry_run:
-            print(f"[DRY RUN] execute_trade skipped: {side} {size:.6f} {symbol}")
+            notional = size * (self.live_prices.get(symbol) or 0.0)
+            print(f"[DRY RUN] {side.upper()} {size:.6f} {symbol}"
+                  f"  notional≈${notional:.2f}")
             return None
 
         price = self.live_prices.get(symbol)
@@ -1380,25 +1540,28 @@ class LiveBroker(SimulatedBroker):
             )
             return None
 
-        # Signed delta: positive = long / buy, negative = short / sell
-        delta = size if side == "buy" else -size
+        notional = size * price   # USD notional of this order (unsigned)
 
-        if not self._pre_trade_safety(symbol, price, delta):
+        if not self._pre_trade_safety(symbol, price, notional):
             return None
 
-        order = self._build_spot_order(symbol, price, delta)
+        # size is already in coin units — pass directly to the builder
+        order = self._build_spot_order(symbol, price, size, side)
         if order is None:
             return None
 
         result = self._submit_spot_order(order)
         if result is not None:
-            # Track position internally so _current_notional() stays accurate
+            # Update position tracker (coin units, signed)
+            signed_units = size if side == "buy" else -size
             self.spot_positions[symbol] = (
-                self.spot_positions.get(symbol, 0.0) + delta
+                self.spot_positions.get(symbol, 0.0) + signed_units
             )
-            notional = abs(delta * price)
+            # Estimate fee (taker rate; may be lower if order rests as maker)
+            fee_usd = notional * self.taker_fee
+            self.cumulative_fees_usd += fee_usd
             print(f"[EXECUTE] {side.upper()} {size:.6f} {symbol} @ {price:.4f}"
-                  f"  notional={notional:.2f} USD"
+                  f"  notional=${notional:.2f}  fee≈${fee_usd:.4f}"
                   f"  pos={self.spot_positions[symbol]:+.6f}")
         return result
 
@@ -1564,14 +1727,17 @@ class LiveBroker(SimulatedBroker):
         """
         Fetch the USD collateral balance from the Kraken Futures account.
 
+        Returns 0.0 immediately when ENABLE_FUTURES is False — no HTTP call
+        is made and no futures state is mutated.
+
         Paper mode: simulates 25 % of current spot equity as collateral.
         Live mode: calls GET /accounts on futures.kraken.com.
 
-        Returns 0.0 on any failure (futures overlay continues with last
-        known balance; does not disable the overlay on a transient error).
-
         Updates self.futures_wallet_usd and self.last_futures_wallet_ts.
         """
+        if not self.ENABLE_FUTURES:
+            return 0.0   # hard gate — futures disabled
+
         if not self.futures_available:
             return self.futures_wallet_usd
 
@@ -1640,43 +1806,77 @@ class LiveBroker(SimulatedBroker):
         """
         Live spot execution override.
 
-        Flow:  health check → build payload → dry-run log  OR  live submit.
-        Futures execution stays dry-run only until the Kraken Futures
-        endpoint is separately wired.
+        delta_exposure here is a FRACTIONAL exposure delta (from execute_portfolio_exposure).
+        This path converts the fraction to coin units via _fractional_to_coin_units()
+        before building the order payload — fixing the previous ambiguity where
+        `volume` received a raw fraction instead of coin units.
+
+        Returns the estimated USD fee so the parent can deduct it from
+        agent.balance and agent.realized_pnl (fixes the bug where this always
+        returned 0.0 and the agent's internal balance was never reduced by fees).
         """
-        if not self._pre_trade_safety(asset, price, delta_exposure):
+        equity = self.compute_total_equity() or 1.0
+        coin_units   = self._fractional_to_coin_units(delta_exposure, equity, price)
+        notional_usd = abs(delta_exposure) * equity
+        side         = "buy" if delta_exposure > 0 else "sell"
+
+        if not self._pre_trade_safety(asset, price, notional_usd):
             print(f"[LIVE SPOT BLOCKED SAFETY] {asset}  delta={delta_exposure:+.4f}")
             return 0.0
 
-        order = self._build_spot_order(asset, price, delta_exposure)
+        if coin_units <= 0:
+            print(f"[LIVE SPOT NO-OP]     {asset}  delta={delta_exposure:+.4f}")
+            return 0.0
+
+        order = self._build_spot_order(asset, price, coin_units, side)
         if order is None:
             print(f"[LIVE SPOT NO-OP]     {asset}  delta={delta_exposure:+.4f}")
             return 0.0
 
-        if self.dry_run:
-            print(f"[LIVE SPOT DRY-RUN]   {asset}  order={order}")
-            return 0.0
+        # Estimated fee — returned so caller can update agent.balance
+        fee_usd = notional_usd * self.taker_fee
 
-        # Live path — actually submit to Kraken
+        if self.dry_run:
+            print(f"[LIVE SPOT DRY-RUN]   {asset}  {side}  {coin_units:.6f} coins"
+                  f"  notional=${notional_usd:.2f}  fee≈${fee_usd:.4f}"
+                  f"  order={order}")
+            return fee_usd   # return estimated cost even in dry-run so balance is realistic
+
         result = self._submit_spot_order(order)
         if result is None:
             print(f"[LIVE SPOT FAILED]    {asset}  order={order}")
-        return 0.0
+            return 0.0
+
+        self.spot_positions[asset] = (
+            self.spot_positions.get(asset, 0.0)
+            + (coin_units if side == "buy" else -coin_units)
+        )
+        self.cumulative_fees_usd += fee_usd
+        print(f"[LIVE SPOT FILLED] {side.upper()} {coin_units:.6f} {asset}"
+              f"  @ ${price:.4f}  notional=${notional_usd:.2f}  fee≈${fee_usd:.4f}")
+        return fee_usd
 
     def _execute_futures_trade(self, asset, price, delta_exposure, microstructure_fn=None):
         """
         Live futures execution override.
 
+        Fully suppressed when ENABLE_FUTURES is False (US-user safety gate).
         delta_exposure is a FRACTIONAL delta (fraction of equity).
         Safety checks use equity-based USD notional (not coin × price).
+        Adds the missing daily-loss check that the previous version omitted.
         """
+        if not self.ENABLE_FUTURES:
+            return 0.0   # silently suppressed — futures are disabled
+
         if not self.check_health():
             return 0.0
 
         if not self._check_trade_rate():
             return 0.0
 
-        # Compute correct USD notional for fractional futures deltas
+        if not self._check_daily_loss():
+            return 0.0
+
         equity       = self.compute_total_equity() or 1.0
         usd_notional = abs(delta_exposure) * equity
 
@@ -1721,6 +1921,9 @@ class LiveBroker(SimulatedBroker):
                     panic_risk  (int, 0-2),  top_risk   (int, 0-2)
                   Omitted keys default to safe neutral values.
         """
+        if not self.ENABLE_FUTURES:
+            return   # hard gate — futures fully disabled for US users
+
         if not self.check_health():
             return
 
