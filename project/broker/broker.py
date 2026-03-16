@@ -149,6 +149,14 @@ class SimulatedBroker(Broker):
         self.asset_vol_ema   = {}   # asset → smoothed |return| estimate
         self.asset_vol_alpha = 0.1  # EMA decay (slower than funding EMA)
 
+        # --- Execution-layer slippage parameters --------------------------
+        # Realistic crypto fills: spot uses TWAP-like routing (low slippage),
+        # futures use market-like routing (higher slippage).
+        # size_factor scales slippage up for large deltas.
+        self.spot_slippage_bps    = 5    # 0.05 % for spot
+        self.futures_slippage_bps = 20   # 0.20 % for futures
+        self.slippage_scale       = 1.0  # multiplier on trade size
+
     # ------------------------------------------------------------------
     # Standard order-book routing (used by non-RL agents)
     # ------------------------------------------------------------------
@@ -278,13 +286,16 @@ class SimulatedBroker(Broker):
             # --- 3. Execute spot (slow — 2% threshold) -------------------
             delta_spot = spot_target - self.spot_positions[a]
             if abs(delta_spot) > 0.02:
+                # Apply spot slippage (low — TWAP-like routing)
+                delta_spot_slipped = self._apply_slippage(delta_spot, self.spot_slippage_bps)
                 spot_cost = self._execute_spot_trade(
-                    a, price, delta_spot, microstructure_fn
+                    a, price, delta_spot_slipped, microstructure_fn
                 )
                 agent.balance      -= spot_cost
                 agent.realized_pnl -= spot_cost
                 total_cost         += spot_cost
-                self.spot_positions[a] = spot_target
+                # Store actual filled exposure, not the raw target
+                self.spot_positions[a] = self.spot_positions[a] + delta_spot_slipped
 
             # --- 4. Execute futures (fast — 1% threshold) ----------------
             delta_fut = fut_target - self.futures_positions[a]
@@ -315,13 +326,16 @@ class SimulatedBroker(Broker):
                 fut_target = current_fut + delta_fut
 
             if abs(delta_fut) > 0.01:
+                # Apply futures slippage (higher — market-like routing)
+                delta_fut_slipped = self._apply_slippage(delta_fut, self.futures_slippage_bps)
                 fut_cost = self._execute_futures_trade(
-                    a, price, delta_fut, microstructure_fn
+                    a, price, delta_fut_slipped, microstructure_fn
                 )
                 agent.balance      -= fut_cost
                 agent.realized_pnl -= fut_cost
                 total_cost         += fut_cost
-                self.futures_positions[a] = fut_target
+                # Store actual filled exposure (slipped), not the intended target
+                self.futures_positions[a] = current_fut + delta_fut_slipped
 
             # --- 5. Write combined exposure back to agent ----------------
             combined = self.spot_positions[a] + self.futures_positions[a]
@@ -333,6 +347,24 @@ class SimulatedBroker(Broker):
         # Keep agent.position (base class, SOL) in sync for display / featurize_state
         agent.position = agent.positions.get("SOL", 0.0)
         return total_cost
+
+    # ------------------------------------------------------------------
+    # Slippage helpers
+    # ------------------------------------------------------------------
+
+    def _apply_slippage(self, delta_exposure, slippage_bps):
+        """
+        Return the actual filled delta after modelling execution slippage.
+
+        Slippage grows linearly with trade size via `slippage_scale`:
+          effective_slippage = (slippage_bps / 10 000) × (1 + scale × |delta|)
+
+        The fill is reduced in the direction of the trade so the agent always
+        ends up *less* exposed than it intended — a realistic conservative bias.
+        """
+        size_factor = 1.0 + self.slippage_scale * abs(delta_exposure)
+        slippage    = (slippage_bps / 10_000.0) * size_factor
+        return delta_exposure * (1.0 - slippage)
 
     # ------------------------------------------------------------------
     # Per-asset volatility helpers
