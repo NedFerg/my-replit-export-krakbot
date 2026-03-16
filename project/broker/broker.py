@@ -509,6 +509,13 @@ class LiveBroker(SimulatedBroker):
         self.last_latency_sec = 0.0    # round-trip latency of last API call
         self.kill_switch      = False  # set True to halt all order flow immediately
 
+        # Fee accounting
+        # Kraken spot taker fee for standard volume tier (< $50k/month).
+        # Maker = 0.16 %, taker = 0.26 %.  We always use market/taker orders.
+        # Round-trip cost = 2 × taker_fee = 0.52 % per trade.
+        self.taker_fee           = 0.0026   # 0.26 %
+        self.cumulative_fees_usd = 0.0      # total fees paid this session
+
         # Kraken spot REST configuration
         self.kraken_base_url = "https://api.kraken.com"
         self.kraken_session  = requests.Session()
@@ -905,15 +912,20 @@ class LiveBroker(SimulatedBroker):
         if equity > 0:
             leverage = total_notional / equity
 
+        fees_paid = getattr(self, "cumulative_fees_usd", 0.0)
+        fee_adj_pnl = (session_pnl - fees_paid) if session_pnl is not None else None
+
         snapshot = {
-            "equity":           equity,
-            "starting_equity":  starting,
-            "session_pnl":      session_pnl,
-            "total_notional":   total_notional,
-            "net_exposure":     exposure.get("net_exposure", 0.0),
-            "leverage":         leverage,
-            "spot_exposure":    exposure.get("spot_exposure", {}),
-            "futures_exposure": exposure.get("futures_exposure", {}),
+            "equity":             equity,
+            "starting_equity":    starting,
+            "session_pnl":        session_pnl,
+            "fees_paid":          round(fees_paid, 4),
+            "fee_adjusted_pnl":   round(fee_adj_pnl, 4) if fee_adj_pnl is not None else None,
+            "total_notional":     total_notional,
+            "net_exposure":       exposure.get("net_exposure", 0.0),
+            "leverage":           leverage,
+            "spot_exposure":      exposure.get("spot_exposure", {}),
+            "futures_exposure":   exposure.get("futures_exposure", {}),
         }
         print(f"[UNIFIED PNL] {snapshot}")
         return snapshot
@@ -933,6 +945,8 @@ class LiveBroker(SimulatedBroker):
             "kill_switch":      self.kill_switch,
             "equity":           pnl.get("equity"),
             "session_pnl":      pnl.get("session_pnl"),
+            "fees_paid":        pnl.get("fees_paid"),
+            "fee_adj_pnl":      pnl.get("fee_adjusted_pnl"),
             "net_exposure":     pnl.get("net_exposure"),
             "total_notional":   pnl.get("total_notional"),
             "leverage":         pnl.get("leverage"),

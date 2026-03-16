@@ -517,6 +517,13 @@ class ReinforcementLearningTrader(TraderAgent):
         # ----------------------------------------------------------------
         MIN_TRADE_USD = 5.0   # Kraken per-asset minimums; keep well above them
 
+        # Fee constants — pulled from the broker so they stay in one place.
+        # Kraken spot taker = 0.26 %; round-trip = 0.52 %.
+        TAKER_FEE     = getattr(self.broker, "taker_fee", 0.0026)
+        ROUND_TRIP    = 2.0 * TAKER_FEE          # min gross gain to break even
+        FEE_BUFFER    = 3.0                       # require 3× round-trip to trade
+        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER  # ~1.56 % of notional
+
         # Rebalancing cooldown — only execute orders every 5 minutes.
         # The RL agent generates signals every 5 s; without this gate the bot
         # would churn the portfolio on every random signal and burn through
@@ -594,32 +601,61 @@ class ReinforcementLearningTrader(TraderAgent):
             else:
                 delta_usd = max(delta_usd, -max_notional)
 
-            delta_units = abs(delta_usd) / price
+            notional_usd = abs(delta_usd)
+            delta_units  = notional_usd / price
 
             # For sells: never exceed the units actually held
             if delta_usd < 0 and current_units > 0:
-                delta_units = min(delta_units, current_units)
+                delta_units  = min(delta_units, current_units)
+                notional_usd = delta_units * price
             elif delta_usd < 0 and current_units <= 0:
                 continue   # nothing to sell
 
-            if delta_units * price < MIN_TRADE_USD:
+            if notional_usd < MIN_TRADE_USD:
                 continue   # dust — skip
 
-            # Stop issuing buy orders if we've exhausted available cash
-            if delta_usd > 0 and delta_usd > remaining_usd:
-                print(f"  [ORDER] {a} skipped — insufficient remaining cash"
-                      f" (need {delta_usd:.2f}, have {remaining_usd:.2f})")
-                continue
+            # Fee estimation — Kraken charges taker_fee on the full notional.
+            est_fee_usd = notional_usd * TAKER_FEE
+
+            # Minimum profit hurdle for SELL orders:
+            # Only sell if the gross move (drift × equity) would clear the
+            # round-trip fee cost (entry fee + exit fee) with a safety buffer.
+            # This prevents selling at a loss just to chase the next random signal.
+            if delta_usd < 0:
+                gross_move_usd = abs(delta_frac) * equity
+                min_required   = notional_usd * MIN_FEE_HURDLE
+                if gross_move_usd < min_required:
+                    print(f"  [ORDER] {a} sell skipped — expected gain "
+                          f"({gross_move_usd:.2f} USD) < fee hurdle "
+                          f"({min_required:.2f} USD)")
+                    continue
+
+            # Buy: require the full cost (notional + taker fee) fits in remaining cash
+            if delta_usd > 0:
+                total_cost = notional_usd * (1.0 + TAKER_FEE)
+                if total_cost > remaining_usd:
+                    print(f"  [ORDER] {a} skipped — insufficient remaining cash"
+                          f" (need {total_cost:.2f} incl. fee, have {remaining_usd:.2f})")
+                    continue
 
             side = "buy" if delta_usd > 0 else "sell"
             print(f"  [ORDER] {side.upper()} {delta_units:.6f} {a}"
-                  f"  Δ={delta_usd:+.2f} USD  (target={target_frac:.3f}"
-                  f"  current={current_frac:.3f}  cash_left={remaining_usd:.2f})")
+                  f"  Δ={delta_usd:+.2f} USD  fee≈{est_fee_usd:.3f} USD"
+                  f"  (target={target_frac:.3f}  current={current_frac:.3f}"
+                  f"  cash_left={remaining_usd:.2f})")
             self.place_order(a, side, delta_units)
 
-            # Deduct from remaining cash only for buy orders
+            # Track cumulative fees on the broker
+            if hasattr(self.broker, "cumulative_fees_usd"):
+                self.broker.cumulative_fees_usd += est_fee_usd
+
             if delta_usd > 0:
-                remaining_usd -= delta_usd
+                # Deduct full cost of buy (notional + fee) from available cash
+                remaining_usd -= notional_usd * (1.0 + TAKER_FEE)
+            else:
+                # Credit net sell proceeds (notional minus fee) to available cash
+                # so subsequent buys in the same rebalancing round can use them
+                remaining_usd += notional_usd * (1.0 - TAKER_FEE)
 
         # ----------------------------------------------------------------
         # Futures overlay — runs after all spot orders are placed so the
