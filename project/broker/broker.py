@@ -880,6 +880,49 @@ class LiveBroker(SimulatedBroker):
         print(f"[UNIFIED PNL] {snapshot}")
         return snapshot
 
+    def emit_health_check(self):
+        """
+        Emit a compact health snapshot:
+        - kill switch state
+        - equity and session PnL
+        - net exposure and total notional
+        - leverage estimate
+        - spot + futures exposure breakdown
+        """
+        pnl = self.compute_unified_pnl_snapshot()
+
+        snapshot = {
+            "kill_switch":      self.kill_switch,
+            "equity":           pnl.get("equity"),
+            "session_pnl":      pnl.get("session_pnl"),
+            "net_exposure":     pnl.get("net_exposure"),
+            "total_notional":   pnl.get("total_notional"),
+            "leverage":         pnl.get("leverage"),
+            "spot_exposure":    pnl.get("spot_exposure"),
+            "futures_exposure": pnl.get("futures_exposure"),
+        }
+        print(f"[HEALTH CHECK] {snapshot}")
+        return snapshot
+
+    def heartbeat(self, interval_seconds: int = 300):
+        """
+        Heartbeat loop:
+        - emits a health check every `interval_seconds`
+        - stops immediately if kill switch is active
+        - intended to run inside the main loop (non-blocking)
+        """
+        now = time.time()
+        if not hasattr(self, "_last_heartbeat"):
+            self._last_heartbeat = 0
+
+        if now - self._last_heartbeat >= interval_seconds:
+            if self.kill_switch:
+                print("[HEARTBEAT] Kill switch active — heartbeat suppressed")
+            else:
+                print(f"[HEARTBEAT] alive at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                self.emit_health_check()
+            self._last_heartbeat = now
+
     # ------------------------------------------------------------------
     # Order payload builders (formatting only — nothing is submitted)
     # ------------------------------------------------------------------
