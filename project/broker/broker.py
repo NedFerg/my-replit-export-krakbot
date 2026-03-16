@@ -938,6 +938,43 @@ class LiveBroker(SimulatedBroker):
         print(f"[LIVE SPOT SUBMITTED] txid={txids}")
         return result
 
+    def _submit_futures_order(self, order: dict):
+        """
+        Submit a futures/perps order to the Kraken Futures endpoint.
+
+        Calls _kraken_futures_private (separate base URL + auth scheme from
+        spot).  That helper is scaffolded here and can be wired when the
+        Kraken Futures API credentials are ready.
+        Returns the result dict on success, or None on failure.
+        """
+        if not order:
+            return None
+
+        resp = self._kraken_futures_private("/sendorder", order)
+        if not resp:
+            self.trigger_kill_switch("Futures order submission failed — no response")
+            return None
+
+        if resp.get("error"):
+            self.trigger_kill_switch(f"Futures order error: {resp['error']}")
+            return None
+
+        result   = resp.get("result", resp)
+        order_id = result.get("order_id") or result.get("orderId")
+        print(f"[LIVE FUTURES SUBMITTED] order_id={order_id}")
+        return result
+
+    def _kraken_futures_private(self, path: str, data: dict | None = None):
+        """
+        Stub: private Kraken Futures REST request.
+
+        Kraken Futures uses a different base URL (https://futures.kraken.com)
+        and a different HMAC-SHA256 signing scheme.  Wire this separately
+        when Futures API credentials are available.
+        """
+        print(f"[FUTURES API STUB] path={path}  (not yet wired)")
+        return None
+
     # ------------------------------------------------------------------
     # Live order execution (overrides SimulatedBroker private helpers)
     # Signature must match the parent: (asset, price, delta_exposure, microstructure_fn)
@@ -974,11 +1011,13 @@ class LiveBroker(SimulatedBroker):
         """
         Live futures execution override.
 
-        Gate order: health check → build payload → dry-run log.
-        TODO: when dry_run is disabled, submit to the Kraken Futures endpoint.
+        Flow:  full safety gate → build payload → dry-run log  OR  live submit.
+        Mirrors the spot flow exactly; submission delegates to
+        _submit_futures_order which calls _kraken_futures_private (stub until
+        Futures API credentials are wired).
         """
-        if not self.check_health():
-            print(f"[LIVE FUTURES BLOCKED] {asset}  delta={delta_exposure:+.4f}")
+        if not self._pre_trade_safety(asset, price, delta_exposure):
+            print(f"[LIVE FUTURES BLOCKED SAFETY] {asset}  delta={delta_exposure:+.4f}")
             return 0.0
 
         order = self._build_futures_order(asset, price, delta_exposure)
@@ -990,6 +1029,8 @@ class LiveBroker(SimulatedBroker):
             print(f"[LIVE FUTURES DRY-RUN] {asset}  order={order}")
             return 0.0
 
-        # TODO: submit to Kraken Futures/perps endpoint
-        print(f"[LIVE FUTURES ORDER]   {asset}  order={order}")
+        # Live path — submit to Kraken Futures
+        result = self._submit_futures_order(order)
+        if result is None:
+            print(f"[LIVE FUTURES FAILED]  {asset}  order={order}")
         return 0.0

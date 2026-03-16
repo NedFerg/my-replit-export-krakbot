@@ -1,0 +1,75 @@
+We’re doing three things:
+
+    adding a futures submission helper
+
+    upgrading _execute_futures_trade to use the full safety gate
+
+    keeping dry‑run behavior identical to spot until you’re ready to flip it
+
+1. Add a futures submission helper
+
+Inside LiveBroker, near your spot submission helper, add:
+python
+
+    # --------- Futures order submission (Kraken Futures) ---------
+
+    def _submit_futures_order(self, order: dict):
+        """
+        Submit a futures/perps order to Kraken Futures.
+
+        This assumes a _kraken_futures_private(path, data) helper exists
+        that handles the separate Futures API base URL and auth scheme.
+        """
+        if not order:
+            return None
+
+        resp = self._kraken_futures_private("/sendorder", order)
+        if not resp:
+            self.trigger_kill_switch("Futures order submission failed (no response)")
+            return None
+
+        if resp.get("error"):
+            self.trigger_kill_switch(f"Futures order error: {resp['error']}")
+            return None
+
+        result = resp.get("result", resp)
+        order_id = result.get("order_id") or result.get("orderId")
+        print(f"[LIVE FUTURES SUBMITTED] order_id={order_id}")
+        return result
+
+    If you don’t have _kraken_futures_private yet, you can leave this in place as scaffolding and wire that helper later.
+
+2. Upgrade _execute_futures_trade to use safety + submission
+
+Replace your current LiveBroker._execute_futures_trade with:
+python
+
+    def _execute_futures_trade(self, asset, price, delta_exposure, microstructure_fn=None):
+        """
+        Live futures execution override.
+
+        Flow:
+        - full safety gate (rate, notional, loss, health)
+        - build order
+        - dry-run: log payload only
+        - live: submit via _submit_futures_order
+        """
+        if not self._pre_trade_safety(asset, price, delta_exposure):
+            print(f"[LIVE FUTURES BLOCKED SAFETY] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        order = self._build_futures_order(asset, price, delta_exposure)
+        if order is None:
+            print(f"[LIVE FUTURES NO-OP] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        if self.dry_run:
+            print(f"[LIVE FUTURES DRY-RUN] {asset} order={order}")
+            return 0.0
+
+        # Live path: actually submit to Kraken Futures
+        result = self._submit_futures_order(order)
+        if result is None:
+            print(f"[LIVE FUTURES FAILED] {asset} order={order}")
+        return 0.0
+
