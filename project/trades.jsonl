@@ -125,3 +125,5 @@
 {"status": "live", "symbol": "XLM", "side": "buy", "size": 244.6320472037426, "result": {"txid": ["O5TO46-WFFHS-HRBV6F"], "descr": {"order": "buy 244.63204 XLMUSD @ market"}}, "timestamp": 1773660712.9281726}
 {"status": "live", "symbol": "XLM", "side": "sell", "size": 292.5687536571094, "result": {"txid": ["ONDUC4-7AO6V-D75EIR"], "descr": {"order": "sell 292.56875 XLMUSD @ market"}}, "timestamp": 1773661013.3525345}
 {"status": "live", "symbol": "ETH", "side": "buy", "size": 0.022032740652609777, "result": {"txid": ["OTE7SO-VOR73-NL56IH"], "descr": {"order": "buy 0.02203 ETHUSD @ market"}}, "timestamp": 1773661013.5138907}
+{"status": "live", "symbol": "XLM", "side": "sell", "size": 244.36181217, "result": {"txid": ["OAOT3R-2PRQG-C4QRIB"], "descr": {"order": "sell 244.36181 XLMUSD @ market"}}, "timestamp": 1773661614.1752088}
+{"status": "live", "symbol": "ETH", "side": "buy", "size": 0.018672958353457184, "result": {"txid": ["O2YMAF-6WN34-3VAQRS"], "descr": {"order": "buy 0.01867 ETHUSD @ market"}}, "timestamp": 1773661614.3621783}
