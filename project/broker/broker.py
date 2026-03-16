@@ -985,6 +985,30 @@ class LiveBroker(SimulatedBroker):
         self._health_log = []
         print("[MORNING SUMMARY] Metrics reset for new session")
 
+    def daily_rollover(self, rollover_hour: int = 7):
+        """
+        Automatic daily rollover:
+        - At the specified hour (default 07:00 local time), emit a morning summary
+        - Reset metrics for the new session
+        - Ensures the rollover fires only once per day
+        Intended to be called inside the main loop (non-blocking).
+        """
+        now          = time.localtime()
+        current_hour = now.tm_hour
+        current_day  = now.tm_yday
+
+        if not hasattr(self, "_last_rollover_day"):
+            self._last_rollover_day = None
+
+        if current_hour == rollover_hour:
+            if self._last_rollover_day != current_day:
+                print(f"[DAILY ROLLOVER] Triggering morning summary for day {current_day}")
+                self.emit_morning_summary()
+                self.reset_morning_metrics()
+                self._last_rollover_day = current_day
+        # Outside rollover hour: no action needed — next day's rollover will
+        # fire because _last_rollover_day will no longer equal current_day.
+
     # ------------------------------------------------------------------
     # Order payload builders (formatting only — nothing is submitted)
     # ------------------------------------------------------------------
