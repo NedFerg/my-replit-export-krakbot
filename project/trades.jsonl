@@ -91,3 +91,32 @@
 {"status": "live", "symbol": "HBAR", "side": "sell", "size": 261.9980958079723, "result": {"txid": ["OZC647-MOCKT-WAYWQT"], "descr": {"order": "sell 261.998 HBARUSD @ market"}}, "timestamp": 1773645676.7627852}
 {"status": "live", "symbol": "LINK", "side": "buy", "size": 3.1518311906773357, "result": {"txid": ["OM3RNG-NRIJC-D7CVMD"], "descr": {"order": "buy 3.15183 LINKUSD @ market"}}, "timestamp": 1773645676.9166887}
 {"status": "live", "symbol": "XRP", "side": "buy", "size": 4.022571697635587, "result": {"txid": ["OF7KID-CRNF3-3V35GU"], "descr": {"order": "buy 4.02257 XRPUSD @ market"}}, "timestamp": 1773645677.0706866}
+{"status": "live", "symbol": "BTC", "side": "sell", "size": 0.00067773, "result": {"txid": ["ORO5HO-GN43C-2D5J7W"], "descr": {"order": "sell 0.00067 XBTUSD @ market"}}, "timestamp": 1773645767.1827803}
+{"status": "live", "symbol": "LINK", "side": "sell", "size": 2.566577007576535, "result": {"txid": ["OV7M46-TZGY3-2LKJXK"], "descr": {"order": "sell 2.56657 LINKUSD @ market"}}, "timestamp": 1773645767.3392406}
+{"status": "live", "symbol": "SOL", "side": "buy", "size": 0.5340168749332479, "result": {"txid": ["OO7X63-KHKP5-QY6447"], "descr": {"order": "buy 0.53401 SOLUSD @ market"}}, "timestamp": 1773645767.6194913}
+{"status": "live", "symbol": "XRP", "side": "sell", "size": 4.0225717, "result": {"txid": ["O5CWFD-4LXGT-GXVZUX"], "descr": {"order": "sell 4.02257 XRPUSD @ market"}}, "timestamp": 1773645858.6976151}
+{"status": "live", "symbol": "XRP", "side": "buy", "size": 16.870120317698106, "result": {"txid": ["OJ4M5G-KYETA-BWQ4TD"], "descr": {"order": "buy 16.87012 XRPUSD @ market"}}, "timestamp": 1773645948.6297503}
+{"status": "live", "symbol": "SOL", "side": "sell", "size": 0.53401687, "result": {"txid": ["OXTV3I-ZXUWD-3RNLCG"], "descr": {"order": "sell 0.53401 SOLUSD @ market"}}, "timestamp": 1773646039.4692175}
+{"status": "live", "symbol": "HBAR", "side": "buy", "size": 505.9192552868562, "result": {"txid": ["O7ARPX-UVHSK-UKXBLE"], "descr": {"order": "buy 505.919 HBARUSD @ market"}}, "timestamp": 1773646039.624275}
+{"status": "live", "symbol": "HBAR", "side": "sell", "size": 253.26714618579678, "result": {"txid": ["OF2GHC-SEZEU-6X5PAJ"], "descr": {"order": "sell 253.267 HBARUSD @ market"}}, "timestamp": 1773646130.4413798}
+{"status": "live", "symbol": "XRP", "side": "sell", "size": 16.869664968453726, "result": {"txid": ["OP3IGH-S33WI-IXOV3L"], "descr": {"order": "sell 16.86966 XRPUSD @ market"}}, "timestamp": 1773646130.5974028}
+{"status": "live", "symbol": "ETH", "side": "buy", "size": 0.013632755329308318, "result": {"txid": ["OKG7G3-IY6FP-ZLRFDW"], "descr": {"order": "buy 0.01363 ETHUSD @ market"}}, "timestamp": 1773646130.7623236}
+{"status": "live", "symbol": "LINK", "side": "buy", "size": 1.9765499715247417, "result": {"txid": ["ODODML-K27CZ-34JYDX"], "descr": {"order": "buy 1.97654 LINKUSD @ market"}}, "timestamp": 1773646130.9166021}
+{"status": "live", "symbol": "HBAR", "side": "sell", "size": 273.8618937589968, "result": {"txid": ["ORN6ZN-NBMWE-BXMWUC"], "descr": {"order": "sell 273.861 HBARUSD @ market"}}, "timestamp": 1773646311.2459629}
+{"status": "live", "symbol": "SOL", "side": "buy", "size": 0.3700624677174952, "result": {"txid": ["OS3H5I-NZCAV-B72FOO"], "descr": {"order": "buy 0.37006 SOLUSD @ market"}}, "timestamp": 1773646311.4420958}
+{"status": "live", "symbol": "SOL", "side": "sell", "size": 0.37006247, "result": {"txid": ["O4PIIP-25VK4-ZQ2R7N"], "descr": {"order": "sell 0.37006 SOLUSD @ market"}}, "timestamp": 1773646492.0689657}
+{"status": "live", "symbol": "LINK", "side": "sell", "size": 2.56180415, "result": {"txid": ["ON3EO6-DQSMK-LZIMCO"], "descr": {"order": "sell 2.56180 LINKUSD @ market"}}, "timestamp": 1773646582.4139476}
+{"status": "live", "symbol": "BTC", "side": "buy", "size": 0.0006786599452185692, "result": {"txid": ["OZQ7FG-Z3M3Z-UWXFU4"], "descr": {"order": "buy 0.00067 XBTUSD @ market"}}, "timestamp": 1773646582.571686}
+{"status": "live", "symbol": "SOL", "side": "buy", "size": 0.07329209430532946, "result": {"txid": ["O2A6EE-3TEW6-YVS3X4"], "descr": {"order": "buy 0.07329 SOLUSD @ market"}}, "timestamp": 1773646582.7536693}
+{"status": "live", "symbol": "BTC", "side": "sell", "size": 0.00067866, "result": {"txid": ["OANHOK-MFFQF-OSCIML"], "descr": {"order": "sell 0.00067 XBTUSD @ market"}}, "timestamp": 1773646673.374073}
+{"status": "live", "symbol": "SOL", "side": "buy", "size": 0.5332195798229711, "result": {"txid": ["OXRO5R-DOH5R-C4HASV"], "descr": {"order": "buy 0.53321 SOLUSD @ market"}}, "timestamp": 1773646673.541846}
+{"status": "live", "symbol": "SOL", "side": "sell", "size": 0.12016860347421106, "result": {"txid": ["OJKBAW-IDTFA-AUG4GK"], "descr": {"order": "sell 0.12016 SOLUSD @ market"}}, "timestamp": 1773646855.2537763}
+{"status": "live", "symbol": "SOL", "side": "sell", "size": 0.3245950109454127, "result": {"txid": ["ODDVUW-HLHRO-7JM3ZS"], "descr": {"order": "sell 0.32459 SOLUSD @ market"}}, "timestamp": 1773646945.3998215}
+{"status": "live", "symbol": "XRP", "side": "buy", "size": 31.37206794452966, "result": {"txid": ["OHXFKO-HSZL3-2URUGU"], "descr": {"order": "buy 31.37206 XRPUSD @ market"}}, "timestamp": 1773646945.562499}
+{"status": "live", "symbol": "SOL", "side": "sell", "size": 0.16174806, "result": {"txid": ["ON2S4W-A43WE-OGZHEW"], "descr": {"order": "sell 0.16174 SOLUSD @ market"}}, "timestamp": 1773647126.6146865}
+{"status": "live", "symbol": "ETH", "side": "sell", "size": 0.002539385844257469, "result": {"txid": ["OV4ETW-X5UD4-HNVYYI"], "descr": {"order": "sell 0.00253 ETHUSD @ market"}}, "timestamp": 1773647217.3391786}
+{"status": "live", "symbol": "XRP", "side": "sell", "size": 31.37252329, "result": null, "timestamp": 1773647307.4755502}
+{"status": "live", "symbol": "BTC", "side": "buy", "size": 0.0006802785876872297, "result": null, "timestamp": 1773647307.4756892}
+{"status": "live", "symbol": "XRP", "side": "sell", "size": 31.37252329, "result": {"txid": ["OYWMZF-RCZ3Z-733WQY"], "descr": {"order": "sell 31.37252 XRPUSD @ market"}}, "timestamp": 1773659811.0619895}
+{"status": "live", "symbol": "ETH", "side": "sell", "size": 0.01109337, "result": {"txid": ["OZBCQ7-577S2-JOUITW"], "descr": {"order": "sell 0.01109 ETHUSD @ market"}}, "timestamp": 1773659811.2234929}
+{"status": "live", "symbol": "SOL", "side": "buy", "size": 0.5330490405117271, "result": {"txid": ["OG6XB3-NIRRY-VOWJLA"], "descr": {"order": "buy 0.53304 SOLUSD @ market"}}, "timestamp": 1773659811.384147}

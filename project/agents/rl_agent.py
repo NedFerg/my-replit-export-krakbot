@@ -521,13 +521,15 @@ class ReinforcementLearningTrader(TraderAgent):
         # Kraken spot taker = 0.26 %; round-trip = 0.52 %.
         TAKER_FEE      = getattr(self.broker, "taker_fee", 0.0026)
         ROUND_TRIP     = 2.0 * TAKER_FEE          # min gross gain to break even
-        FEE_BUFFER     = 1.5                       # require 1.5× round-trip to trade
-        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER   # ~0.78 % of notional
+        FEE_BUFFER     = 2.0                       # require 2× round-trip to trade
+        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER   # ~1.04 % of notional
 
-        # Rebalancing cooldown — execute orders every 90 seconds.
-        # This is more active than the original 5-minute gate while still
-        # preventing runaway churn against Kraken's hourly rate limit.
-        REBALANCE_COOLDOWN_SEC = 90
+        # Rebalancing cooldown — 5 minutes between rounds.
+        # 90s was too aggressive for a $100 account: 30 trades/hour limit
+        # was hit within ~45 min, burning $2+ in fees.  At 5 min we get
+        # ≤12 rounds/hour; with the 6 % drift gate and 0.60 min-confidence
+        # filter that typically means 3–8 actual trades per hour.
+        REBALANCE_COOLDOWN_SEC = 300
         _now = time.time()
         _last_rebal = getattr(self.broker, "_last_rebalance_time", 0.0)
         if _now - _last_rebal < REBALANCE_COOLDOWN_SEC:
@@ -577,7 +579,8 @@ class ReinforcementLearningTrader(TraderAgent):
         # Within the same round, execute SELLs before BUYs so the freed
         # cash is available for the subsequent buy orders.
         # ----------------------------------------------------------------
-        MIN_DRIFT_FRAC = 0.03   # 3 % drift gate (was 8 %)
+        MIN_DRIFT_FRAC  = 0.06   # 6 % drift gate (3 % was too active on $100 account)
+        MIN_CONFIDENCE  = 0.60   # only act on reasonably high-conviction signals
         max_notional   = getattr(self.broker, "max_notional_per_asset", 50.0)
 
         candidates = []
@@ -596,6 +599,10 @@ class ReinforcementLearningTrader(TraderAgent):
             # Confidence ∈ [0, 1] = |raw action|; scale notional cap so
             # high-conviction signals get larger position moves.
             confidence    = abs(self.target_exposures.get(a, 0.0))
+
+            # Skip low-conviction signals — saves fees on noisy flips
+            if confidence < MIN_CONFIDENCE:
+                continue
             # Scale the cap: 50 % of max_notional at min confidence,
             # 100 % at confidence ≥ 0.7, linearly interpolated.
             conf_scale    = min(1.0, max(0.5, confidence / 0.7))
@@ -637,7 +644,14 @@ class ReinforcementLearningTrader(TraderAgent):
         candidates.sort(key=lambda c: (0 if c["side"] == "sell" else 1,
                                        -abs(c["delta_frac"])))
 
+        # Cap orders per round — prevents excess fee burn on a small account.
+        # 4 orders × $0.13 avg fee = $0.52 max fee per 5-min round.
+        MAX_ORDERS_PER_ROUND = 4
+        orders_placed = 0
+
         for c in candidates:
+            if orders_placed >= MAX_ORDERS_PER_ROUND:
+                break
             a            = c["asset"]
             side         = c["side"]
             delta_usd    = c["delta_usd"]
@@ -672,6 +686,7 @@ class ReinforcementLearningTrader(TraderAgent):
                   f"  (target={target_frac:.3f}  current={current_frac:.3f}"
                   f"  cash_left={remaining_usd:.2f})")
             self.place_order(a, side, delta_units)
+            orders_placed += 1
 
             if hasattr(self.broker, "cumulative_fees_usd"):
                 self.broker.cumulative_fees_usd += est_fee_usd

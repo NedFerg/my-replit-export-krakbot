@@ -590,7 +590,7 @@ class LiveBroker(SimulatedBroker):
         # --- Automatic safety limits (first-night harness) ---------------
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
         self.max_total_notional     = 200.0   # USD cap across all open positions
-        self.max_trades_per_hour    = 30      # rate limiter (≈ 3 cycles worth of orders)
+        self.max_trades_per_hour    = 50      # 5-min cooldown × 4 orders/round = 48 max/hr
         self.max_daily_loss         = 50.0    # USD drawdown cap from session start (true P&L, not cash)
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
