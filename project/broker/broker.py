@@ -136,6 +136,13 @@ class SimulatedBroker(Broker):
         self.funding_ema   = {}   # asset → smoothed funding rate
         self.funding_alpha = 0.2  # EMA decay (0 = no update, 1 = no smoothing)
 
+        # --- Portfolio-level leverage limits ------------------------------
+        # All values are in fractional-exposure units (1.0 = 100% of equity).
+        # Spot layer is excluded — leverage control applies to futures only.
+        self.max_portfolio_leverage = 2.0   # total |spot + futures| cap
+        self.max_futures_notional   = 1.5   # total |futures| cap across assets
+        self.max_asset_futures      = 0.40  # per-asset futures cap
+
     # ------------------------------------------------------------------
     # Standard order-book routing (used by non-RL agents)
     # ------------------------------------------------------------------
@@ -260,6 +267,32 @@ class SimulatedBroker(Broker):
 
             # --- 4. Execute futures (fast — 1% threshold) ----------------
             delta_fut = fut_target - self.futures_positions[a]
+
+            # --- Portfolio-level leverage enforcement --------------------
+            # Works in fractional-exposure units (equity cancels out).
+            # Spot is untouched — only futures are constrained here.
+            current_fut = self.futures_positions[a]
+
+            # 1. Per-asset futures cap (40 % of equity)
+            fut_target = max(-self.max_asset_futures,
+                             min(self.max_asset_futures, fut_target))
+            delta_fut = fut_target - current_fut
+
+            # 2. Total futures notional cap across portfolio
+            _ts, _tf, _te = self._compute_portfolio_exposure()
+            if _tf + abs(delta_fut) > self.max_futures_notional:
+                _allowed = max(0.0, self.max_futures_notional - _tf)
+                delta_fut  = (min(delta_fut,  _allowed) if delta_fut > 0
+                              else max(delta_fut, -_allowed))
+                fut_target = current_fut + delta_fut
+
+            # 3. Total portfolio leverage cap (spot + futures)
+            if _te + abs(delta_fut) > self.max_portfolio_leverage:
+                _allowed = max(0.0, self.max_portfolio_leverage - _te)
+                delta_fut  = (min(delta_fut,  _allowed) if delta_fut > 0
+                              else max(delta_fut, -_allowed))
+                fut_target = current_fut + delta_fut
+
             if abs(delta_fut) > 0.01:
                 fut_cost = self._execute_futures_trade(
                     a, price, delta_fut, microstructure_fn
@@ -279,6 +312,19 @@ class SimulatedBroker(Broker):
         # Keep agent.position (base class, SOL) in sync for display / featurize_state
         agent.position = agent.positions.get("SOL", 0.0)
         return total_cost
+
+    # ------------------------------------------------------------------
+    # Portfolio exposure helpers
+    # ------------------------------------------------------------------
+
+    def _compute_portfolio_exposure(self):
+        """
+        Return (total_spot, total_futures, total_combined) as sums of
+        absolute fractional exposures across all tracked assets.
+        """
+        total_spot = sum(abs(v) for v in self.spot_positions.values())
+        total_fut  = sum(abs(v) for v in self.futures_positions.values())
+        return total_spot, total_fut, total_spot + total_fut
 
     # ------------------------------------------------------------------
     # Funding-rate helpers

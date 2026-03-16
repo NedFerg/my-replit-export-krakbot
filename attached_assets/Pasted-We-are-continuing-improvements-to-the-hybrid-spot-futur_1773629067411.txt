@@ -1,0 +1,68 @@
+We are continuing improvements to the hybrid spot/futures execution engine.
+
+Goal:  
+Add portfolio‑level leverage limits so the system never exceeds safe notional exposure, even during extreme altseason volatility.
+
+This adds institutional‑grade safety on top of the hybrid model.
+1. Add leverage state to broker
+
+In broker.__init__, add:
+python
+
+# Portfolio-level leverage limits
+self.max_portfolio_leverage = 2.0     # total exposure / equity
+self.max_futures_notional   = 1.5     # futures exposure / equity
+self.max_asset_futures      = 0.40    # per-asset futures cap (40% of equity)
+
+These values are tunable.
+2. Add helper to compute portfolio exposure
+
+Place this anywhere in broker.py:
+python
+
+def _compute_portfolio_exposure(self):
+    total_spot = sum(abs(v) for v in self.spot_positions.values())
+    total_fut  = sum(abs(v) for v in self.futures_positions.values())
+    return total_spot, total_fut, total_spot + total_fut
+
+3. Add leverage enforcement inside execute_portfolio_exposure
+
+Inside the hybrid loop, after computing:
+python
+
+delta_fut = futures_exposure - current_fut
+
+insert this block:
+python
+
+# --- Portfolio-level leverage enforcement ---
+total_spot, total_fut, total_exp = self._compute_portfolio_exposure()
+equity = simulation.equity
+
+# 1) Per-asset futures cap
+max_asset_notional = self.max_asset_futures * equity
+if abs(futures_exposure) * equity > max_asset_notional:
+    futures_exposure = max(-self.max_asset_futures, min(self.max_asset_futures, futures_exposure))
+
+# 2) Total futures notional cap
+if (total_fut + abs(delta_fut)) * equity > self.max_futures_notional * equity:
+    # shrink delta_fut proportionally
+    allowed = self.max_futures_notional - total_fut
+    delta_fut = max(-allowed, min(allowed, delta_fut))
+    futures_exposure = current_fut + delta_fut
+
+# 3) Total portfolio leverage cap
+if (total_exp + abs(delta_fut)) / equity > self.max_portfolio_leverage:
+    allowed = self.max_portfolio_leverage * equity - total_exp
+    delta_fut = max(-allowed, min(allowed, delta_fut))
+    futures_exposure = current_fut + delta_fut
+
+This ensures:
+
+    no single asset dominates futures exposure
+
+    total futures exposure stays within safe bounds
+
+    total portfolio leverage never exceeds the limit
+
+Spot is unaffected — leverage control applies only to the tactical futures layer.
