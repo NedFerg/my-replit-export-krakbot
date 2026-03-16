@@ -1,0 +1,137 @@
+We are extending LiveBroker with:
+
+    spot order payload builder
+
+    futures order payload builder
+
+    validation + kill‑switch guards
+
+    dry‑run execution that logs the exact payload that would be sent
+
+No real orders are submitted.
+1. Add order‑builder helpers to LiveBroker
+
+Inside the LiveBroker class, add:
+python
+
+    # --------- Order formatting (Kraken-style, dry-run only) ---------
+
+    def _build_spot_order(self, asset, price, delta_exposure):
+        """
+        Build a Kraken spot market order payload from a fractional delta_exposure.
+        This is formatting only; submission is still dry-run.
+        """
+        if asset not in self.kraken_pairs:
+            self.trigger_kill_switch(f"Unknown asset for spot order: {asset}")
+            return None
+
+        if price is None or price <= 0:
+            self.trigger_kill_switch(f"Invalid price for spot order: {asset} price={price}")
+            return None
+
+        if delta_exposure == 0:
+            return None
+
+        pair = self.kraken_pairs[asset]
+        side = "buy" if delta_exposure > 0 else "sell"
+
+        # NOTE: For now we treat |delta_exposure| as a synthetic size.
+        # Later, you can map this to real notional using equity and price.
+        volume = abs(delta_exposure)
+
+        order = {
+            "pair": pair,
+            "type": side,
+            "ordertype": "market",
+            "volume": f"{volume:.8f}",
+        }
+        return order
+
+    def _build_futures_order(self, asset, price, delta_exposure):
+        """
+        Build a futures/perps order payload (formatting only).
+        Kraken futures uses a separate API; this is a logical placeholder.
+        """
+        if asset not in self.kraken_pairs:
+            self.trigger_kill_switch(f"Unknown asset for futures order: {asset}")
+            return None
+
+        if price is None or price <= 0:
+            self.trigger_kill_switch(f"Invalid price for futures order: {asset} price={price}")
+            return None
+
+        if delta_exposure == 0:
+            return None
+
+        symbol = self.kraken_pairs[asset]
+        side = "buy" if delta_exposure > 0 else "sell"
+        size = abs(delta_exposure)
+
+        order = {
+            "symbol": symbol,
+            "side": side,
+            "ordertype": "market",
+            "size": f"{size:.8f}",
+        }
+        return order
+
+2. Update LiveBroker execution stubs to use the builders (still dry‑run)
+
+Replace the existing LiveBroker._execute_spot_trade with:
+python
+
+    def _execute_spot_trade(self, asset, price, delta_exposure, microstructure_fn=None):
+        """
+        Live spot execution override.
+
+        For now:
+        - health-gated
+        - dry-run only
+        - logs the formatted order payload
+        """
+        if not self.check_health():
+            print(f"[LIVE SPOT BLOCKED] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        order = self._build_spot_order(asset, price, delta_exposure)
+        if order is None:
+            print(f"[LIVE SPOT NO-OP] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        if self.dry_run:
+            print(f"[LIVE SPOT DRY-RUN] {asset} order={order}")
+            return 0.0
+
+        # TODO: later, submit via _kraken_private("/0/private/AddOrder", order)
+        print(f"[LIVE SPOT ORDER] {asset} order={order}")
+        return 0.0
+
+Replace the existing LiveBroker._execute_futures_trade with:
+python
+
+    def _execute_futures_trade(self, asset, price, delta_exposure, microstructure_fn=None):
+        """
+        Live futures execution override.
+
+        For now:
+        - health-gated
+        - dry-run only
+        - logs the formatted order payload
+        """
+        if not self.check_health():
+            print(f"[LIVE FUTURES BLOCKED] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        order = self._build_futures_order(asset, price, delta_exposure)
+        if order is None:
+            print(f"[LIVE FUTURES NO-OP] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+
+        if self.dry_run:
+            print(f"[LIVE FUTURES DRY-RUN] {asset} order={order}")
+            return 0.0
+
+        # TODO: later, submit to Kraken futures endpoint
+        print(f"[LIVE FUTURES ORDER] {asset} order={order}")
+        return 0.0
+
