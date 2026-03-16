@@ -1,0 +1,69 @@
+We are continuing improvements to the hybrid spot/futures execution engine.
+
+Goal:  
+Add real funding‑rate integration so the futures overlay automatically reduces exposure when funding is expensive and increases exposure when funding is favorable.
+
+This protects the system during euphoric altseason (when funding can become extremely costly) and enhances returns during negative‑funding environments.
+1. Add funding‑rate smoothing state
+
+In broker.__init__, add:
+python
+
+# Funding rate smoothing (EMA)
+self.funding_ema = {}
+self.funding_alpha = 0.2  # smoothing factor
+
+2. Add funding‑rate update helper
+
+Place this anywhere in broker.py:
+python
+
+def update_funding_rate(self, asset, raw_funding):
+    # Initialize if needed
+    if asset not in self.funding_ema:
+        self.funding_ema[asset] = raw_funding
+    else:
+        # EMA smoothing
+        prev = self.funding_ema[asset]
+        self.funding_ema[asset] = prev + self.funding_alpha * (raw_funding - prev)
+
+This allows you to feed real funding rates later (from exchange API or simulation).
+3. Add funding‑aware adjustment inside hybrid execution
+
+Inside execute_portfolio_exposure, replace the placeholder funding block with:
+python
+
+# --- Funding-aware adjustment ---
+raw_funding = self.funding_rates.get(asset, 0.0)
+self.update_funding_rate(asset, raw_funding)
+funding = self.funding_ema[asset]
+
+# k controls sensitivity to funding
+k = 0.25
+
+# Reduce long futures when funding is positive (you pay)
+# Increase long futures when funding is negative (you receive)
+funding_adj = 1.0 - k * funding
+
+# Clamp to avoid extreme reactions
+funding_adj = max(0.5, min(1.5, funding_adj))
+
+futures_exposure *= funding_adj
+
+This gives you:
+
+    funding bleed protection during altseason
+
+    funding harvesting during negative‑funding periods
+
+    smooth, stable adjustments (EMA‑based)
+
+4. Optional: log funding adjustments
+
+Add this inside the same loop (optional):
+python
+
+if abs(funding) > 0.05:  # 5% per 8h is extreme
+    print(f"[Funding] {asset}: raw={raw_funding:.4f}, ema={funding:.4f}, adj={funding_adj:.3f}")
+
+This helps you see when the system is reacting to extreme funding.

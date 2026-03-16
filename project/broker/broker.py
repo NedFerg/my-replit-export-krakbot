@@ -96,7 +96,11 @@ class SimulatedBroker(Broker):
         # not need to know the asset universe at construction time.
         self.spot_positions    = {}   # asset → current spot exposure
         self.futures_positions = {}   # asset → current futures exposure
-        self.funding_rates     = {}   # asset → funding rate (placeholder, all 0)
+        self.funding_rates     = {}   # asset → raw funding rate (feed externally or sim)
+
+        # Funding-rate EMA smoothing — reduces noise in short funding windows
+        self.funding_ema   = {}   # asset → smoothed funding rate
+        self.funding_alpha = 0.2  # EMA decay (0 = no update, 1 = no smoothing)
 
     # ------------------------------------------------------------------
     # Standard order-book routing (used by non-RL agents)
@@ -188,11 +192,20 @@ class SimulatedBroker(Broker):
             elif top_risk == 2:
                 fut_target *= 0.3
 
-            # Funding-rate adjustment (placeholder; all rates are 0 in sim)
-            funding = self.funding_rates.get(a, 0.0)
-            if funding != 0.0:
-                adj = max(0.5, min(1.5, 1.0 - 0.2 * funding))
-                fut_target *= adj
+            # --- Funding-aware adjustment (EMA-smoothed) -----------------
+            # Positive funding → longs pay shorts → reduce long futures.
+            # Negative funding → shorts pay longs → increase long futures.
+            # k=0.25 gives a 25% reduction per unit of funding; adj clamped
+            # to [0.5, 1.5] to prevent extreme reactions.
+            _raw_funding = self.funding_rates.get(a, 0.0)
+            self.update_funding_rate(a, _raw_funding)
+            funding = self.funding_ema.get(a, 0.0)
+            funding_adj = max(0.5, min(1.5, 1.0 - 0.25 * funding))
+            fut_target *= funding_adj
+
+            # Log only when funding is extreme (≥5% per 8 h is unusual)
+            if abs(funding) > 0.05:
+                print(f"[Funding] {a}: raw={_raw_funding:.4f}  ema={funding:.4f}  adj={funding_adj:.3f}")
 
             # Clamp futures within caps
             fut_target = max(cap_short, min(cap_long, fut_target))
@@ -229,6 +242,24 @@ class SimulatedBroker(Broker):
         # Keep agent.position (base class, SOL) in sync for display / featurize_state
         agent.position = agent.positions.get("SOL", 0.0)
         return total_cost
+
+    # ------------------------------------------------------------------
+    # Funding-rate helpers
+    # ------------------------------------------------------------------
+
+    def update_funding_rate(self, asset, raw_funding):
+        """
+        Feed a raw funding rate into the per-asset EMA.
+
+        Initialises the EMA to raw_funding on the first call so there is
+        no cold-start discontinuity.  Call this each step (or each funding
+        period) before execute_portfolio_exposure.
+        """
+        if asset not in self.funding_ema:
+            self.funding_ema[asset] = raw_funding
+        else:
+            prev = self.funding_ema[asset]
+            self.funding_ema[asset] = prev + self.funding_alpha * (raw_funding - prev)
 
     # ------------------------------------------------------------------
     # Execution sub-routines
