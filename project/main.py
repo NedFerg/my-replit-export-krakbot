@@ -8,16 +8,16 @@ from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
 from market_data.data_source import SimulatedDataSource
-from broker.broker import SimulatedBroker
+from broker.broker import SimulatedBroker, LiveBroker, run_live_trading_loop
 from exchange.exchange import Exchange
 from risk.risk_manager import RiskManager
 from config.config import INITIAL_BALANCE, MARKET_START_PRICE
 
 # ---------------------------------------------------------------------------
-# Mode switch — only "sim" is implemented; plug in "live" or "paper" here
-# when a real MarketDataSource is available.
+# Mode switch — "sim" runs the local simulation; "live" starts the Kraken
+# live trading loop (requires KRAKEN_API_KEY / KRAKEN_API_SECRET secrets).
 # ---------------------------------------------------------------------------
-MODE = "sim"
+MODE = "live"
 
 NUM_EPISODES = 10
 
@@ -147,7 +147,24 @@ def print_risk_summary(risk_manager):
 # Main
 # ---------------------------------------------------------------------------
 
+def run_live():
+    """Launch the Kraken live trading loop (MODE='live')."""
+    print("[MAIN] Starting live trading loop...")
+    broker = LiveBroker(dry_run=False)
+    agent  = ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False)
+    agent.warm_up(broker, cycles=5)
+    if not agent.ready:
+        print("[MAIN] Warm-up failed — aborting live launch.")
+        return
+    print("[MAIN] Warm-up complete — entering live trading loop (Ctrl-C to stop)")
+    run_live_trading_loop(broker, agent)
+
+
 def main():
+    if MODE == "live":
+        run_live()
+        return
+
     # Create agents once — RLTrader's Q-table accumulates across episodes
     agents = [
         ValueTrader("ValueTrader", INITIAL_BALANCE),
