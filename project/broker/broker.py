@@ -923,6 +923,68 @@ class LiveBroker(SimulatedBroker):
                 self.emit_health_check()
             self._last_heartbeat = now
 
+    def record_health_metrics(self):
+        """
+        Record a single snapshot of key risk metrics.
+        Called automatically by heartbeat() or manually.
+        Stores a rolling in-memory log for morning summaries.
+        """
+        if not hasattr(self, "_health_log"):
+            self._health_log = []
+
+        snapshot = self.emit_health_check()
+        snapshot["timestamp"] = time.time()
+
+        # Keep last ~2000 entries (roughly 24h at 40s cadence)
+        self._health_log.append(snapshot)
+        if len(self._health_log) > 2000:
+            self._health_log.pop(0)
+
+    def emit_morning_summary(self):
+        """
+        Produce a morning summary of the previous session:
+        - overnight PnL
+        - max leverage
+        - max drawdown (equity-based)
+        - kill-switch events
+        - exposure extremes
+        """
+        if not hasattr(self, "_health_log") or not self._health_log:
+            print("[MORNING SUMMARY] No health data recorded")
+            return None
+
+        log = self._health_log
+
+        equities  = [e["equity"]       for e in log if e["equity"]       is not None]
+        leverages = [e["leverage"]     for e in log if e["leverage"]     is not None]
+        pnls      = [e["session_pnl"]  for e in log if e["session_pnl"] is not None]
+        exposures = [e["net_exposure"] for e in log if e["net_exposure"] is not None]
+
+        summary = {
+            "entries":            len(log),
+            "start_time":         log[0]["timestamp"],
+            "end_time":           log[-1]["timestamp"],
+            "starting_equity":    equities[0]  if equities else None,
+            "ending_equity":      equities[-1] if equities else None,
+            "overnight_pnl":      (equities[-1] - equities[0]) if len(equities) >= 2 else None,
+            "max_leverage":       max(leverages)  if leverages  else None,
+            "min_equity":         min(equities)   if equities   else None,
+            "max_equity":         max(equities)   if equities   else None,
+            "max_drawdown":       (min(equities) - max(equities)) if len(equities) >= 2 else None,
+            "max_exposure":       max(exposures)  if exposures  else None,
+            "min_exposure":       min(exposures)  if exposures  else None,
+            "kill_switch_triggered": any(e["kill_switch"] for e in log),
+        }
+        print(f"[MORNING SUMMARY] {summary}")
+        return summary
+
+    def reset_morning_metrics(self):
+        """
+        Clears the rolling health log to begin a new session.
+        """
+        self._health_log = []
+        print("[MORNING SUMMARY] Metrics reset for new session")
+
     # ------------------------------------------------------------------
     # Order payload builders (formatting only — nothing is submitted)
     # ------------------------------------------------------------------
