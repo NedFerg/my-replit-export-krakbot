@@ -329,6 +329,11 @@ class ReinforcementLearningTrader(TraderAgent):
 
         stable = 0
         while stable < cycles:
+            # Abort warm-up immediately if kill switch has been triggered
+            if getattr(broker, "kill_switch", False):
+                print("[WARM-UP] Kill switch active — aborting warm-up")
+                return
+
             state = broker.sync_live_account_state()
             if state is None:
                 print("[WARM-UP] Account sync failed — retrying")

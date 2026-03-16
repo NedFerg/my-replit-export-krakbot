@@ -486,7 +486,7 @@ class LiveBroker(SimulatedBroker):
     - A kill-switch can halt all order flow immediately.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, dry_run=True, **kwargs):
         super().__init__(*args, **kwargs)
 
         # Load Kraken API credentials from the environment — never hard-coded.
@@ -496,9 +496,13 @@ class LiveBroker(SimulatedBroker):
         if not self.kraken_api_key or not self.kraken_api_secret:
             print("[LiveBroker] WARNING: KRAKEN_API_KEY / KRAKEN_API_SECRET not set. "
                   "Running in dry-run mode with no credentials.")
+            dry_run = True   # force dry-run when credentials are missing
 
-        # Safety: always start in dry-run — flip only after full wiring + checks.
-        self.dry_run = True
+        # Honour the caller's dry_run preference (default True for safety).
+        # Set dry_run=False only after credentials are confirmed present.
+        self.dry_run = dry_run
+        if not self.dry_run:
+            print("[LiveBroker] dry_run=False — LIVE ORDER SUBMISSION ENABLED")
 
         # Health and kill-switch state
         self.last_api_error   = None   # last exception or error message from API
