@@ -24,7 +24,7 @@ class NoisyLinear(nn.Module):
     (weight_mu, bias_mu) are used, making the output deterministic.
 
     Noise buffers are refreshed by calling reset_noise() — this happens once
-    per training step in update_q() so that exploration varies every update.
+    per training step in update_value() so that exploration varies every update.
 
     Parameters
     ----------
@@ -38,13 +38,11 @@ class NoisyLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
 
-        # Learnable mean and sigma parameters
         self.weight_mu = nn.Parameter(torch.empty(out_features, in_features))
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
         self.bias_mu = nn.Parameter(torch.empty(out_features))
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
 
-        # Noise samples (not learnable — refreshed each step)
         self.register_buffer("weight_epsilon", torch.empty(out_features, in_features))
         self.register_buffer("bias_epsilon", torch.empty(out_features))
 
@@ -76,91 +74,119 @@ class NoisyLinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Distributional Dueling Q-Network (C51 + Dueling + NoisyNets)
+# C51 Distributional Value Network  V(s)
 # ---------------------------------------------------------------------------
 
-class DuelingQNetwork(nn.Module):
+class ValueNetwork(nn.Module):
     """
-    Distributional Dueling DQN.
+    C51 distributional state-value network.
 
-    Instead of outputting a scalar Q(s,a) per action, the network outputs a
-    probability distribution over num_atoms return atoms for every action:
+    Outputs a probability distribution over num_atoms return atoms for the
+    current state only — no action dimension.
 
-        output shape: [batch, num_actions, num_atoms]   (raw logits)
-
-    The dueling decomposition is applied atom-wise:
-        Q_logits(s,a,z) = V(s,z) + A(s,a,z) − mean_a A(s,a,z)
-
-    After softmax across atoms the expected Q-value is:
-        Q(s,a) = Σ_z  softmax(Q_logits)[a,z] · support[z]
+        output shape: [batch, num_atoms]   (raw logits, softmax → probs)
 
     Architecture
     ------------
-    Shared:    Linear(input_dim, 64) → ReLU → Linear(64, 64) → ReLU
-    Value:     NoisyLinear(64, 32) → ReLU → NoisyLinear(32, num_atoms)
-    Advantage: NoisyLinear(64, 32) → ReLU → NoisyLinear(32, num_actions * num_atoms)
+    Shared:  Linear(input_dim, 64) → ReLU → Linear(64, 64) → ReLU
+    Value:   NoisyLinear(64, 32)   → ReLU → NoisyLinear(32, num_atoms)
     """
 
-    def __init__(self, input_dim, num_actions, num_atoms):
+    def __init__(self, input_dim, num_atoms):
         super().__init__()
-        self.num_actions = num_actions
         self.num_atoms = num_atoms
 
-        # Shared feature extractor (standard Linear — noise only in heads)
         self.feature = nn.Sequential(
             nn.Linear(input_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 64),
             nn.ReLU(),
         )
-
-        # Value stream — one atom-vector per state: [batch, num_atoms]
         self.value = nn.Sequential(
             NoisyLinear(64, 32),
             nn.ReLU(),
             NoisyLinear(32, num_atoms),
         )
 
-        # Advantage stream — one atom-vector per (state, action): [batch, num_actions * num_atoms]
-        self.advantage = nn.Sequential(
-            NoisyLinear(64, 32),
-            nn.ReLU(),
-            NoisyLinear(32, num_actions * num_atoms),
-        )
-
     def forward(self, x):
-        f = self.feature(x)
-
-        V = self.value(f)                                            # [batch, num_atoms]
-        V = V.view(-1, 1, self.num_atoms)                           # [batch, 1, num_atoms]
-
-        A = self.advantage(f)                                        # [batch, num_actions * num_atoms]
-        A = A.view(-1, self.num_actions, self.num_atoms)            # [batch, num_actions, num_atoms]
-
-        A_mean = A.mean(dim=1, keepdim=True)                        # [batch, 1, num_atoms]
-        return V + (A - A_mean)                                      # [batch, num_actions, num_atoms]
+        return self.value(self.feature(x))   # [batch, num_atoms]
 
     def reset_noise(self):
-        """Resample noise buffers in every NoisyLinear layer."""
         for module in self.modules():
             if isinstance(module, NoisyLinear):
                 module.reset_noise()
 
 
 # ---------------------------------------------------------------------------
-# Reinforcement-learning trader
+# Gaussian Actor Network
+# ---------------------------------------------------------------------------
+
+class ActorNetwork(nn.Module):
+    """
+    Stochastic Gaussian actor for continuous multi-asset portfolio exposure.
+
+    Input  : state feature vector (FEATURE_DIM,)
+    Output : mu, log_std — each of shape (num_assets,)
+    Action : tanh(sample from N(mu, std)) — each component in [-1, +1]
+
+    The tanh squash ensures every target exposure is bounded without hard
+    clipping, and the log-probability correction (SAC-style) accounts for the
+    change of variables so gradient estimates are unbiased.
+    """
+
+    LOG_STD_MIN = -4.0   # clamp: prevents std → 0 (degenerate deterministic)
+    LOG_STD_MAX =  2.0   # clamp: prevents std → ∞ (random walk)
+
+    def __init__(self, input_dim, num_assets):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+        )
+        self.mu_head      = nn.Linear(64, num_assets)
+        self.log_std_head = nn.Linear(64, num_assets)
+
+    def forward(self, x):
+        h = self.net(x)
+        mu      = self.mu_head(h)
+        log_std = self.log_std_head(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return mu, log_std
+
+    def sample(self, x):
+        """
+        Reparameterised sample + log-probability.
+
+        Returns
+        -------
+        action   : [batch, num_assets] — tanh-squashed, in [-1, +1]
+        log_prob : [batch]             — sum of per-asset log probs with
+                                         tanh Jacobian correction
+        """
+        mu, log_std = self.forward(x)
+        std  = log_std.exp()
+        dist = torch.distributions.Normal(mu, std)
+        raw  = dist.rsample()                                    # reparameterised
+        action = torch.tanh(raw)
+        log_prob = dist.log_prob(raw) - torch.log(1.0 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(dim=-1)                          # scalar per sample
+        return action, log_prob
+
+
+# ---------------------------------------------------------------------------
+# Reinforcement-learning trader — multi-asset actor-critic
 # ---------------------------------------------------------------------------
 
 class ReinforcementLearningTrader(TraderAgent):
     IS_RL_AGENT = True   # tells the exchange not to mutate self.position
 
-    # 5 discrete target-exposure levels the agent can select each step.
-    # Action index → target exposure in [-1, +1].
-    ACTION_TO_EXPOSURE = {0: -1.0, 1: -0.5, 2: 0.0, 3: 0.5, 4: 1.0}
-    num_actions = 5   # number of discrete actions (used to build the network)
+    # Assets the portfolio covers.  SOL is the only one that was previously
+    # traded; all five now have continuous exposure targets in [-1, +1].
+    PORTFOLIO_ASSETS = ["SOL", "XRP", "LINK", "ETH", "BTC"]
 
     # Reward shaping coefficients — class-level for easy tuning
-    INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of absolute exposure
+    INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of mean abs portfolio exposure
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
@@ -171,127 +197,125 @@ class ReinforcementLearningTrader(TraderAgent):
 
         self.feature_dim = self.FEATURE_DIM
 
-        # Current target exposure set by decide() each step.
-        # The broker's execute_exposure() will ramp self.position toward this.
-        self.target_exposure = 0.0
+        # Multi-asset portfolio -------------------------------------------
+        self.assets    = list(self.PORTFOLIO_ASSETS)
+        self.num_assets = len(self.assets)
 
-        # ---------------------------------------------------------------
-        # Neural Q-networks (live and target)
-        #
-        # q_net     — trained every replay step via backprop
-        # target_q_net — slowly tracks q_net via Polyak averaging;
-        #                used exclusively for bootstrap targets to keep
-        #                them stable across consecutive updates (DQN idea)
+        # Per-asset current exposures (floats in [-1, +1]).
+        # self.position (from TraderAgent) is kept in sync with SOL.
+        self.positions       = {a: 0.0 for a in self.assets}
+        self.target_exposures = {a: 0.0 for a in self.assets}
+
+        # Legacy single-asset compatibility (SOL):
+        self.target_exposure = 0.0   # kept in sync with target_exposures["SOL"]
+
         # ---------------------------------------------------------------
         # C51 distributional RL hyper-parameters
-        # The support is 51 evenly-spaced return atoms in [v_min, v_max].
-        # v_min / v_max should bracket the realistic range of shaped rewards;
-        # these can be tuned once observed return scales are known.
         # ---------------------------------------------------------------
         self.num_atoms = 51
-        self.v_min = -20.0
-        self.v_max = 20.0
-        self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
-        self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms)
+        self.v_min     = -20.0
+        self.v_max     =  20.0
+        self.delta_z   = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        self.support   = torch.linspace(self.v_min, self.v_max, self.num_atoms)
 
-        self.device = torch.device("cpu")
+        self.device  = torch.device("cpu")
         self.support = self.support.to(self.device)
 
-        self.q_net = DuelingQNetwork(
-            self.feature_dim, self.num_actions, self.num_atoms
-        ).to(self.device)
-        self.target_q_net = DuelingQNetwork(
-            self.feature_dim, self.num_actions, self.num_atoms
-        ).to(self.device)
-        self.target_q_net.load_state_dict(self.q_net.state_dict())
-        self.target_q_net.eval()
+        # ---------------------------------------------------------------
+        # Value network  V(s)  (C51 distributional)
+        # ---------------------------------------------------------------
+        self.value_net = ValueNetwork(self.feature_dim, self.num_atoms).to(self.device)
+        self.target_value_net = ValueNetwork(self.feature_dim, self.num_atoms).to(self.device)
+        self.target_value_net.load_state_dict(self.value_net.state_dict())
+        self.target_value_net.eval()
 
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=1e-3)
+        self.critic_optimizer = optim.Adam(self.value_net.parameters(), lr=1e-3)
 
-        # Polyak rate for soft target-network updates (applied each replay step)
+        # Polyak rate for soft target-network updates
         self.target_update_tau = 0.01
 
-        # Cumulative replay step counter (useful for diagnostics / future extensions)
-        self.replay_steps = 0
+        # ---------------------------------------------------------------
+        # Actor network  π(a|s)  (Gaussian + tanh squash)
+        # ---------------------------------------------------------------
+        ACTOR_LR = 3e-4
+        self.actor = ActorNetwork(self.feature_dim, self.num_assets).to(self.device)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
 
-        # How many times replay() has been called; used to throttle updates
-        # to once every replay_freq calls (standard DQN practice).
+        # Log-probability of the last sampled action; used for the online
+        # actor update in the step immediately following the action.
+        self.last_log_prob = None
+        self.prev_log_prob = None
+
+        # Cumulative replay step counter
+        self.replay_steps = 0
         self._replay_call_count = 0
-        self.replay_freq = 4          # run one gradient batch every 4 env steps
+        self.replay_freq = 4   # gradient update every 4 env steps
 
         # ---------------------------------------------------------------
         # Learning hyper-parameters
         # ---------------------------------------------------------------
-        self.gamma = 0.95   # discount factor
-
-        # Polyak averaging coefficient for soft Q-target blending inside update_q
-        self.tau = 0.1
-
-        # Eligibility traces for Q(λ) — kept for structural consistency;
-        # with a neural network the update is per-transition (see update_q).
+        self.gamma   = 0.95
+        self.tau     = 0.1
         self.lambda_ = 0.8
-        self.eligibilities = {}     # reset each episode
+        self.eligibilities = {}
 
-        # Epsilon-greedy exploration with per-episode decay
-        self.epsilon = 0.10
-        self.epsilon_decay = 0.98
-        self.min_epsilon = 0.05
+        # Epsilon attribute kept for display / diagnostics.
+        # Actor-based policy has no ε-greedy; shown as 0.
+        self.epsilon       = 0.0
+        self.epsilon_decay = 1.0
+        self.min_epsilon   = 0.0
 
         # ---------------------------------------------------------------
-        # Experience replay buffer (persists across episodes)
-        # Each entry: (transition, priority)
-        # transition = (prev_state, action, reward, new_state)
+        # Prioritized Experience Replay + N-step returns
         # ---------------------------------------------------------------
-        self.replay_buffer = []
+        self.replay_buffer   = []
         self.replay_capacity = 5000
-        self.batch_size = 32
+        self.batch_size      = 32
 
-        # Prioritized Experience Replay (PER) hyper-parameters
-        self.prioritized_alpha = 0.6    # how strongly priority biases sampling
-        self.prioritized_epsilon = 1e-5  # floor added to |td_error|
+        self.prioritized_alpha   = 0.6
+        self.prioritized_epsilon = 1e-5
 
-        # N-step return accumulation
-        # n_step_buffer collects raw 1-step transitions; once N are gathered
-        # (or the episode ends) they are collapsed into a single N-step
-        # transition (s_0, a_0, R_n, s_n) and pushed to replay_buffer.
-        self.n_step = 3
+        self.n_step        = 3
         self.n_step_buffer = collections.deque(maxlen=self.n_step)
 
-        self.last_mid_price = None  # for momentum feature
+        self.last_mid_price = None
+        self.prev_state     = None
+        self.prev_action    = None
+        self.prev_equity    = None
 
-        # Set by the simulation loop each step
-        self.prev_state = None
-        self.prev_action = None
-        self.prev_equity = None
+    # ------------------------------------------------------------------
+    # Display helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def num_actions(self):
+        """For display compat: the 'actions' are now per-asset exposures."""
+        return self.num_assets
 
     def reset_for_new_episode(self):
         """
         Reset per-episode fields.
-
-        Persisted across episodes: network weights, replay buffer.
-        Epsilon decays here rather than being reset.
-        Eligibilities are cleared: traces must not propagate across episode
-        boundaries.
+        Network weights, replay buffer, and actor persist across episodes.
         """
         super().reset_for_new_episode()
-        self.last_mid_price = None
-        self.prev_state = None
-        self.prev_action = None
-        self.prev_equity = None
+        self.positions        = {a: 0.0 for a in self.assets}
+        self.target_exposures = {a: 0.0 for a in self.assets}
+        self.target_exposure  = 0.0
+        self.last_mid_price   = None
+        self.prev_state       = None
+        self.prev_action      = None
+        self.prev_equity      = None
+        self.last_log_prob    = None
+        self.prev_log_prob    = None
         self.eligibilities.clear()
-        self.n_step_buffer.clear()   # prevent transitions leaking across episodes
-        self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+        self.n_step_buffer.clear()
 
     # ------------------------------------------------------------------
     # State encoding (legacy — retained for reference / diagnostics)
     # ------------------------------------------------------------------
 
     def encode_state(self, market_state):
-        """
-        Legacy tabular encoding (7-tuple of integer/string buckets).
-        Superseded by featurize_state() + state_to_vector() for the DQN pipeline.
-        Retained for reference and potential diagnostics.
-        """
+        """Legacy tabular encoding. Superseded by featurize_state()."""
         price_bucket = int(market_state.mid_price // 5)
         spread_bucket = int((market_state.spread or 0) // 1)
         regime = market_state.regime
@@ -332,7 +356,7 @@ class ReinforcementLearningTrader(TraderAgent):
         A. price_bucket  – normalized 1-step price return, 3dp.
         B. vol_bucket    – current regime volatility parameter, 3dp.
         C. drift_bucket  – current drift, 3dp.
-        D. inv_bucket    – agent's current exposure in [-1, +1] (float).
+        D. inv_bucket    – agent's SOL exposure in [-1, +1] (float).
         E. regime        – regime string (converted to float in state_to_vector).
         F. m1            – 1-step momentum if MarketState provides it, else 0.
         G. m3            – 3-step momentum if MarketState provides it, else 0.
@@ -350,6 +374,11 @@ class ReinforcementLearningTrader(TraderAgent):
         -----------------------------------------------------------------------
         Per asset: price/1000, vol, mom_5/100, mom_20/100, mom_50/100,
                    rolling_vol/1000, vol_imbalance/1000, pressure.
+
+        Crypto-regime features (7)
+        --------------------------
+        btc_dominance, eth_btc_ratio/100, sol_btc_strength/100,
+        sol_eth_strength/100, altseason_index, vol_regime, liq_regime/1000.
         """
         prev_price = agent.last_mid_price
         if prev_price is not None and prev_price > 0:
@@ -358,10 +387,10 @@ class ReinforcementLearningTrader(TraderAgent):
             price_change = 0.0
         price_bucket = round(price_change, 3)
 
-        vol_bucket = round(market_state.volatility, 3)
+        vol_bucket   = round(market_state.volatility, 3)
         drift_bucket = round(market_state.drift, 3)
-        inv_bucket = agent.position   # exposure float, already in [-1, +1]
-        regime = market_state.regime
+        inv_bucket   = agent.position   # SOL exposure (kept in sync by broker)
+        regime       = market_state.regime
 
         m1 = round(market_state.momentum_1, 3) if hasattr(market_state, "momentum_1") else 0
         m3 = round(market_state.momentum_3, 3) if hasattr(market_state, "momentum_3") else 0
@@ -381,7 +410,6 @@ class ReinforcementLearningTrader(TraderAgent):
         vol_imbalance = max(min(getattr(market_state, "vol_imbalance", 0.0) / 1000.0, 1.0), -1.0)
         pressure      = max(min(getattr(market_state, "pressure",   0.0), 1.0), -1.0)
 
-        # Base 16 SOL-specific features
         features = [
             price_bucket, vol_bucket, drift_bucket, inv_bucket, regime,
             m1, m3, imbalance,
@@ -390,8 +418,6 @@ class ReinforcementLearningTrader(TraderAgent):
             rolling_vol, vol_imbalance, pressure,
         ]
 
-        # Cross-asset features: 8 per asset × 5 assets = 40 additional features.
-        # Normalisations mirror the SOL features to keep all inputs in similar ranges.
         for a in ["SOL", "XRP", "LINK", "ETH", "BTC"]:
             features.extend([
                 getattr(market_state, f"{a}_price",        0.0) / 1000.0,
@@ -404,20 +430,14 @@ class ReinforcementLearningTrader(TraderAgent):
                 getattr(market_state, f"{a}_pressure",     0.0),
             ])
 
-        # Crypto-regime features (7): market-structure signals that give the
-        # agent context about the broader macro regime.
-        # btc_dominance / altseason_index are already in [0,1] naturally.
-        # Ratios (eth_btc, sol_btc, sol_eth) are normalised by /100 to bring
-        # them from their raw float range into a consistent magnitude.
-        # vol_regime and liq_regime mirror the per-asset normalisations above.
         features.extend([
-            getattr(market_state, "btc_dominance",    0.0),           # [0,1]
-            getattr(market_state, "eth_btc_ratio",    0.0) / 100.0,   # raw ratio → small
+            getattr(market_state, "btc_dominance",    0.0),
+            getattr(market_state, "eth_btc_ratio",    0.0) / 100.0,
             getattr(market_state, "sol_btc_strength", 0.0) / 100.0,
             getattr(market_state, "sol_eth_strength", 0.0) / 100.0,
-            getattr(market_state, "altseason_index",  0.0),           # [0,1]
-            getattr(market_state, "vol_regime",       0.0),           # small (like vol)
-            getattr(market_state, "liq_regime",       0.0) / 1000.0, # like rolling_vol
+            getattr(market_state, "altseason_index",  0.0),
+            getattr(market_state, "vol_regime",       0.0),
+            getattr(market_state, "liq_regime",       0.0) / 1000.0,
         ])
 
         return tuple(features)
@@ -440,49 +460,19 @@ class ReinforcementLearningTrader(TraderAgent):
         ]
 
     # ------------------------------------------------------------------
-    # Q-value helpers — neural network inference
+    # Value helpers — distributional V(s)
     # ------------------------------------------------------------------
 
-    def _dist_to_q_values(self, logits):
+    def _dist_to_value(self, logits):
         """
-        Convert raw distribution logits to expected Q-values.
+        Convert raw distribution logits to expected scalar value.
 
-        logits : [batch, num_actions, num_atoms]  (raw network output)
-        Returns : [batch, num_actions]  (expected Q per action)
-
-        Softmax across atoms gives probabilities; dot-product with the
-        support gives the expectation E[Z] = Σ_z p(z) · z.
+        logits  : [batch, num_atoms]  (raw network output)
+        Returns : [batch]             (expected value E[Z] = Σ p(z)·z)
         """
-        probs = torch.softmax(logits, dim=-1)           # [batch, num_actions, num_atoms]
-        support = self.support.view(1, 1, -1)           # [1, 1, num_atoms]
-        return (probs * support).sum(dim=-1)            # [batch, num_actions]
-
-    def q_value(self, state_vec, action_idx):
-        """
-        Expected Q(s, a) from the live network (no grad, inference only).
-
-        action_idx : int in [0, num_actions)
-        Returns a plain Python float.
-        """
-        x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            logits = self.q_net(x)                      # [1, num_actions, num_atoms]
-            q_vals = self._dist_to_q_values(logits)     # [1, num_actions]
-        return q_vals[0, action_idx].item()
-
-    def target_q_value(self, state_vec, action_idx):
-        """
-        Expected Q(s, a) from the target network (no grad, inference only).
-
-        action_idx : int in [0, num_actions)
-        Used exclusively for action evaluation in update_q() so that the
-        bootstrap signal comes from a stable, slowly-updated copy.
-        """
-        x = torch.tensor(state_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            logits = self.target_q_net(x)
-            q_vals = self._dist_to_q_values(logits)
-        return q_vals[0, action_idx].item()
+        probs   = torch.softmax(logits, dim=-1)          # [batch, num_atoms]
+        support = self.support.view(1, -1)               # [1, num_atoms]
+        return (probs * support).sum(dim=-1)             # [batch]
 
     # ------------------------------------------------------------------
     # Action selection
@@ -490,32 +480,34 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def decide(self, market_state):
         """
-        Epsilon-greedy action selection using the live Q-network.
+        Sample a continuous portfolio action from the actor.
 
-        Returns an integer action index in [0, num_actions).
-        Also sets self.target_exposure = ACTION_TO_EXPOSURE[action_idx]
-        so the broker knows which exposure level to move toward.
+        Returns a tensor of shape (num_assets,) with target exposures in
+        [-1, +1] for [SOL, XRP, LINK, ETH, BTC].
 
-        Greedy: single forward pass → argmax over 5 expected Q-values.
+        Sets self.target_exposures (dict) and self.last_log_prob for the
+        subsequent actor update.
         """
         state_tuple = self.featurize_state(market_state, self)
-
-        # Update price reference for next step's featurize_state call
         self.last_mid_price = market_state.mid_price
 
-        if random.random() < self.epsilon:
-            action_idx = random.randrange(self.num_actions)
-        else:
-            state_vec = self.state_to_vector(state_tuple)
-            x = torch.tensor(state_vec, dtype=torch.float32,
-                              device=self.device).unsqueeze(0)
-            with torch.no_grad():
-                logits = self.q_net(x)                      # [1, 5, 51]
-                q_vals = self._dist_to_q_values(logits)     # [1, 5]
-            action_idx = int(q_vals[0].argmax().item())
+        state_vec = self.state_to_vector(state_tuple)
+        x = torch.tensor(state_vec, dtype=torch.float32,
+                          device=self.device).unsqueeze(0)   # [1, feature_dim]
 
-        self.target_exposure = self.ACTION_TO_EXPOSURE[action_idx]
-        return action_idx
+        self.actor.train()
+        action, log_prob = self.actor.sample(x)   # [1, num_assets], [1]
+
+        self.last_log_prob = log_prob              # store for actor update next step
+
+        action_list = action.detach().squeeze(0).tolist()
+        for i, a in enumerate(self.assets):
+            self.target_exposures[a] = float(action_list[i])
+
+        # Legacy compat: single SOL exposure target
+        self.target_exposure = self.target_exposures["SOL"]
+
+        return action.detach().squeeze(0)          # (num_assets,) tensor
 
     # ------------------------------------------------------------------
     # Reward shaping
@@ -525,10 +517,15 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         Shape the raw equity-change reward.
 
-        1. Inventory penalty — discourages large directional exposure.
+        1. Mean absolute portfolio exposure penalty — discourages large
+           directional bets across all assets simultaneously.
         2. Volatility scaling — reduces reward magnitude in chaotic regimes.
         """
-        inventory_penalty = self.INVENTORY_PENALTY_COEF * abs(self.position)
+        if self.positions:
+            mean_abs_exposure = sum(abs(v) for v in self.positions.values()) / len(self.positions)
+        else:
+            mean_abs_exposure = abs(self.position)
+        inventory_penalty = self.INVENTORY_PENALTY_COEF * mean_abs_exposure
         reward = raw_reward - inventory_penalty
         vol_scale = 1.0 / (1.0 + market_state.volatility)
         return reward * vol_scale
@@ -538,57 +535,36 @@ class ReinforcementLearningTrader(TraderAgent):
     # ------------------------------------------------------------------
 
     def update_eligibilities(self, state, action):
-        """
-        Maintain accumulating eligibility traces (state tuples as keys).
-
-        Decays all existing traces by γλ, prunes negligible ones,
-        then increments the current (state, action) pair by 1.
-
-        Note: traces are tracked for structural consistency and future use.
-        The neural network update in update_q() currently updates only the
-        current (s, a) via backprop (full TD(λ) with backprop is non-trivial).
-        """
+        """Maintain accumulating eligibility traces (kept for structural consistency)."""
         decay = self.gamma * self.lambda_
         for key in list(self.eligibilities.keys()):
             self.eligibilities[key] *= decay
             if self.eligibilities[key] < 1e-6:
                 del self.eligibilities[key]
-
-        key = (state, action)
+        key = (state, id(action) if not isinstance(action, (int, str)) else action)
         self.eligibilities[key] = self.eligibilities.get(key, 0.0) + 1.0
 
     # ------------------------------------------------------------------
-    # Experience replay (Prioritized)
+    # Experience replay (Prioritized, N-step)
     # ------------------------------------------------------------------
 
     def add_experience(self, prev_state, action, reward, new_state, done=False):
         """
         Accumulate a raw 1-step transition into the N-step buffer, then
-        collapse and push to the replay buffer once N steps are available
-        (or the episode ends).
+        collapse and push to the replay buffer once N steps are available.
 
-        N-step return
-        -------------
-        R_n = Σ_{k=0}^{N-1} γ^k · r_{t+k}   (sum stops early if done=True)
-        s_n = state reached after N steps (or at episode end)
+        N-step return: R_n = Σ_{k=0}^{N-1} γ^k · r_{t+k}
+        The collapsed transition (s_0, a_0, R_n, s_n) is stored for the
+        critic update; the actor uses online updates instead.
 
-        The collapsed transition (s_0, a_0, R_n, s_n) is stored in
-        replay_buffer exactly like a 1-step transition, so replay() and
-        update_q() require no changes — they simply receive a richer reward
-        signal and a further-ahead bootstrap state.
-
-        Priority
-        --------
-        New entries receive the current maximum priority so they are sampled
-        at least once before being re-scored by actual TD error.
+        Priority: new entries receive max priority so they are sampled at
+        least once before being re-scored by actual critic loss.
         """
         self.n_step_buffer.append((prev_state, action, reward, new_state, done))
 
-        # Wait until the buffer is full (or the episode is done)
         if len(self.n_step_buffer) < self.n_step and not done:
             return
 
-        # Compute discounted N-step return, stopping at any terminal step
         R = 0.0
         gamma_pow = 1.0
         for (_, _, r, _, d) in self.n_step_buffer:
@@ -598,7 +574,7 @@ class ReinforcementLearningTrader(TraderAgent):
             gamma_pow *= self.gamma
 
         s0, a0, _, _, _ = self.n_step_buffer[0]
-        s_n = self.n_step_buffer[-1][3]  # state after the last collected step
+        s_n = self.n_step_buffer[-1][3]
 
         transition = (s0, a0, R, s_n)
         max_prio = max((p for (_, p) in self.replay_buffer), default=1.0)
@@ -611,15 +587,10 @@ class ReinforcementLearningTrader(TraderAgent):
 
     def replay(self):
         """
-        Sample a priority-weighted mini-batch and train the Q-network.
+        Sample a priority-weighted mini-batch and update the value network.
 
-        Sampling is proportional to priority^alpha (Prioritized Experience
-        Replay).  For each sampled transition:
-          1. update_eligibilities() — bookkeeping; traces decay as usual.
-          2. update_q()             — one backprop step; returns td_error.
-          3. Refresh buffer priority to |td_error| + ε.
-
-        No-ops until batch_size transitions are available or on non-update steps.
+        Only the C51 critic is updated here (using N-step replay).
+        The actor is updated online each step via update_actor() in simulation.
         """
         self._replay_call_count += 1
         if self._replay_call_count % self.replay_freq != 0:
@@ -627,13 +598,11 @@ class ReinforcementLearningTrader(TraderAgent):
         if len(self.replay_buffer) < self.batch_size:
             return
 
-        # Build priority-weighted sampling distribution
         priorities = [p for (_, p) in self.replay_buffer]
         probs = [p ** self.prioritized_alpha for p in priorities]
         total = sum(probs)
         probs = [p / total for p in probs]
 
-        # Sample indices with replacement, weighted by priority
         indices = random.choices(range(len(self.replay_buffer)),
                                  weights=probs,
                                  k=self.batch_size)
@@ -642,106 +611,114 @@ class ReinforcementLearningTrader(TraderAgent):
             transition, _ = self.replay_buffer[idx]
             prev_state, action, reward, new_state = transition
 
-            self.update_eligibilities(prev_state, action)
-            td_error = self.update_q(prev_state, action, reward, new_state)
+            td_error = self.update_value(prev_state, reward, new_state)
 
-            # Refresh priority from latest TD-error magnitude
             new_prio = abs(td_error) + self.prioritized_epsilon
             self.replay_buffer[idx] = (transition, new_prio)
-
             self.replay_steps += 1
 
     # ------------------------------------------------------------------
-    # DQN training step (Double-Q + soft Q-target + Polyak target update)
+    # Critic training step  V(s)  — C51 distributional
     # ------------------------------------------------------------------
 
-    def update_q(self, prev_state, action, reward, new_state):
+    def update_value(self, prev_state, reward, new_state):
         """
-        C51 distributional update with Double-Q, NoisyNets, N-step returns,
-        and Polyak target-network update.
+        C51 distributional update for V(s).
 
         Algorithm
         ---------
-        1. Build state tensors.
-
-        2. Live network forward (with gradient):
-               logits     → [1, num_actions, num_atoms]
-               log_probs  → log_softmax over atoms
-               log_probs_a → log-probs for the taken action: [1, num_atoms]
-
-        3. Double-Q next-action selection (no gradient):
-               live net  → expected Q per action → argmax → best_next_idx
-               target net → probability distribution for best_next_idx
-
-        4. C51 distributional projection (N-step Bellman):
+        1. Build state tensors from feature tuples.
+        2. Live value net forward (with gradient): logits [1, num_atoms].
+        3. Target value net forward (no gradient): next_probs [num_atoms].
+        4. C51 N-step Bellman projection:
                Tz_j = clamp(r + γ^n · z_j, v_min, v_max)
-               b_j  = (Tz_j − v_min) / δz
-               Spread p(z_j) proportionally to floor(b_j) and ceil(b_j)
-
-        5. Cross-entropy loss: −Σ_j target_dist_j · log_probs_a_j
-           Backprop → Adam step.
-
-        6. Resample NoisyNet noise, then soft-update target network (Polyak).
-
-        7. Return |ΔQ| as the PER priority signal.
+               Spread target_probs proportionally between floor/ceil atoms.
+        5. Cross-entropy loss: −Σ_j target_j · log_prob_j
+        6. Backprop → Adam step → resample noise → Polyak target update.
+        7. Return loss.item() as PER priority signal.
         """
-        s_vec = self.state_to_vector(prev_state)
+        s_vec  = self.state_to_vector(prev_state)
         s2_vec = self.state_to_vector(new_state)
 
         x  = torch.tensor(s_vec,  dtype=torch.float32, device=self.device).unsqueeze(0)
         x2 = torch.tensor(s2_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
-        a_idx = torch.tensor([action], device=self.device)   # action is int 0-4
-        r = torch.tensor([reward], dtype=torch.float32, device=self.device)
+        r  = torch.tensor([reward], dtype=torch.float32, device=self.device)
 
-        # --- Live network forward (gradient tracked) ---
-        logits = self.q_net(x)                                     # [1, num_actions, num_atoms]
-        log_probs   = torch.log_softmax(logits, dim=-1)            # [1, num_actions, num_atoms]
-        log_probs_a = log_probs[0, a_idx[0]]                       # [num_atoms]
+        # --- Live network forward ---
+        logits   = self.value_net(x)                           # [1, num_atoms]
+        log_probs = torch.log_softmax(logits, dim=-1)[0]       # [num_atoms]
 
-        # --- Double-Q: live selects action, target evaluates distribution ---
+        # --- Target V(s') ---
         with torch.no_grad():
-            next_logits_live  = self.q_net(x2)                     # [1, num_actions, num_atoms]
-            next_q_vals_live  = self._dist_to_q_values(next_logits_live)   # [1, num_actions]
-            best_next_idx     = next_q_vals_live.argmax(dim=1)     # [1]
+            next_logits = self.target_value_net(x2)            # [1, num_atoms]
+            next_probs  = torch.softmax(next_logits, dim=-1)[0]   # [num_atoms]
 
-            next_logits_target = self.target_q_net(x2)             # [1, num_actions, num_atoms]
-            next_probs_target  = torch.softmax(next_logits_target, dim=-1)
-            next_probs_best    = next_probs_target[0, best_next_idx[0]]    # [num_atoms]
-
-        # --- C51 distributional projection (N-step Bellman operator) ---
-        # Vectorised: no Python loop over atoms.
+        # --- C51 distributional projection (N-step Bellman) ---
         gamma_n = self.gamma ** self.n_step
         Tz = r.unsqueeze(1) + gamma_n * self.support.view(1, -1)  # [1, num_atoms]
         Tz = Tz.clamp(self.v_min, self.v_max)
 
-        b  = (Tz - self.v_min) / self.delta_z                     # [1, num_atoms]
-        l  = b.floor().long().view(-1)                             # [num_atoms]
-        u  = b.ceil().long().view(-1)                              # [num_atoms]
-        b  = b.view(-1)                                            # [num_atoms]
+        b = (Tz - self.v_min) / self.delta_z
+        l = b.floor().long().view(-1)
+        u = b.ceil().long().view(-1)
+        b = b.view(-1)
 
-        # Split next_probs_best mass between the two surrounding atoms.
-        # index_add_ accumulates into duplicate indices correctly.
         target_dist = torch.zeros(self.num_atoms, device=self.device)
-        target_dist.index_add_(0, l, next_probs_best * (u.float() - b))
-        target_dist.index_add_(0, u, next_probs_best * (b - l.float()))
+        target_dist.index_add_(0, l, next_probs * (u.float() - b))
+        target_dist.index_add_(0, u, next_probs * (b - l.float()))
 
-        # --- Cross-entropy loss and backprop ---
-        loss = -(target_dist * log_probs_a).sum()
-        self.optimizer.zero_grad()
+        # --- Cross-entropy loss ---
+        loss = -(target_dist * log_probs).sum()
+        self.critic_optimizer.zero_grad()
         loss.backward()
-        self.optimizer.step()
+        self.critic_optimizer.step()
 
-        # --- Resample noise and soft-update target network ---
-        self.q_net.reset_noise()
-        self.target_q_net.reset_noise()
+        # --- Resample noise and soft-update target ---
+        self.value_net.reset_noise()
+        self.target_value_net.reset_noise()
 
         with torch.no_grad():
             for param, target_param in zip(
-                self.q_net.parameters(), self.target_q_net.parameters()
+                self.value_net.parameters(), self.target_value_net.parameters()
             ):
                 target_param.data.mul_(1.0 - self.target_update_tau)
                 target_param.data.add_(self.target_update_tau * param.data)
 
-        # Cross-entropy loss is the natural C51 priority signal:
-        # high loss ↔ large surprise ↔ should be revisited (replaces |ΔQ|).
-        return loss.item()  # used by replay() to refresh PER priorities
+        return loss.item()
+
+    # ------------------------------------------------------------------
+    # Actor training step — online advantage-weighted policy gradient
+    # ------------------------------------------------------------------
+
+    def update_actor(self, prev_state, reward, new_state):
+        """
+        One-step online actor update using the current value estimates.
+
+        Advantage: A = r + γ · E[V(s')] − E[V(s)]
+        Loss:      L = −A · log π(a|s)
+
+        We *resample* a fresh action from the current actor on prev_state
+        rather than using a stored log_prob from a previous forward pass.
+        This avoids stale computation-graph errors caused by in-place
+        parameter updates between the original sample and the backward call.
+        """
+        s_vec  = self.state_to_vector(prev_state)
+        s2_vec = self.state_to_vector(new_state)
+
+        x  = torch.tensor(s_vec,  dtype=torch.float32, device=self.device).unsqueeze(0)
+        x2 = torch.tensor(s2_vec, dtype=torch.float32, device=self.device).unsqueeze(0)
+        r  = torch.tensor([reward], dtype=torch.float32, device=self.device)
+
+        # Fresh sample → fresh computation graph anchored in current actor params
+        self.actor.train()
+        _action, log_prob = self.actor.sample(x)          # [1, num_assets], [1]
+
+        with torch.no_grad():
+            v_s  = self._dist_to_value(self.value_net(x))    # [1]
+            v_s2 = self._dist_to_value(self.value_net(x2))   # [1]
+            advantage = (r + self.gamma * v_s2 - v_s)        # [1]
+
+        actor_loss = -(advantage * log_prob)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()

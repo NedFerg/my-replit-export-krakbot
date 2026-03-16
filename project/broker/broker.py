@@ -29,22 +29,21 @@ class Broker(ABC):
         Returns a list of Fill objects from the final match."""
 
     @abstractmethod
-    def execute_exposure(self, agent, price, microstructure_fn=None) -> float:
+    def execute_portfolio_exposure(self, agent, prices, microstructure_fn=None) -> float:
         """
-        Ramp agent.position toward agent.target_exposure and update directly.
-        Applies microstructure costs (spread + slippage + fee) when
-        microstructure_fn is supplied.
+        For each asset in agent.assets, ramp agent.positions[asset] toward
+        agent.target_exposures[asset] and apply microstructure costs.
 
         Parameters
         ----------
-        agent            : TraderAgent subclass with IS_RL_AGENT = True
-        price            : float — current mid market price
-        microstructure_fn: callable(mid_price, side) → (exec_price, txn_cost)
-                           or None for zero-cost mode
+        agent            : ReinforcementLearningTrader
+        prices           : Dict[str, float] — current mid price per asset
+        microstructure_fn: callable(mid_price, side, delta_exposure)
+                           → (exec_price, txn_cost), or None for zero-cost mode
 
         Returns
         -------
-        float — transaction cost charged this step (0.0 if no trade or no fn)
+        float — total transaction cost charged across all assets this step
         """
 
     @property
@@ -78,57 +77,58 @@ class SimulatedBroker(Broker):
     def fill_resting_orders(self, price) -> list:
         return self._exchange.fill_resting_orders(price)
 
-    def execute_exposure(self, agent, price, microstructure_fn=None) -> float:
+    def execute_portfolio_exposure(self, agent, prices, microstructure_fn=None) -> float:
         """
-        Ramp agent.position (exposure float in [-1, +1]) toward
-        agent.target_exposure using up to max_steps increments of 1/max_steps.
+        For each asset in agent.assets, ramp agent.positions[asset] toward
+        agent.target_exposures[asset] using up to max_steps increments.
 
-        When microstructure_fn is provided the execution price includes the
-        bid/ask spread and slippage, and the flat transaction fee is deducted
-        from agent.balance.  The fee is returned so the caller can subtract
-        it from the RL reward signal.
-
-        No exchange order book is involved — position is updated directly.
-        Idempotent when abs(delta) < 0.05 (dead-band to avoid churning).
+        The same dead-band (< 0.05), ramp logic, and microstructure cost
+        model that the single-asset execute_exposure used are applied
+        independently per asset.  agent.position is kept in sync with the
+        SOL position for backward-compatible display and featurize_state().
 
         Returns
         -------
-        float — transaction cost charged this step (0.0 if no trade).
+        float — sum of transaction costs across all assets this step.
         """
-        delta = agent.target_exposure - agent.position
-        if abs(delta) < 0.05:
-            return 0.0
+        total_cost = 0.0
+        max_steps  = 3
 
-        side = "buy" if delta > 0 else "sell"
+        for a in agent.assets:
+            price = prices.get(a, 0.0)
+            if price <= 0:
+                continue
 
-        max_steps = 3
-        steps = int(round(abs(delta) * max_steps))
-        exposure_change = steps * (1.0 / max_steps)
+            current = agent.positions[a]
+            target  = agent.target_exposures[a]
+            delta   = target - current
 
-        # Signed exposure change this step — passed into apply_microstructure
-        # so the dynamic slippage model can scale with trade size.
-        delta_exposure = exposure_change if delta > 0 else -exposure_change
+            if abs(delta) < 0.05:
+                continue
 
-        # Apply microstructure friction when a pricing function is available.
-        # exec_price is recorded on the agent for reference; the flat txn_cost
-        # is deducted from balance and returned for the reward shaping.
-        if microstructure_fn is not None:
-            exec_price, txn_cost = microstructure_fn(price, side, delta_exposure)
-        else:
-            exec_price, txn_cost = price, 0.0
+            side   = "buy" if delta > 0 else "sell"
+            steps  = int(round(abs(delta) * max_steps))
+            change = steps * (1.0 / max_steps)
+            delta_exposure = change if delta > 0 else -change
 
-        if delta > 0:
-            agent.position = min(1.0, agent.position + exposure_change)
-        else:
-            agent.position = max(-1.0, agent.position - exposure_change)
+            if microstructure_fn is not None:
+                _exec_price, txn_cost = microstructure_fn(price, side, delta_exposure)
+            else:
+                txn_cost = 0.0
 
-        # Deduct the flat transaction fee from the agent's cash balance.
-        # This is distinct from slippage (which affects exec_price) and
-        # makes the balance decrease visibly when the agent trades.
-        agent.balance  -= txn_cost
-        agent.realized_pnl -= txn_cost   # fee reduces realised book too
+            if delta > 0:
+                agent.positions[a] = min(1.0, current + change)
+            else:
+                agent.positions[a] = max(-1.0, current - change)
 
-        return txn_cost
+            agent.balance      -= txn_cost
+            agent.realized_pnl -= txn_cost
+            total_cost         += txn_cost
+
+        # Keep agent.position (base class, SOL) in sync for display / featurize_state
+        agent.position = agent.positions.get("SOL", 0.0)
+
+        return total_cost
 
     @property
     def trade_log(self):

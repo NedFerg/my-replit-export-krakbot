@@ -1,0 +1,204 @@
+We are now upgrading the RL system from single‑asset discrete exposure to multi‑asset continuous exposure.
+
+Goal:
+
+    Control one exposure per asset for: ["SOL", "XRP", "LINK", "ETH", "BTC"]
+
+    Each exposure is a continuous value in [-1, +1]
+
+    Keep the existing C51 critic if possible, but move to an actor–critic architecture
+
+    Preserve all existing microstructure, impact, and regime features
+
+You have full access to the codebase; design the exact wiring in a clean, modular way.
+1. Define the portfolio action space
+
+    Add a constant in a shared config or inside ReinforcementLearningTrader:
+    python
+
+    self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC"]
+    self.num_assets = len(self.assets)
+
+    Define the action as a vector of target exposures:
+    python
+
+    # shape: (num_assets,)
+    # each in [-1, +1]
+
+2. Add a continuous actor network
+
+In rl_agent.py:
+
+    Create an ActorNetwork class:
+
+        Input: state feature vector of size FEATURE_DIM (currently 63)
+
+        Output:
+
+            mu: shape (num_assets,) — unconstrained means
+
+            log_std: shape (num_assets,) — unconstrained log‑std
+
+        Use:
+
+            tanh on the sampled action to squash to [-1, +1]
+
+            softplus or clamped exp on log_std to keep std positive and bounded
+
+    Add an instance of ActorNetwork to ReinforcementLearningTrader:
+    python
+
+    self.actor = ActorNetwork(self.feature_dim, self.num_assets).to(self.device)
+    self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
+
+    In decide():
+
+        Compute features from featurize_state(state)
+
+        Forward through self.actor to get mu, log_std
+
+        Sample raw_action ~ Normal(mu, std)
+
+        Apply tanh to get action = tanh(raw_action) in [-1, +1]
+
+        Store:
+
+            self.last_action = action.detach()
+
+            self.last_log_prob (for policy gradient)
+
+        Return the continuous action vector instead of a discrete index
+
+3. Adapt the critic to actor–critic
+
+You currently have a C51 dueling network with discrete actions.
+
+Refactor it into a state–value critic:
+
+    Modify the C51 network to output V(s) instead of Q(s, a):
+
+        Remove the action dimension
+
+        Output a distribution over returns for each state only
+
+    Update the RL training loop:
+
+        Use the C51 critic as a value estimator:
+
+            V(s) from the distribution (e.g., expectation over atoms)
+
+        Use the actor to generate actions
+
+        Use TD targets with C51 for value loss
+
+    Policy loss:
+
+        For each sampled transition:
+
+            Compute V(s) and V(s')
+
+            Compute advantage A ≈ r + γ V(s') − V(s)
+
+            Policy loss: L_actor = -E[ A * log_prob(action | s) ]
+
+        Backprop through self.actor only
+
+    Keep all existing C51 machinery (atoms, support, projection) but treat it as a V(s) critic, not Q(s, a).
+
+4. Wire the continuous action vector into the broker
+
+In broker.py:
+
+    Replace the single‑asset execute_exposure(agent, price, microstructure_fn) with a multi‑asset version:
+    python
+
+    def execute_portfolio_exposure(self, agent, prices: Dict[str, float], microstructure_fn):
+        # agent.target_exposures: Dict[asset, target_exposure in [-1, +1]]
+
+    For each asset in agent.assets:
+
+        Read current_exposure = agent.positions[asset] (you’ll need a per‑asset dict)
+
+        Read target_exposure = agent.target_exposures[asset]
+
+        Compute delta = target_exposure - current_exposure
+
+        Apply the same ramp logic you already use (dead‑band + max_steps)
+
+        Determine side "buy" or "sell" from the sign of delta
+
+        Call microstructure_fn(price, side, delta_exposure) per asset
+
+        Update:
+
+            agent.positions[asset] (clamped to [-1, +1])
+
+            agent.balance and agent.realized_pnl with txn_cost
+
+    Return the sum of transaction costs across all assets so the simulation can subtract it from reward.
+
+5. Track per‑asset exposures and portfolio PnL
+
+In trader_agent.py and/or simulation.py:
+
+    Replace single position with:
+    python
+
+    self.positions = {a: 0.0 for a in self.assets}  # exposures per asset
+
+    Unrealized PnL:
+    python
+
+    self.unrealized_pnl = sum(
+        self.positions[a] * current_prices[a]
+        for a in self.assets
+    )
+
+    Equity:
+    python
+
+    equity = self.balance + self.unrealized_pnl
+
+    Make sure all logging/printing uses portfolio‑level equity and PnL.
+
+6. Update the simulation to use portfolio reward
+
+In simulation.py:
+
+    When computing reward for the RL agent:
+
+        Use portfolio return:
+        python
+
+        step_return = (equity_t - equity_{t-1}) / max(equity_{t-1}, 1e-6)
+
+        Subtract:
+
+            transaction costs (sum across assets)
+
+            turnover penalty (sum of |Δexposure| across assets)
+
+            optional volatility/drawdown penalties (already present)
+
+    Keep the reward scalar, but make it reflect portfolio‑level performance, not just SOL.
+
+7. Sanity checks
+
+After implementing:
+
+    Confirm the header prints something like:
+    C51 63feat×(5-asset actor)×51atoms
+
+    Confirm:
+
+        No NaNs
+
+        No crashes
+
+        positions is a dict with 5 entries in [-1, +1]
+
+        balance and realized_pnl move when exposures change
+
+        unrealized_pnl reflects all assets
+
+        Reward tracks portfolio equity changes, not just one asset

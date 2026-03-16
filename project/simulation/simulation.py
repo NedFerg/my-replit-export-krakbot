@@ -494,25 +494,44 @@ class Simulation:
             # --- End-of-step settlement via broker -----------------------
             self.broker.fill_resting_orders(price)
 
-            # --- RL agent: ramp exposure toward target -------------------
+            # --- RL agent: ramp portfolio exposures toward targets --------
             # Store the current state so apply_microstructure() can read
             # state.equity_vol / pressure / rolling_vol via self.current_state.
             self.current_state = state
 
-            # execute_exposure() returns the transaction cost it charged so
-            # the reward calculation can subtract it in the same step.
+            # execute_portfolio_exposure() returns total txn cost across all
+            # assets so the simulation can subtract it from the reward.
             rl_txn_costs = {}
             for agent in self.agents:
                 if isinstance(agent, ReinforcementLearningTrader):
-                    cost = self.broker.execute_exposure(
-                        agent, price, self.apply_microstructure
+                    # Build per-asset price dict from the simulation's buffers.
+                    # SOL uses the current tick price; others use the most recent
+                    # synthetic price appended earlier this step.
+                    _asset_prices = {
+                        a: (self.asset_prices[a][-1] if self.asset_prices[a] else 100.0)
+                        for a in agent.assets
+                    }
+                    cost = self.broker.execute_portfolio_exposure(
+                        agent, _asset_prices, self.apply_microstructure
                     )
                     rl_txn_costs[agent] = cost
 
-            # --- Tracking + Q-learning update ----------------------------
+            # --- Tracking + actor-critic update --------------------------
             for agent in self.agents:
                 agent.update_last_price(state.mid_price)
-                agent.update_unrealized_pnl(price)
+
+                if isinstance(agent, ReinforcementLearningTrader):
+                    # Portfolio unrealized PnL: sum exposure × price per asset.
+                    _apx = {
+                        a: (self.asset_prices[a][-1] if self.asset_prices[a] else 100.0)
+                        for a in agent.assets
+                    }
+                    agent.unrealized_pnl = sum(
+                        agent.positions[a] * _apx[a] for a in agent.assets
+                    )
+                else:
+                    agent.update_unrealized_pnl(price)
+
                 agent.record_equity()
 
                 if isinstance(agent, ReinforcementLearningTrader):
@@ -549,18 +568,17 @@ class Simulation:
                         state.equity_vol = 0.0
 
                     if agent.prev_state is not None:
-                        # Risk-aware reward: raw PnL minus drawdown,
-                        # equity-volatility, and transaction-cost penalties.
-                        # Coefficients (0.1, 0.05) are tunable starting points.
-                        pnl_reward = new_equity - agent.prev_equity
+                        # Portfolio reward: equity change minus risk penalties
+                        # and total portfolio transaction costs.
+                        pnl_reward    = new_equity - agent.prev_equity
                         step_txn_cost = rl_txn_costs.get(agent, 0.0)
                         reward = (
                             pnl_reward
-                            - 0.1 * state.drawdown
+                            - 0.1  * state.drawdown
                             - 0.05 * state.equity_vol
                             - step_txn_cost
                         )
-                        # Store in replay buffer then learn from a random batch
+                        # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)
                         agent.add_experience(
                             agent.prev_state,
@@ -571,7 +589,17 @@ class Simulation:
                         )
                         agent.replay()
 
-                    agent.prev_state = new_encoded
+                        # --- Actor: online one-step advantage update ------
+                        # Resamples a fresh action on prev_state to get a
+                        # valid computation graph anchored in the current
+                        # (just-updated) actor parameters.
+                        agent.update_actor(
+                            agent.prev_state,
+                            reward,
+                            new_encoded,
+                        )
+
+                    agent.prev_state  = new_encoded
                     agent.prev_action = step_actions[agent]
                     agent.prev_equity = new_equity
 
