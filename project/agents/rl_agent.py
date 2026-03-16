@@ -190,7 +190,7 @@ class ReinforcementLearningTrader(TraderAgent):
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
-    FEATURE_DIM = 63   # 16 SOL-only + 40 cross-asset (8×5) + 7 crypto-regime
+    FEATURE_DIM = 64   # 16 SOL-only + 40 cross-asset (8×5) + 7 crypto-regime + 1 macro_regime
 
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
@@ -198,16 +198,34 @@ class ReinforcementLearningTrader(TraderAgent):
         self.feature_dim = self.FEATURE_DIM
 
         # Multi-asset portfolio -------------------------------------------
-        self.assets    = list(self.PORTFOLIO_ASSETS)
+        self.assets     = list(self.PORTFOLIO_ASSETS)
         self.num_assets = len(self.assets)
 
         # Per-asset current exposures (floats in [-1, +1]).
         # self.position (from TraderAgent) is kept in sync with SOL.
-        self.positions       = {a: 0.0 for a in self.assets}
+        self.positions        = {a: 0.0 for a in self.assets}
         self.target_exposures = {a: 0.0 for a in self.assets}
 
         # Legacy single-asset compatibility (SOL):
         self.target_exposure = 0.0   # kept in sync with target_exposures["SOL"]
+
+        # Per-asset exposure caps — reflect the desired risk weighting:
+        # SOL > XRP > LINK > ETH > BTC (SOL is the highest-conviction asset;
+        # BTC is treated as a hedge so its max short is also the smallest).
+        self.max_long = {
+            "SOL":  1.0,
+            "XRP":  0.8,
+            "LINK": 0.7,
+            "ETH":  0.6,
+            "BTC":  0.3,
+        }
+        self.max_short = {
+            "SOL":  -0.5,
+            "XRP":  -0.4,
+            "LINK": -0.4,
+            "ETH":  -0.3,
+            "BTC":  -0.2,
+        }
 
         # ---------------------------------------------------------------
         # C51 distributional RL hyper-parameters
@@ -439,6 +457,11 @@ class ReinforcementLearningTrader(TraderAgent):
             getattr(market_state, "vol_regime",       0.0),
             getattr(market_state, "liq_regime",       0.0) / 1000.0,
         ])
+
+        # Feature 64: macro_regime flag — +1 bull, 0 neutral, -1 bear.
+        # Lets the network learn different behaviour under different
+        # macro stances without re-training from scratch each time.
+        features.append(float(getattr(market_state, "macro_regime", 0)))
 
         return tuple(features)
 

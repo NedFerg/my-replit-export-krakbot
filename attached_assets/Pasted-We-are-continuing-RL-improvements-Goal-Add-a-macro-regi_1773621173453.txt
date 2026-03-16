@@ -1,0 +1,186 @@
+We are continuing RL improvements.
+
+Goal:
+
+    Add a macro_regime flag that I can set manually:
+
+        +1 = bull, 0 = neutral, -1 = bear
+
+    Add per‑asset exposure caps to reflect my desired weighting:
+
+        SOL > XRP > LINK > ETH > BTC
+
+    Make the reward regime‑aware (bull vs bear vs neutral)
+
+    Add a macro feedback module that compares macro_regime to market signals and logs messages like:
+
+        "Signals conflict with your macro call (bull vs stress)."
+
+All RL core logic (C51 critic, actor, replay, microstructure, etc.) stays in place.
+1. Add macro_regime to the simulation
+
+In simulation.py, inside __init__, add:
+python
+
+# --- Macro regime flag (set externally or via config) ---
+# +1 = bull, 0 = neutral, -1 = bear
+self.macro_regime = 0
+
+For now, you can keep it constant or read it from a simple config; later it can be wired to a CLI flag or external input.
+
+Before returning the state each step, attach it:
+python
+
+setattr(state, "macro_regime", self.macro_regime)
+
+2. Add macro_regime to featurize_state
+
+In rl_agent.py, at the end of featurize_state, append:
+python
+
+features.append(getattr(state, "macro_regime", 0.0))
+
+Increase FEATURE_DIM by +1 accordingly.
+3. Add per‑asset exposure caps
+
+In the trader or broker layer (where positions/target_exposures are handled), define caps that reflect priority:
+python
+
+self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC"]
+
+self.max_long = {
+    "SOL": 1.0,
+    "XRP": 0.8,
+    "LINK": 0.7,
+    "ETH": 0.6,
+    "BTC": 0.3,
+}
+
+self.max_short = {
+    "SOL": -0.5,
+    "XRP": -0.4,
+    "LINK": -0.4,
+    "ETH": -0.3,
+    "BTC": -0.2,
+}
+
+In broker.execute_portfolio_exposure (or equivalent), after computing target_exposure per asset, clamp:
+python
+
+cap_long = self.max_long[asset]
+cap_short = self.max_short[asset]
+target_exposure = max(cap_short, min(cap_long, target_exposure))
+
+Also ensure positions[asset] is clamped to the same range after updates.
+4. Make reward regime‑aware
+
+In simulation.py, where you compute the RL reward (portfolio return minus costs/penalties), modify it to depend on macro_regime, altseason_index, vol_regime, and turnover.
+
+Assume you already have:
+
+    step_return (portfolio return)
+
+    txn_cost (sum across assets)
+
+    turnover (sum of |Δexposure| across assets)
+
+    state.altseason_index, state.vol_regime, state.liq_regime, state.macro_regime
+
+Add something like:
+python
+
+macro = self.macro_regime
+alt = getattr(state, "altseason_index", 0.0)
+vol = getattr(state, "vol_regime", 0.0)
+
+base_reward = step_return - txn_cost
+
+# Regime-aware turnover penalty
+if macro > 0:
+    turnover_penalty = 0.001 * turnover  # looser in bull
+elif macro < 0:
+    turnover_penalty = 0.005 * turnover  # tighter in bear
+else:
+    turnover_penalty = 0.003 * turnover
+
+# Extra upside weight in bull + strong downside penalty in bear
+if macro > 0:
+    # reward upside more when altseason is strong
+    reward = base_reward * (1.0 + 0.5 * alt) - turnover_penalty
+elif macro < 0:
+    # penalize negative returns more when vol is high
+    downside = min(step_return, 0.0)
+    reward = base_reward - 2.0 * abs(downside) * (1.0 + 5.0 * vol) - turnover_penalty
+else:
+    reward = base_reward - turnover_penalty
+
+Use your judgment to tune the coefficients; the key is:
+
+    Bull: encourage upside capture, lighter turnover penalty
+
+    Bear: heavily penalize drawdowns and churn
+
+    Neutral: middle ground
+
+5. Add a macro feedback module
+
+In simulation.py, after computing regime features (btc_dominance, altseason_index, vol_regime, liq_regime) and knowing self.macro_regime, add a simple diagnostic block that logs human‑readable feedback.
+
+At the top of simulation.py, add a list to store messages:
+python
+
+self.macro_messages = []
+
+Then each step, after regime computation:
+python
+
+macro = self.macro_regime
+alt = self.altseason_index
+vol = self.vol_regime
+liq = self.liq_regime
+btc_dom = self.btc_dominance
+
+message = None
+
+# Example conflict conditions
+if macro > 0:
+    # You say bull, but signals look stressed
+    if vol > VOL_HIGH_THRESHOLD and alt < ALT_LOW_THRESHOLD and btc_dom_rising_condition:
+        message = "Signals conflict with your macro call: bull vs stress (high vol, weak alts, rising BTC dominance)."
+elif macro < 0:
+    # You say bear, but signals look risk-on
+    if vol < VOL_LOW_THRESHOLD and alt > ALT_HIGH_THRESHOLD and btc_dom_falling_condition:
+        message = "Signals conflict with your macro call: bear vs risk-on (low vol, strong alts, falling BTC dominance)."
+
+if message:
+    self.macro_messages.append(message)
+    print(message)
+
+Define simple thresholds near the top of the file:
+python
+
+VOL_HIGH_THRESHOLD = 0.02   # example, tune based on your vol scale
+VOL_LOW_THRESHOLD  = 0.005
+ALT_HIGH_THRESHOLD = 0.6
+ALT_LOW_THRESHOLD  = 0.2
+
+And simple BTC dominance conditions, e.g.:
+python
+
+btc_dom_rising_condition = self.btc_dominance > 0.5
+btc_dom_falling_condition = self.btc_dominance < 0.4
+
+The exact numbers can be tuned; the important part is:
+
+    When your macro flag and the signals disagree, a clear message is printed and stored.
+
+6. Optional: expose macro messages in main.py
+
+In main.py, after each episode or at intervals, you can print the last few macro messages:
+python
+
+if hasattr(simulation, "macro_messages") and simulation.macro_messages:
+    print("Macro feedback (last few):")
+    for msg in simulation.macro_messages[-5:]:
+        print("  -", msg)
+

@@ -218,6 +218,10 @@ def main():
             )
             print(f"  {a.name:<18} equity: {eq:>10.2f}{tag}")
         print_risk_summary(risk_manager)
+        if hasattr(sim, "macro_messages") and sim.macro_messages:
+            print(f"  Macro feedback ({len(sim.macro_messages)} alert(s) this episode):")
+            for msg in sim.macro_messages[-5:]:
+                print(f"    - {msg}")
         print()
 
     # ---------------------------------------------------------------------------

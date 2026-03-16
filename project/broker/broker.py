@@ -100,8 +100,12 @@ class SimulatedBroker(Broker):
                 continue
 
             current = agent.positions[a]
-            target  = agent.target_exposures[a]
-            delta   = target - current
+            # Clamp the actor's raw target to the agent's per-asset exposure caps
+            # before computing the delta so the broker never executes beyond them.
+            cap_long  = agent.max_long.get(a,  1.0)
+            cap_short = agent.max_short.get(a, -1.0)
+            target = max(cap_short, min(cap_long, agent.target_exposures[a]))
+            delta  = target - current
 
             if abs(delta) < 0.05:
                 continue
@@ -117,9 +121,9 @@ class SimulatedBroker(Broker):
                 txn_cost = 0.0
 
             if delta > 0:
-                agent.positions[a] = min(1.0, current + change)
+                agent.positions[a] = min(cap_long,  current + change)
             else:
-                agent.positions[a] = max(-1.0, current - change)
+                agent.positions[a] = max(cap_short, current - change)
 
             agent.balance      -= txn_cost
             agent.realized_pnl -= txn_cost

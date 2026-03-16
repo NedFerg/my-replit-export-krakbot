@@ -4,6 +4,14 @@ import random
 
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Macro feedback thresholds (tune these to match your vol/alt scale)
+# ---------------------------------------------------------------------------
+VOL_HIGH_THRESHOLD = 0.02   # vol_regime above this is "stressed"
+VOL_LOW_THRESHOLD  = 0.005  # vol_regime below this is "calm"
+ALT_HIGH_THRESHOLD = 0.6    # altseason_index above this is "risk-on"
+ALT_LOW_THRESHOLD  = 0.2    # altseason_index below this is "risk-off"
+
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
@@ -144,6 +152,15 @@ class Simulation:
         self.altseason_index  = 0.0   # composite altcoin momentum signal
         self.vol_regime       = 0.0   # cross-market realized volatility
         self.liq_regime       = 0.0   # cross-market average rolling volume
+
+        # --- Macro regime flag (set externally or via config) -------------
+        # +1 = bull, 0 = neutral, -1 = bear
+        # Can be changed between episodes or during a run from main.py.
+        self.macro_regime = 0
+
+        # --- Macro feedback message log -----------------------------------
+        # Populated each step when macro flag conflicts with market signals.
+        self.macro_messages = []
 
     # ------------------------------------------------------------------
     # Microstructure helper
@@ -460,6 +477,37 @@ class Simulation:
             state.altseason_index  = self.altseason_index
             state.vol_regime       = self.vol_regime
             state.liq_regime       = self.liq_regime
+            state.macro_regime     = self.macro_regime
+
+            # --- Macro feedback: detect signal / macro conflicts ----------
+            _mac = self.macro_regime
+            _alt = self.altseason_index
+            _vol = self.vol_regime
+            _btc = self.btc_dominance
+            _btc_rising  = _btc > 0.5
+            _btc_falling = _btc < 0.4
+            _msg = None
+            if _mac > 0:
+                # You say bull, but signals look stressed
+                if (_vol > VOL_HIGH_THRESHOLD
+                        and _alt < ALT_LOW_THRESHOLD
+                        and _btc_rising):
+                    _msg = (
+                        "Signals conflict with your macro call: bull vs stress "
+                        "(high vol, weak alts, rising BTC dominance)."
+                    )
+            elif _mac < 0:
+                # You say bear, but signals look risk-on
+                if (_vol < VOL_LOW_THRESHOLD
+                        and _alt > ALT_HIGH_THRESHOLD
+                        and _btc_falling):
+                    _msg = (
+                        "Signals conflict with your macro call: bear vs risk-on "
+                        "(low vol, strong alts, falling BTC dominance)."
+                    )
+            if _msg:
+                self.macro_messages.append(_msg)
+                print(f"[MacroFeedback] {_msg}")
 
             # --- Deliver queued orders that are due ----------------------
             # Use the *current* state for the risk check so a delayed order
@@ -501,12 +549,17 @@ class Simulation:
 
             # execute_portfolio_exposure() returns total txn cost across all
             # assets so the simulation can subtract it from the reward.
-            rl_txn_costs = {}
+            rl_txn_costs    = {}
+            rl_turnovers    = {}
             for agent in self.agents:
                 if isinstance(agent, ReinforcementLearningTrader):
+                    # Turnover = Σ |target − current| before the broker ramps.
+                    # Computed here so exposure-change caps don't hide it.
+                    rl_turnovers[agent] = sum(
+                        abs(agent.target_exposures[a] - agent.positions[a])
+                        for a in agent.assets
+                    )
                     # Build per-asset price dict from the simulation's buffers.
-                    # SOL uses the current tick price; others use the most recent
-                    # synthetic price appended earlier this step.
                     _asset_prices = {
                         a: (self.asset_prices[a][-1] if self.asset_prices[a] else 100.0)
                         for a in agent.assets
@@ -568,16 +621,37 @@ class Simulation:
                         state.equity_vol = 0.0
 
                     if agent.prev_state is not None:
-                        # Portfolio reward: equity change minus risk penalties
-                        # and total portfolio transaction costs.
+                        # --- Regime-aware portfolio reward ----------------
                         pnl_reward    = new_equity - agent.prev_equity
                         step_txn_cost = rl_txn_costs.get(agent, 0.0)
-                        reward = (
-                            pnl_reward
-                            - 0.1  * state.drawdown
-                            - 0.05 * state.equity_vol
-                            - step_txn_cost
-                        )
+                        turnover      = rl_turnovers.get(agent, 0.0)
+
+                        # Risk adjustments that apply regardless of regime
+                        risk_adj   = 0.1 * state.drawdown + 0.05 * state.equity_vol
+                        step_return = pnl_reward - risk_adj
+                        base_reward = step_return - step_txn_cost
+
+                        macro = self.macro_regime
+                        alt   = getattr(state, "altseason_index", 0.0)
+                        vol   = getattr(state, "vol_regime", 0.0)
+
+                        if macro > 0:
+                            # Bull: encourage upside capture, light turnover penalty
+                            turnover_penalty = 0.001 * turnover
+                            reward = base_reward * (1.0 + 0.5 * alt) - turnover_penalty
+                        elif macro < 0:
+                            # Bear: heavily penalize drawdowns and churn
+                            turnover_penalty = 0.005 * turnover
+                            downside = min(pnl_reward, 0.0)
+                            reward = (
+                                base_reward
+                                - 2.0 * abs(downside) * (1.0 + 5.0 * vol)
+                                - turnover_penalty
+                            )
+                        else:
+                            # Neutral: balanced middle ground
+                            turnover_penalty = 0.003 * turnover
+                            reward = base_reward - turnover_penalty
                         # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)
                         agent.add_experience(
