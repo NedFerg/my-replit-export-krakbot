@@ -181,16 +181,16 @@ class ActorNetwork(nn.Module):
 class ReinforcementLearningTrader(TraderAgent):
     IS_RL_AGENT = True   # tells the exchange not to mutate self.position
 
-    # Assets the portfolio covers.  SOL is the only one that was previously
-    # traded; all five now have continuous exposure targets in [-1, +1].
-    PORTFOLIO_ASSETS = ["SOL", "XRP", "LINK", "ETH", "BTC"]
+    # Assets the portfolio covers — 8 total.  BTC and ETH are anchors/hedges;
+    # all 8 have continuous exposure targets in [-1, +1].
+    PORTFOLIO_ASSETS = ["SOL", "XRP", "LINK", "ETH", "BTC", "XLM", "HBAR", "AVAX"]
 
     # Reward shaping coefficients — class-level for easy tuning
     INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of mean abs portfolio exposure
 
     # Number of features produced by featurize_state().
     # Must match the length of the tuple featurize_state() returns.
-    FEATURE_DIM = 64   # 16 SOL-only + 40 cross-asset (8×5) + 7 crypto-regime + 1 macro_regime
+    FEATURE_DIM = 88   # 16 SOL-only + 64 cross-asset (8×8) + 7 crypto-regime + 1 macro_regime
 
     def __init__(self, name, balance, latency=2):
         super().__init__(name, balance, latency)
@@ -218,6 +218,9 @@ class ReinforcementLearningTrader(TraderAgent):
             "LINK": 0.7,
             "ETH":  0.6,
             "BTC":  0.3,
+            "XLM":  0.6,
+            "HBAR": 0.6,
+            "AVAX": 0.7,
         }
         self.max_short = {
             "SOL":  -0.5,
@@ -225,6 +228,9 @@ class ReinforcementLearningTrader(TraderAgent):
             "LINK": -0.4,
             "ETH":  -0.3,
             "BTC":  -0.2,
+            "XLM":  -0.3,
+            "HBAR": -0.3,
+            "AVAX": -0.4,
         }
 
         # ---------------------------------------------------------------
@@ -388,7 +394,7 @@ class ReinforcementLearningTrader(TraderAgent):
         O. vol_imbalance – buy−sell volume, normalised /1000, clipped ±1.
         P. pressure      – vol_imbalance / total_volume, in (−1, +1).
 
-        Cross-asset features (40 = 8 × 5 assets: SOL, XRP, LINK, ETH, BTC)
+        Cross-asset features (64 = 8 × 8 assets: SOL, XRP, LINK, ETH, BTC, XLM, HBAR, AVAX)
         -----------------------------------------------------------------------
         Per asset: price/1000, vol, mom_5/100, mom_20/100, mom_50/100,
                    rolling_vol/1000, vol_imbalance/1000, pressure.
@@ -436,7 +442,7 @@ class ReinforcementLearningTrader(TraderAgent):
             rolling_vol, vol_imbalance, pressure,
         ]
 
-        for a in ["SOL", "XRP", "LINK", "ETH", "BTC"]:
+        for a in ["SOL", "XRP", "LINK", "ETH", "BTC", "XLM", "HBAR", "AVAX"]:
             features.extend([
                 getattr(market_state, f"{a}_price",        0.0) / 1000.0,
                 getattr(market_state, f"{a}_vol",          0.0),
@@ -506,7 +512,7 @@ class ReinforcementLearningTrader(TraderAgent):
         Sample a continuous portfolio action from the actor.
 
         Returns a tensor of shape (num_assets,) with target exposures in
-        [-1, +1] for [SOL, XRP, LINK, ETH, BTC].
+        [-1, +1] for [SOL, XRP, LINK, ETH, BTC, XLM, HBAR, AVAX].
 
         Sets self.target_exposures (dict) and self.last_log_prob for the
         subsequent actor update.

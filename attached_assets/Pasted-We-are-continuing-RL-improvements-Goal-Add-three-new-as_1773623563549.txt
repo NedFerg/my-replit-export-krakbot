@@ -1,0 +1,100 @@
+We are continuing RL improvements.
+
+Goal:  
+Add three new assets to the system:
+
+    XLM, HBAR, AVAX
+
+and wire them into:
+
+    asset universe (prices, positions)
+
+    dynamic caps
+
+    rotation engine
+
+    reward tilt (light)
+
+    actor action space
+
+BTC remains the main anchor, ETH secondary.
+All RL core logic (C51 critic, actor, replay, microstructure) stays conceptually the same, but the action dimension increases.
+1. Extend the asset universe
+
+In simulation.py (or wherever assets are defined):
+python
+
+self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC", "XLM", "HBAR", "AVAX"]
+
+Initialize prices and positions for the new assets the same way as existing ones:
+python
+
+self.positions = {a: 0.0 for a in self.assets}
+self.asset_prices = {a: [] for a in self.assets}
+
+Make sure you append xlm_price, hbar_price, avax_price into asset_prices["XLM"], etc., each step (mirroring SOL/XRP/LINK/ETH/BTC).
+2. Extend base caps and dynamic caps
+
+In the dynamic caps block:
+python
+
+base_caps = {
+    "SOL": 1.0,
+    "XRP": 0.8,
+    "LINK": 0.7,
+    "ETH": 0.6,
+    "BTC": 0.3,
+    "XLM": 0.6,
+    "HBAR": 0.6,
+    "AVAX": 0.7,
+}
+
+The rest of the dynamic cap logic already loops over self.assets or base_caps—the new assets will automatically inherit regime/top_risk/rotation scaling.
+3. Extend rotation engine to new alts
+
+In the rotation scoring block, change the loop:
+python
+
+for a in ["SOL", "XRP", "LINK", "ETH", "XLM", "HBAR", "AVAX"]:
+    score = 0.0
+    # same scoring logic as existing alts
+    ...
+    self.rotation_score[a] = score
+
+BTC remains excluded from rotation scoring (anchor only).
+
+Feedback loop:
+python
+
+for a in ["SOL", "XRP", "LINK", "ETH", "XLM", "HBAR", "AVAX"]:
+    ...
+
+4. Actor action space: increase dimension
+
+In rl_agent.py, wherever the action dimension is defined (e.g. ACTION_DIM = 5), update:
+python
+
+ACTION_DIM = 8  # SOL, XRP, LINK, ETH, BTC, XLM, HBAR, AVAX
+
+Update the actor network output layer to produce 8 values instead of 5.
+
+Where you map actions to assets (e.g. in decide() or when building target_exposures), ensure the order matches:
+python
+
+self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC", "XLM", "HBAR", "AVAX"]
+
+for i, asset in enumerate(self.assets):
+    target_exposures[asset] = action_vector[i]
+
+5. Broker: loop over all assets
+
+In broker.execute_portfolio_exposure, ensure it loops over simulation.assets or agent.assets so XLM/HBAR/AVAX are included automatically:
+python
+
+for asset in simulation.assets:
+    ...
+
+Dynamic caps and position clamping already work per asset; no special‑case logic needed.
+6. Optional: display / logging
+
+In main.py, if you print per‑asset positions or PnL, extend the display to include XLM, HBAR, AVAX in the same order.

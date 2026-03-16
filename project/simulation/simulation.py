@@ -126,10 +126,11 @@ class Simulation:
         # Populated in run() so apply_microstructure() can read it.
         self.current_state = None
 
-        # --- Multi-asset support (observation only) -----------------------
-        # The RL agent trades SOL exclusively; the other four assets are
-        # included in the state vector to give the agent cross-asset context.
-        self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC"]
+        # --- Multi-asset universe ------------------------------------------
+        # 8 assets: SOL is the primary agent-traded asset; the rest are
+        # traded by the RL portfolio and also feed cross-asset state features.
+        # BTC and ETH are anchor/benchmark assets for the rotation engine.
+        self.assets = ["SOL", "XRP", "LINK", "ETH", "BTC", "XLM", "HBAR", "AVAX"]
 
         self.asset_prices             = {a: [] for a in self.assets}
         self.asset_returns            = {a: [] for a in self.assets}
@@ -356,10 +357,10 @@ class Simulation:
             self.asset_prices["SOL"].append(price)
 
             # Non-SOL assets: generate correlated synthetic prices.
-            # Ordering matters: BTC first → ETH follows BTC → LINK & XRP
-            # follow ETH.  This ensures same-step correlation references are
-            # always populated before they are read.
-            for a in ["BTC", "ETH", "LINK", "XRP"]:
+            # Ordering matters: BTC first → ETH follows BTC → LINK, XRP,
+            # XLM, HBAR, AVAX follow ETH.  Same-step references are always
+            # populated before they are read.
+            for a in ["BTC", "ETH", "LINK", "XRP", "XLM", "HBAR", "AVAX"]:
                 prev_a = self.asset_prices[a][-1] if self.asset_prices[a] else 100.0
                 if a == "BTC":
                     a_drift = random.uniform(-0.002, 0.002)
@@ -434,18 +435,25 @@ class Simulation:
             # guard with a short-circuit so step-1 stays safe.
             if all(self.asset_prices[a] for a in self.assets):
                 _btc = self.asset_prices["BTC"][-1]
-                _eth = self.asset_prices["ETH"][-1]
-                _sol = self.asset_prices["SOL"][-1]
-                _xrp = self.asset_prices["XRP"][-1]
-                _lnk = self.asset_prices["LINK"][-1]
+                _eth  = self.asset_prices["ETH"][-1]
+                _sol  = self.asset_prices["SOL"][-1]
+                _xrp  = self.asset_prices["XRP"][-1]
+                _lnk  = self.asset_prices["LINK"][-1]
+                _xlm  = self.asset_prices["XLM"][-1]
+                _hbar = self.asset_prices["HBAR"][-1]
+                _avax = self.asset_prices["AVAX"][-1]
 
                 # --- BTC dominance (synthetic market caps) ----------------
-                _btc_mc  = _btc * 19_000_000
-                _eth_mc  = _eth * 120_000_000
-                _sol_mc  = _sol * 440_000_000
-                _xrp_mc  = _xrp * 50_000_000_000
-                _lnk_mc  = _lnk * 587_000_000
-                _total_mc = _btc_mc + _eth_mc + _sol_mc + _xrp_mc + _lnk_mc
+                _btc_mc  = _btc  * 19_000_000
+                _eth_mc  = _eth  * 120_000_000
+                _sol_mc  = _sol  * 440_000_000
+                _xrp_mc  = _xrp  * 50_000_000_000
+                _lnk_mc  = _lnk  * 587_000_000
+                _xlm_mc  = _xlm  * 25_000_000_000
+                _hbar_mc = _hbar * 35_000_000_000
+                _avax_mc = _avax * 350_000_000
+                _total_mc = (_btc_mc + _eth_mc + _sol_mc + _xrp_mc
+                             + _lnk_mc + _xlm_mc + _hbar_mc + _avax_mc)
                 self.btc_dominance = _btc_mc / _total_mc if _total_mc > 0 else 0.0
 
                 # --- Cross-asset ratios -----------------------------------
@@ -457,24 +465,27 @@ class Simulation:
                 # Component 1: ETH/BTC ratio (already computed above)
                 _eth_vs_btc = self.eth_btc_ratio
 
-                # Component 2: altcoin volume share (SOL + XRP + LINK)
+                # Component 2: altcoin volume share (all non-BTC, non-ETH alts)
                 # Use most-recent step volume from volume history; default 0.
-                _bvol = self.asset_volume_history["BTC"][-1]  if self.asset_volume_history["BTC"]  else 0.0
-                _evol = self.asset_volume_history["ETH"][-1]  if self.asset_volume_history["ETH"]  else 0.0
-                _svol = self.asset_volume_history["SOL"][-1]  if self.asset_volume_history["SOL"]  else 0.0
-                _xvol = self.asset_volume_history["XRP"][-1]  if self.asset_volume_history["XRP"]  else 0.0
-                _lvol = self.asset_volume_history["LINK"][-1] if self.asset_volume_history["LINK"] else 0.0
-                _total_vol = _bvol + _evol + _svol + _xvol + _lvol
-                _alt_vol   = _svol + _xvol + _lvol
+                _bvol  = self.asset_volume_history["BTC"][-1]  if self.asset_volume_history["BTC"]  else 0.0
+                _evol  = self.asset_volume_history["ETH"][-1]  if self.asset_volume_history["ETH"]  else 0.0
+                _svol  = self.asset_volume_history["SOL"][-1]  if self.asset_volume_history["SOL"]  else 0.0
+                _xvol  = self.asset_volume_history["XRP"][-1]  if self.asset_volume_history["XRP"]  else 0.0
+                _lvol  = self.asset_volume_history["LINK"][-1] if self.asset_volume_history["LINK"] else 0.0
+                _xlvol = self.asset_volume_history["XLM"][-1]  if self.asset_volume_history["XLM"]  else 0.0
+                _hvol  = self.asset_volume_history["HBAR"][-1] if self.asset_volume_history["HBAR"] else 0.0
+                _avvol = self.asset_volume_history["AVAX"][-1] if self.asset_volume_history["AVAX"] else 0.0
+                _total_vol = _bvol + _evol + _svol + _xvol + _lvol + _xlvol + _hvol + _avvol
+                _alt_vol   = _svol + _xvol + _lvol + _xlvol + _hvol + _avvol
                 _alt_vol_share = _alt_vol / _total_vol if _total_vol > 0 else 0.0
 
                 # Component 3: fraction of alts beating BTC this step
                 _btc_ret = self.asset_returns["BTC"][-1] if self.asset_returns["BTC"] else 0.0
                 _alts_outperform = sum(
-                    1 for a in ["SOL", "XRP", "LINK", "ETH"]
+                    1 for a in ["SOL", "XRP", "LINK", "ETH", "XLM", "HBAR", "AVAX"]
                     if self.asset_returns[a] and self.asset_returns[a][-1] > _btc_ret
                 )
-                _alts_outperform_norm = _alts_outperform / 4
+                _alts_outperform_norm = _alts_outperform / 7
 
                 self.altseason_index = (
                     0.4 * _eth_vs_btc
@@ -539,9 +550,9 @@ class Simulation:
             state.internal_regime  = self.internal_regime
 
             # --- Multi-asset rotation engine ------------------------------
-            # Derives relative strength for SOL, XRP, LINK, ETH vs BTC/ETH
-            # anchors using existing price buffers — no new data sources.
-            _rot_assets = ["SOL", "XRP", "LINK", "ETH"]
+            # Derives relative strength for all alts vs BTC/ETH anchors
+            # using existing price buffers — no new data sources.
+            _rot_assets = ["SOL", "XRP", "LINK", "ETH", "XLM", "HBAR", "AVAX"]
             _btc_prices = self.asset_prices["BTC"]
             _eth_prices = self.asset_prices["ETH"]
 
@@ -639,6 +650,9 @@ class Simulation:
                 "LINK": 0.7,
                 "ETH":  0.6,
                 "BTC":  0.3,
+                "XLM":  0.6,
+                "HBAR": 0.6,
+                "AVAX": 0.7,
             }
             _alt = self.altseason_index
             _vol = self.vol_regime
