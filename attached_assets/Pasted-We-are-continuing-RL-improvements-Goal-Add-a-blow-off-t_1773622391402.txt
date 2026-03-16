@@ -1,0 +1,146 @@
+We are continuing RL improvements.
+
+Goal:  
+Add a blow‑off top detection module that identifies late‑cycle, unsustainable price acceleration and produces a top_risk flag:
+
+    0 = normal
+
+    1 = elevated (early warning)
+
+    2 = blow‑off (de‑risk aggressively)
+
+This module should:
+
+    use existing regime features (no new data sources)
+
+    integrate with AUTO mode
+
+    tighten dynamic caps when top_risk rises
+
+    adjust reward shaping to discourage adding risk into a blow‑off
+
+    generate feedback messages like:
+
+        “Top‑risk rising: early blow‑off conditions detected.”
+
+        “Blow‑off top conditions detected — de‑risking recommended.”
+
+All RL core logic stays unchanged.
+1. Add top_risk flag to simulation
+
+In simulation.py, inside __init__:
+python
+
+# Blow-off top risk flag: 0=normal, 1=warning, 2=blow-off
+self.top_risk = 0
+
+Attach to state before returning:
+python
+
+setattr(state, "top_risk", self.top_risk)
+
+2. Compute blow‑off top risk each step
+
+After regime features and internal_regime are computed, add:
+python
+
+# --- Blow-off top detection ---
+alt = self.altseason_index
+vol = self.vol_regime
+liq = self.liq_regime
+btc_dom = self.btc_dominance
+
+# Scoring components
+score = 0.0
+
+# 1. Extreme altseason → late-cycle rotation
+if alt > 0.7:
+    score += 1.0
+if alt > 0.85:
+    score += 1.0
+
+# 2. Volatility rising while prices are strong → instability
+if vol > 0.015:
+    score += 1.0
+if vol > 0.025:
+    score += 1.0
+
+# 3. Liquidity thinning → exhaustion
+if liq < 0.3:
+    score += 1.0
+
+# 4. BTC dominance falling sharply → alt blow-off
+if btc_dom < 0.40:
+    score += 1.0
+if btc_dom < 0.35:
+    score += 1.0
+
+# Convert score → top_risk
+if score >= 4:
+    self.top_risk = 2   # blow-off
+elif score >= 2:
+    self.top_risk = 1   # early warning
+else:
+    self.top_risk = 0   # normal
+
+Attach to state:
+python
+
+setattr(state, "top_risk", self.top_risk)
+
+3. Integrate top_risk into dynamic caps
+
+In the dynamic caps block, after computing cap, add:
+python
+
+# Tighten caps during blow-off risk
+if self.top_risk == 1:
+    cap *= 0.8  # early warning
+elif self.top_risk == 2:
+    cap *= 0.5  # blow-off → de-risk hard
+
+Then clamp as before.
+4. Integrate top_risk into reward shaping
+
+In the reward section, after computing reward, add:
+python
+
+# Penalize adding risk during blow-off conditions
+if self.top_risk == 1:
+    reward -= 0.5 * turnover  # discourage aggressive repositioning
+elif self.top_risk == 2:
+    reward -= 1.0 * turnover  # strong penalty for adding exposure
+    # Extra penalty for negative returns during blow-off
+    if step_return < 0:
+        reward -= 2.0 * abs(step_return)
+
+This encourages:
+
+    taking profit
+
+    reducing exposure
+
+    avoiding adding size into the blow‑off
+
+5. Add blow‑off feedback messages
+
+In simulation.py, after computing top_risk, add:
+python
+
+if not hasattr(self, "prev_top_risk"):
+    self.prev_top_risk = 0
+
+if self.top_risk != self.prev_top_risk:
+    if self.top_risk == 1:
+        msg = "Top-risk rising: early blow-off conditions detected."
+    elif self.top_risk == 2:
+        msg = "Blow-off top conditions detected — de-risking recommended."
+    else:
+        msg = "Top-risk normalized."
+
+    self.macro_messages.append(msg)
+    print(msg)
+
+self.prev_top_risk = self.top_risk
+
+This prints only on transitions, not every step.

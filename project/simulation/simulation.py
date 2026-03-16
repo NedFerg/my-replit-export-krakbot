@@ -164,6 +164,11 @@ class Simulation:
         self.dynamic_caps      = {}   # asset → current cap
         self.prev_dynamic_caps = {}   # asset → cap from previous step
 
+        # --- Blow-off top risk flag ----------------------------------------
+        # 0 = normal, 1 = early warning, 2 = blow-off (de-risk aggressively)
+        self.top_risk      = 0
+        self.prev_top_risk = 0
+
         # --- Macro feedback message log -----------------------------------
         # Populated each step when manual flag conflicts with signals,
         # or when AUTO mode detects uncertain / mixed conditions.
@@ -528,6 +533,44 @@ class Simulation:
             state.macro_regime     = self.macro_regime
             state.internal_regime  = self.internal_regime
 
+            # --- Blow-off top detection -----------------------------------
+            # Scores late-cycle, unsustainable acceleration using existing
+            # regime features — no new data sources required.
+            _bot_alt    = self.altseason_index
+            _bot_vol    = self.vol_regime
+            _bot_liq    = self.liq_regime
+            _bot_btcdom = self.btc_dominance
+            _bot_score  = 0.0
+
+            if _bot_alt > 0.70:   _bot_score += 1.0   # extreme altseason
+            if _bot_alt > 0.85:   _bot_score += 1.0   # very extreme
+            if _bot_vol > 0.015:  _bot_score += 1.0   # rising vol in strength
+            if _bot_vol > 0.025:  _bot_score += 1.0   # severe instability
+            if _bot_liq < 0.30:   _bot_score += 1.0   # liquidity exhaustion
+            if _bot_btcdom < 0.40: _bot_score += 1.0  # alt blow-off rotation
+            if _bot_btcdom < 0.35: _bot_score += 1.0  # extreme alt dominance
+
+            if _bot_score >= 4:
+                self.top_risk = 2   # blow-off
+            elif _bot_score >= 2:
+                self.top_risk = 1   # early warning
+            else:
+                self.top_risk = 0   # normal
+
+            setattr(state, "top_risk", self.top_risk)
+
+            # Blow-off feedback: print only on transitions
+            if self.top_risk != self.prev_top_risk:
+                if self.top_risk == 1:
+                    _tmsg = "Top-risk rising: early blow-off conditions detected."
+                elif self.top_risk == 2:
+                    _tmsg = "Blow-off top conditions detected — de-risking recommended."
+                else:
+                    _tmsg = "Top-risk normalized."
+                self.macro_messages.append(_tmsg)
+                print(_tmsg)
+            self.prev_top_risk = self.top_risk
+
             # --- Dynamic exposure caps ------------------------------------
             # Per-asset caps that adapt each step to volatility, liquidity,
             # altseason momentum, and the effective macro regime.
@@ -564,6 +607,12 @@ class Simulation:
                         _cap *= 0.7
                     if _liq > 0.5:
                         _cap *= 1.1
+
+                # Tighten caps during blow-off risk (applied before clamp)
+                if self.top_risk == 1:
+                    _cap *= 0.8   # early warning: moderate reduction
+                elif self.top_risk == 2:
+                    _cap *= 0.5   # blow-off: de-risk hard
 
                 # Clamp to [0.1, 1.5 × base]
                 self.dynamic_caps[_asset] = max(0.1, min(1.5 * _base, _cap))
@@ -762,6 +811,16 @@ class Simulation:
                             # Neutral / AUTO-neutral: balanced middle ground
                             turnover_penalty = 0.003 * turnover
                             reward = base_reward - turnover_penalty
+
+                        # --- Blow-off top reward adjustment ---------------
+                        # Discourage adding exposure into blow-off conditions.
+                        if self.top_risk == 1:
+                            reward -= 0.5 * turnover
+                        elif self.top_risk == 2:
+                            reward -= 1.0 * turnover
+                            if step_return < 0:
+                                reward -= 2.0 * abs(step_return)
+
                         # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)
                         agent.add_experience(
