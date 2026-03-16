@@ -1,0 +1,117 @@
+Add these fields inside LiveBroker.__init__:
+python
+
+        # --- Automatic safety limits (first-night harness) ---
+        self.max_notional_per_asset = 50.0      # USD cap per asset
+        self.max_total_notional     = 200.0     # USD cap across all assets
+        self.max_trades_per_hour    = 10        # throttle
+        self.max_daily_loss         = 20.0      # USD loss cap
+
+        self._trade_count_window = []
+        self._starting_equity = None
+
+1. Add a helper to compute notional exposure
+
+Inside LiveBroker:
+python
+
+    def _current_notional(self):
+        """
+        Estimate total notional exposure using live prices.
+        """
+        if not self.live_prices:
+            return 0.0
+
+        total = 0.0
+        for asset, pos in self.spot_positions.items():
+            price = self.live_prices.get(asset)
+            if price:
+                total += abs(pos * price)
+
+        for asset, pos in self.futures_positions.items():
+            price = self.live_prices.get(asset)
+            if price:
+                total += abs(pos * price)
+
+        return total
+
+2. Add a trade‑rate limiter
+python
+
+    def _check_trade_rate(self):
+        """
+        Prevent runaway loops: max trades per hour.
+        """
+        now = time.time()
+        self._trade_count_window = [t for t in self._trade_count_window if now - t < 3600]
+
+        if len(self._trade_count_window) >= self.max_trades_per_hour:
+            self.trigger_kill_switch("Trade rate exceeded")
+            return False
+
+        self._trade_count_window.append(now)
+        return True
+
+3. Add a daily loss guard
+python
+
+    def _check_daily_loss(self):
+        """
+        Compare current equity to starting equity.
+        """
+        if self._starting_equity is None:
+            # Initialize on first call
+            bal = self.live_balances.get("ZUSD")
+            if bal:
+                self._starting_equity = float(bal)
+            return True
+
+        bal = self.live_balances.get("ZUSD")
+        if not bal:
+            return True
+
+        current = float(bal)
+        if current < self._starting_equity - self.max_daily_loss:
+            self.trigger_kill_switch("Daily loss limit exceeded")
+            return False
+
+        return True
+
+4. Add a unified pre‑trade safety gate
+python
+
+    def _pre_trade_safety(self, asset, price, delta_exposure):
+        """
+        Run all safety checks before allowing a live trade.
+        """
+        if not self.check_health():
+            return False
+
+        if not self._check_trade_rate():
+            return False
+
+        # Notional cap per asset
+        if price and abs(delta_exposure * price) > self.max_notional_per_asset:
+            self.trigger_kill_switch(f"Notional cap exceeded for {asset}")
+            return False
+
+        # Total notional cap
+        if self._current_notional() > self.max_total_notional:
+            self.trigger_kill_switch("Total notional cap exceeded")
+            return False
+
+        # Daily loss cap
+        if not self._check_daily_loss():
+            return False
+
+        return True
+
+5. Integrate safety gate into spot execution
+
+Replace the top of _execute_spot_trade with:
+python
+
+        if not self._pre_trade_safety(asset, price, delta_exposure):
+            print(f"[LIVE SPOT BLOCKED SAFETY] {asset} delta={delta_exposure:.4f}")
+            return 0.0
+

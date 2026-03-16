@@ -528,6 +528,15 @@ class LiveBroker(SimulatedBroker):
         self.live_balances  = {}   # raw Kraken balance dict
         self.live_positions = {}   # raw Kraken open-positions dict
 
+        # --- Automatic safety limits (first-night harness) ---------------
+        self.max_notional_per_asset = 50.0    # USD cap per single asset trade
+        self.max_total_notional     = 200.0   # USD cap across all open positions
+        self.max_trades_per_hour    = 10      # rate limiter
+        self.max_daily_loss         = 20.0    # USD drawdown cap from session start
+
+        self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
+        self._starting_equity    = None # ZUSD balance at first trade of the session
+
     # ------------------------------------------------------------------
     # Health / kill-switch
     # ------------------------------------------------------------------
@@ -800,6 +809,105 @@ class LiveBroker(SimulatedBroker):
         }
 
     # ------------------------------------------------------------------
+    # First-night safety harness
+    # ------------------------------------------------------------------
+
+    def _current_notional(self) -> float:
+        """
+        Estimate total USD notional exposure across spot + futures layers.
+        Returns 0.0 if live_prices is not yet populated.
+        """
+        if not self.live_prices:
+            return 0.0
+
+        total = 0.0
+        for asset, pos in self.spot_positions.items():
+            price = self.live_prices.get(asset)
+            if price:
+                total += abs(pos * price)
+        for asset, pos in self.futures_positions.items():
+            price = self.live_prices.get(asset)
+            if price:
+                total += abs(pos * price)
+        return total
+
+    def _check_trade_rate(self) -> bool:
+        """
+        Sliding-window trade-rate limiter (max trades per rolling hour).
+        Appends the current timestamp on success; triggers kill switch on breach.
+        """
+        now = time.time()
+        self._trade_count_window = [t for t in self._trade_count_window
+                                    if now - t < 3600]
+
+        if len(self._trade_count_window) >= self.max_trades_per_hour:
+            self.trigger_kill_switch("Trade rate exceeded — too many trades in 1 h")
+            return False
+
+        self._trade_count_window.append(now)
+        return True
+
+    def _check_daily_loss(self) -> bool:
+        """
+        Compare current ZUSD balance to the session-start balance.
+        Triggers kill switch if the drawdown exceeds max_daily_loss.
+        """
+        bal_str = self.live_balances.get("ZUSD")
+
+        if self._starting_equity is None:
+            # Initialise once on the first call that has a balance available
+            if bal_str:
+                self._starting_equity = float(bal_str)
+            return True
+
+        if not bal_str:
+            return True   # balance unavailable — permissive, do not block
+
+        if float(bal_str) < self._starting_equity - self.max_daily_loss:
+            self.trigger_kill_switch(
+                f"Daily loss limit exceeded: balance={float(bal_str):.2f}  "
+                f"start={self._starting_equity:.2f}  limit={self.max_daily_loss:.2f}"
+            )
+            return False
+
+        return True
+
+    def _pre_trade_safety(self, asset, price, delta_exposure) -> bool:
+        """
+        Unified pre-trade gate — runs all safety checks in priority order.
+        Returns False (and triggers the kill switch where appropriate) if any
+        check fails.  Called at the top of every live execution override.
+        """
+        if not self.check_health():
+            return False
+
+        if not self._check_trade_rate():
+            return False
+
+        # Per-asset notional cap
+        if price and abs(delta_exposure * price) > self.max_notional_per_asset:
+            self.trigger_kill_switch(
+                f"Notional cap exceeded for {asset}: "
+                f"|{delta_exposure:.4f}| × {price:.2f} = "
+                f"{abs(delta_exposure * price):.2f} > {self.max_notional_per_asset}"
+            )
+            return False
+
+        # Total portfolio notional cap
+        if self._current_notional() > self.max_total_notional:
+            self.trigger_kill_switch(
+                f"Total notional cap exceeded: "
+                f"{self._current_notional():.2f} > {self.max_total_notional}"
+            )
+            return False
+
+        # Daily loss cap
+        if not self._check_daily_loss():
+            return False
+
+        return True
+
+    # ------------------------------------------------------------------
     # Spot order submission (live path only — dry_run must be False)
     # ------------------------------------------------------------------
 
@@ -843,8 +951,8 @@ class LiveBroker(SimulatedBroker):
         Futures execution stays dry-run only until the Kraken Futures
         endpoint is separately wired.
         """
-        if not self.check_health():
-            print(f"[LIVE SPOT BLOCKED]   {asset}  delta={delta_exposure:+.4f}")
+        if not self._pre_trade_safety(asset, price, delta_exposure):
+            print(f"[LIVE SPOT BLOCKED SAFETY] {asset}  delta={delta_exposure:+.4f}")
             return 0.0
 
         order = self._build_spot_order(asset, price, delta_exposure)
