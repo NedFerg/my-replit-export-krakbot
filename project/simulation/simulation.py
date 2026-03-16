@@ -105,6 +105,16 @@ class Simulation:
         self.prev_frac_drawdown = 0.0
         self.prev_dd_flag       = 0
 
+        # --- Volatility targeting -----------------------------------------
+        # Tracks 30-step annualised realised vol and computes a scaling
+        # factor applied to all exposure targets in the broker so the
+        # portfolio stays near a stable risk level regardless of regime.
+        self.realized_vol      = 0.0
+        self.prev_realized_vol = 0.0
+        self.target_vol        = 0.12   # 12 % annualised target
+        self.vol_scaler        = 1.0    # [0.25, 2.0]
+        self.prev_vol_flag     = 0
+
         # --- Multi-timeframe trend windows --------------------------------
         self.trend_windows = [5, 20, 50]
         # price_history (defined in __init__ above) stores raw prices per step
@@ -1005,6 +1015,45 @@ class Simulation:
                     else:
                         state.equity_vol = 0.0
 
+                    # --- Rolling realised volatility (30-step, annualised) ---
+                    _rv_window = self.equity_history[-30:]
+                    if len(_rv_window) >= 2:
+                        _rv_rets = [
+                            (_rv_window[i] - _rv_window[i - 1]) / max(_rv_window[i - 1], 1e-6)
+                            for i in range(1, len(_rv_window))
+                        ]
+                        _rv_mean = sum(_rv_rets) / len(_rv_rets)
+                        _rv_var  = sum((r - _rv_mean) ** 2 for r in _rv_rets) / len(_rv_rets)
+                        self.prev_realized_vol = self.realized_vol
+                        self.realized_vol = (_rv_var ** 0.5) * (252 ** 0.5)
+                    else:
+                        self.realized_vol = 0.0
+
+                    setattr(state, "realized_vol", self.realized_vol)
+
+                    # Vol scaling factor: target_vol / realized_vol, clipped [0.25, 2.0]
+                    if self.realized_vol > 0:
+                        self.vol_scaler = min(2.0, max(0.25, self.target_vol / self.realized_vol))
+                    else:
+                        self.vol_scaler = 1.0
+
+                    setattr(state, "vol_scaler", self.vol_scaler)
+
+                    # Vol severity feedback (transition-only)
+                    _vf = 0
+                    if self.realized_vol > 1.5 * self.target_vol: _vf = 1
+                    if self.realized_vol > 2.0 * self.target_vol: _vf = 2
+                    if _vf != self.prev_vol_flag:
+                        if _vf == 1:
+                            _vfmsg = "Volatility warning: realized vol above 150% of target."
+                        elif _vf == 2:
+                            _vfmsg = "High volatility: realized vol above 200% of target — scaling down."
+                        else:
+                            _vfmsg = "Volatility normalized."
+                        self.macro_messages.append(_vfmsg)
+                        print(_vfmsg)
+                    self.prev_vol_flag = _vf
+
                     if agent.prev_state is not None:
                         # --- Regime-aware portfolio reward ----------------
                         pnl_reward    = new_equity - agent.prev_equity
@@ -1121,6 +1170,14 @@ class Simulation:
                         # Nudge agent toward maintaining gains near new highs
                         if new_equity >= 0.995 * (self.equity_peak or new_equity):
                             reward += 0.001
+
+                        # --- Volatility targeting reward ------------------
+                        # Penalise deviation from target_vol; small bonus for
+                        # staying within ±2pp of the target.
+                        _vol_err = abs(self.realized_vol - self.target_vol)
+                        reward -= 0.5 * _vol_err
+                        if _vol_err < 0.02:
+                            reward += 0.002
 
                         # --- Critic: N-step replay buffer update ----------
                         done = (current_step == SIMULATION_STEPS - 1)

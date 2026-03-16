@@ -1,0 +1,133 @@
+We are continuing RL improvements.
+
+Goal:  
+Add volatility targeting, so the system automatically scales its exposures to maintain a stable risk level.
+
+This module adds:
+
+    rolling realized volatility
+
+    a target volatility (e.g., 12% annualized)
+
+    a scaling factor applied to all exposures
+
+    reward shaping to encourage stable volatility
+
+    feedback messages when volatility deviates too far from target
+
+All RL core logic stays unchanged.
+1. Add volatility targeting state
+
+In simulation.py, inside __init__:
+python
+
+# Volatility targeting state
+self.realized_vol = 0.0
+self.target_vol = 0.12      # 12% annualized target (adjustable)
+self.vol_scaler = 1.0
+self.prev_realized_vol = 0.0
+
+Attach to state:
+python
+
+setattr(state, "realized_vol", self.realized_vol)
+setattr(state, "vol_scaler", self.vol_scaler)
+
+2. Compute rolling realized volatility
+
+After computing step_return each step:
+python
+
+# --- Rolling realized volatility (30-step window) ---
+window = self.equity_history[-30:]
+if len(window) >= 2:
+    rets = [(window[i] - window[i-1]) / max(window[i-1], 1e-6) for i in range(1, len(window))]
+    mean_r = sum(rets) / len(rets)
+    var_r = sum((r - mean_r)**2 for r in rets) / len(rets)
+    self.prev_realized_vol = self.realized_vol
+    self.realized_vol = (var_r ** 0.5) * (252 ** 0.5)  # annualized
+else:
+    self.realized_vol = 0.0
+
+Attach to state again:
+python
+
+setattr(state, "realized_vol", self.realized_vol)
+
+3. Compute volatility scaling factor
+
+After computing realized_vol:
+python
+
+# --- Volatility scaling factor ---
+if self.realized_vol > 0:
+    self.vol_scaler = min(2.0, max(0.25, self.target_vol / self.realized_vol))
+else:
+    self.vol_scaler = 1.0
+
+Attach to state:
+python
+
+setattr(state, "vol_scaler", self.vol_scaler)
+
+This keeps scaling between 0.25× and 2× — enough flexibility without destabilizing training.
+4. Apply vol_scaler in the broker
+
+In broker.execute_portfolio_exposure, after computing target_exposure but before clamping:
+python
+
+# Apply volatility scaling
+target_exposure *= simulation.vol_scaler
+
+This makes the entire portfolio risk‑aware.
+5. Add volatility‑aware reward shaping
+
+After your existing reward logic (drawdown, turnover, stability):
+python
+
+# --- Volatility targeting reward ---
+vol_error = abs(self.realized_vol - self.target_vol)
+
+# Penalize large deviations from target vol
+reward -= 0.5 * vol_error
+
+# Bonus for staying close to target
+if vol_error < 0.02:
+    reward += 0.002
+
+This teaches the agent to:
+
+    avoid volatility spikes
+
+    avoid volatility collapse
+
+    maintain consistent risk
+
+6. Add volatility feedback messages
+
+After computing realized_vol:
+python
+
+if not hasattr(self, "prev_vol_flag"):
+    self.prev_vol_flag = 0
+
+vol_flag = 0
+if self.realized_vol > 1.5 * self.target_vol:
+    vol_flag = 1
+if self.realized_vol > 2.0 * self.target_vol:
+    vol_flag = 2
+
+if vol_flag != self.prev_vol_flag:
+    if vol_flag == 1:
+        msg = "Volatility warning: realized vol above 150% of target."
+    elif vol_flag == 2:
+        msg = "High volatility: realized vol above 200% of target — scaling down."
+    else:
+        msg = "Volatility normalized."
+
+    self.macro_messages.append(msg)
+    print(msg)
+
+self.prev_vol_flag = vol_flag
+
+Transition‑only, like your other modules.

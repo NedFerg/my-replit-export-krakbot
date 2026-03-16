@@ -110,6 +110,13 @@ class SimulatedBroker(Broker):
                 cap_short = agent.max_short.get(a, -1.0)
 
             target = max(cap_short, min(cap_long, agent.target_exposures[a]))
+
+            # Scale all exposures toward target vol; re-clamp so we never
+            # exceed the dynamic caps that were just applied above.
+            if simulation is not None:
+                _vscaler = getattr(simulation, "vol_scaler", 1.0)
+                target = max(cap_short, min(cap_long, target * _vscaler))
+
             delta  = target - current
 
             if abs(delta) < 0.05:
