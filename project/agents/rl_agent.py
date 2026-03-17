@@ -354,8 +354,8 @@ class ReinforcementLearningTrader(TraderAgent):
         # ------------------------------------------------------------------
         self.ma_strategy = MAStrategy(
             assets       = self.assets,
-            short_window = int(os.getenv("MA_SHORT_WINDOW", "20")),
-            long_window  = int(os.getenv("MA_LONG_WINDOW",  "100")),
+            short_window = int(os.getenv("MA_SHORT_WINDOW", "5")),
+            long_window  = int(os.getenv("MA_LONG_WINDOW",  "20")),
             long_target  = float(os.getenv("MA_LONG_TARGET", "0.02")),
         )
 
@@ -838,6 +838,12 @@ class ReinforcementLearningTrader(TraderAgent):
         # gate so they pass; use the 5-min cooldown as the rate limiter.
         MIN_CONFIDENCE = 0.01 if not self.USE_RL_AGENT else 0.60
 
+        # MA signals target 2 % exposure.  With a 6 % drift gate new positions
+        # would never be opened (target 2 % < gate 6 %).  Lower the gate to
+        # 0.5 % for the MA path so positions can be established; the 5-minute
+        # cooldown remains the primary rate limiter.
+        MIN_DRIFT_FRAC_DEFAULT = 0.005 if not self.USE_RL_AGENT else 0.06
+
         # Rebalancing cooldown — 5 minutes between rounds.
         REBALANCE_COOLDOWN_SEC = 300
         _now        = time.time()
@@ -886,7 +892,7 @@ class ReinforcementLearningTrader(TraderAgent):
         # ----------------------------------------------------------------
         # Build candidate order list, SELLs first (frees cash for BUYs)
         # ----------------------------------------------------------------
-        MIN_DRIFT_FRAC = 0.06
+        MIN_DRIFT_FRAC = MIN_DRIFT_FRAC_DEFAULT
         max_notional   = getattr(self.broker, "max_notional_per_asset", 50.0)
 
         candidates = []

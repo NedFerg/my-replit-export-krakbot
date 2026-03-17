@@ -35,16 +35,16 @@ class MAStrategy:
     Parameters
     ----------
     assets       : list of asset names matching agent.assets
-    short_window : short moving-average lookback (default 20 bars)
-    long_window  : long  moving-average lookback (default 100 bars)
+    short_window : short moving-average lookback (default 5 bars)
+    long_window  : long  moving-average lookback (default 20 bars)
     long_target  : target exposure fraction when bullish (default 0.02 = 2 %)
     """
 
     def __init__(
         self,
         assets: List[str],
-        short_window: int = 20,
-        long_window:  int = 100,
+        short_window: int = 5,
+        long_window:  int = 20,
         long_target:  float = 0.02,
     ):
         if short_window >= long_window:

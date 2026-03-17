@@ -1,0 +1,77 @@
+  
+I want Krakbot to begin placing paper trades immediately and also produce a performance summary I can review. Please implement the following changes:
+1. Reduce MA warm‑up so trading starts now
+
+Modify the MA strategy defaults to:
+
+    MA_SHORT_WINDOW = 5
+
+    MA_LONG_WINDOW = 20
+
+This ensures the strategy becomes “ready” within a few minutes instead of 50 minutes. Keep the environment‑variable overrides, but change the defaults in code.
+2. Ensure the MA strategy runs every tick
+
+Confirm that when USE_RL_AGENT=false, step() always calls _run_ma_step() and that _run_ma_step() always routes signals through _execute_signals() so PaperBroker can fill trades.
+3. Add a performance summary function
+
+Create a new method in PaperBroker:
+Code
+
+def summary(self):
+    """
+    Returns a dict with:
+      - total_trades
+      - total_buys
+      - total_sells
+      - realized_pnl_usd
+      - unrealized_pnl_usd
+      - total_fees_usd
+      - win_rate
+      - average_win
+      - average_loss
+      - largest_win
+      - largest_loss
+      - current_positions (per asset)
+      - equity (cash + positions)
+    """
+
+Use the existing paper state (paper_cash, paper_positions, paper_realized_pnl, paper_trade_history) to compute these fields.
+4. Add a command to print the summary
+
+In main.py, add a keyboard command:
+
+    Pressing S prints the PaperBroker summary to the console in a clean, readable format.
+
+Example:
+Code
+
+=== PAPER TRADING SUMMARY ===
+Total trades: 14 (8 buys, 6 sells)
+Realized PnL: +$3.42
+Unrealized PnL: -$0.18
+Total fees: $0.41
+Win rate: 57%
+Largest win: $1.12
+Largest loss: -$0.74
+Equity: $10,003.24
+Positions:
+  SOL: 0.5
+  XRP: 0.0
+  ...
+==============================
+
+5. Print the summary automatically every 15 minutes
+
+Add a timer inside the live loop so that every 900 seconds, Krakbot prints the same summary without user input.
+6. Show me the updated files
+
+After implementing all changes, show me:
+
+    the updated MA defaults
+
+    the new summary() method
+
+    the updated main.py keyboard handler
+
+    the automatic 15‑minute summary logic
+

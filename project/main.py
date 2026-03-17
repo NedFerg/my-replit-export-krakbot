@@ -211,7 +211,7 @@ def run_live():
             print(
                 "[MAIN] RL agent is inactive — running MA crossover strategy.\n"
                 "       The MA strategy will begin placing paper trades once it has\n"
-                "       accumulated enough price history (100 bars ≈ 50 minutes).\n"
+                "       accumulated enough price history (20 bars ≈ 20 seconds).\n"
                 "       Set USE_RL_AGENT=true in Secrets to switch to the RL actor."
             )
         else:

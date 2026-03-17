@@ -2469,6 +2469,81 @@ class PaperBroker(LiveBroker):
     # Session summary
     # ------------------------------------------------------------------
 
+    def summary(self) -> dict:
+        """
+        Return a performance snapshot as a dict.
+
+        Keys
+        ----
+        total_trades, total_buys, total_sells,
+        realized_pnl_usd, unrealized_pnl_usd, total_fees_usd,
+        win_rate, average_win, average_loss, largest_win, largest_loss,
+        current_positions, equity
+        """
+        trades = self.paper_trade_history
+
+        buys  = [t for t in trades if t["side"] == "buy"]
+        sells = [t for t in trades if t["side"] == "sell"]
+
+        # Realised wins and losses come from the realized_pnl_usd on sell fills.
+        # Buy records always have realized_pnl_usd == 0 so we can sum over all.
+        pnls = [t["realized_pnl_usd"] for t in sells if t["realized_pnl_usd"] != 0.0]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+
+        win_rate    = (len(wins) / len(pnls) * 100.0) if pnls else 0.0
+        avg_win     = (sum(wins)   / len(wins))   if wins   else 0.0
+        avg_loss    = (sum(losses) / len(losses)) if losses else 0.0
+        largest_win  = max(wins,   default=0.0)
+        largest_loss = min(losses, default=0.0)
+
+        return {
+            "total_trades":      len(trades),
+            "total_buys":        len(buys),
+            "total_sells":       len(sells),
+            "realized_pnl_usd":  round(self.paper_realized_pnl, 4),
+            "unrealized_pnl_usd": round(self.get_unrealized_pnl(), 4),
+            "total_fees_usd":    round(self.paper_cumulative_fees, 4),
+            "win_rate":          round(win_rate, 1),
+            "average_win":       round(avg_win,  4),
+            "average_loss":      round(avg_loss, 4),
+            "largest_win":       round(largest_win,  4),
+            "largest_loss":      round(largest_loss, 4),
+            "current_positions": dict(self.paper_positions),
+            "equity":            round(self.compute_total_equity(), 4),
+        }
+
+    def print_summary(self) -> None:
+        """Print the performance summary in a readable format."""
+        s = self.summary()
+        positions = s["current_positions"]
+
+        lines = [
+            "",
+            "=== PAPER TRADING SUMMARY ===",
+            f"Total trades: {s['total_trades']} ({s['total_buys']} buys, {s['total_sells']} sells)",
+            f"Realized PnL:    {s['realized_pnl_usd']:>+10.2f} USD",
+            f"Unrealized PnL:  {s['unrealized_pnl_usd']:>+10.2f} USD",
+            f"Total fees:      {s['total_fees_usd']:>10.4f} USD",
+            f"Win rate:        {s['win_rate']:>9.1f}%",
+            f"Average win:     {s['average_win']:>+10.4f} USD",
+            f"Average loss:    {s['average_loss']:>+10.4f} USD",
+            f"Largest win:     {s['largest_win']:>+10.4f} USD",
+            f"Largest loss:    {s['largest_loss']:>+10.4f} USD",
+            f"Equity:          {s['equity']:>10.2f} USD",
+            "Positions:",
+        ]
+        if positions:
+            for asset, qty in sorted(positions.items()):
+                price  = self.live_prices.get(asset, 0.0)
+                value  = qty * price
+                lines.append(f"  {asset:<6}  {qty:.6f} coins  ≈ ${value:.2f}")
+        else:
+            lines.append("  (none)")
+        lines.append("=" * 30)
+        lines.append("")
+        print("\n".join(lines))
+
     def print_session_summary(self):
         """Print a human-readable PnL and position summary to the console."""
         equity = self.compute_total_equity()
@@ -2518,7 +2593,41 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
     - Emit heartbeat + health metrics
     - Run daily rollover
     - Evaluate alert conditions
+    - Check for keyboard commands from stdin (non-blocking)
+    - Print a performance summary every 15 minutes automatically
+
+    Keyboard commands (type in the workflow console + Enter):
+        S  — print PaperBroker performance summary immediately
     """
+    import queue
+    import threading
+
+    # ---------------------------------------------------------------
+    # Non-blocking stdin reader (daemon thread so it dies with main)
+    # ---------------------------------------------------------------
+    _cmd_queue: queue.Queue = queue.Queue()
+
+    def _stdin_reader():
+        try:
+            for raw_line in iter(sys.stdin.readline, ""):
+                cmd = raw_line.strip().upper()
+                if cmd:
+                    _cmd_queue.put(cmd)
+        except Exception:
+            pass   # stdin closed or not a TTY — silently stop
+
+    _stdin_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
+    _stdin_thread.start()
+
+    SUMMARY_INTERVAL_SEC = 900   # 15 minutes
+    _last_summary_ts     = time.time()
+
+    def _print_summary_if_paper():
+        if isinstance(broker, PaperBroker):
+            broker.print_summary()
+        else:
+            print("[MAIN LOOP] Summary only available in PAPER mode.")
+
     # Initial sync before trading
     state = broker.sync_live_account_state()
     if state is None:
@@ -2528,6 +2637,7 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
     balances, positions = state
     print(f"[MAIN LOOP] Initial balances: {balances}")
     print(f"[MAIN LOOP] Initial positions: {positions}")
+    print("[MAIN LOOP] Type 'S' + Enter in the console to print a performance summary.")
 
     try:
         while True:
@@ -2535,6 +2645,27 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
             if broker.kill_switch:
                 print("[MAIN LOOP] Kill switch active — exiting loop")
                 break
+
+            # -------------------------------------------------------
+            # Keyboard command handler (non-blocking)
+            # -------------------------------------------------------
+            try:
+                cmd = _cmd_queue.get_nowait()
+                if cmd == "S":
+                    _print_summary_if_paper()
+                else:
+                    print(f"[MAIN LOOP] Unknown command: {cmd!r}  (known: S)")
+            except queue.Empty:
+                pass
+
+            # -------------------------------------------------------
+            # Automatic 15-minute summary
+            # -------------------------------------------------------
+            _now = time.time()
+            if _now - _last_summary_ts >= SUMMARY_INTERVAL_SEC:
+                print("[MAIN LOOP] 15-minute auto-summary:")
+                _print_summary_if_paper()
+                _last_summary_ts = _now
 
             # Strategy step
             try:
