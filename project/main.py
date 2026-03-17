@@ -209,9 +209,10 @@ def run_live():
         # Distinguish by the RL gate flags, not broker state.
         if not agent.USE_RL_AGENT or not agent._checkpoint_loaded:
             print(
-                "[MAIN] Entering passive monitoring mode — RL agent is inactive.\n"
-                "       The loop will poll prices and log health metrics.\n"
-                "       No orders will be placed until RL is enabled and validated."
+                "[MAIN] RL agent is inactive — running MA crossover strategy.\n"
+                "       The MA strategy will begin placing paper trades once it has\n"
+                "       accumulated enough price history (100 bars ≈ 50 minutes).\n"
+                "       Set USE_RL_AGENT=true in Secrets to switch to the RL actor."
             )
         else:
             print("[MAIN] Warm-up failed (broker/connectivity issue) — aborting.")

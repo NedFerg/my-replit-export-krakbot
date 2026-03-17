@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from agents.trader_agent import TraderAgent
+from agents.ma_strategy import MAStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -346,12 +347,28 @@ class ReinforcementLearningTrader(TraderAgent):
         self.load_checkpoint(self.CHECKPOINT_PATH, silent=True)
 
         # ------------------------------------------------------------------
+        # Deterministic fallback strategy (active when USE_RL_AGENT=false).
+        # MAStrategy runs inside _run_ma_step() and generates target exposures
+        # that flow through the same _execute_signals() execution path used
+        # by the RL actor, so all safety gates remain active.
+        # ------------------------------------------------------------------
+        self.ma_strategy = MAStrategy(
+            assets       = self.assets,
+            short_window = int(os.getenv("MA_SHORT_WINDOW", "20")),
+            long_window  = int(os.getenv("MA_LONG_WINDOW",  "100")),
+            long_target  = float(os.getenv("MA_LONG_TARGET", "0.02")),
+        )
+
+        # ------------------------------------------------------------------
         # Startup status banner
         # ------------------------------------------------------------------
         if not self.USE_RL_AGENT:
             print(
-                "[RL AGENT] USE_RL_AGENT=false — actor is DISABLED.\n"
-                "           step() will return zero deltas (no live trades).\n"
+                "[RL AGENT] USE_RL_AGENT=false — RL actor is DISABLED.\n"
+                "           Running MA crossover strategy instead.\n"
+                f"           short_window={self.ma_strategy.short_window}  "
+                f"long_window={self.ma_strategy.long_window}  "
+                f"target={self.ma_strategy.long_target*100:.1f}%\n"
                 "           Set USE_RL_AGENT=true in Replit Secrets after a\n"
                 "           checkpoint has been validated in sandbox mode."
             )
@@ -509,9 +526,9 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         if not self.USE_RL_AGENT:
             print(
-                "[WARM-UP] Skipped — USE_RL_AGENT=false.\n"
-                "          The bot is running in safe/passive mode; no trades\n"
-                "          will be placed until RL is enabled and validated."
+                "[WARM-UP] Skipped — RL actor is disabled.\n"
+                "          MA crossover strategy is active and will begin placing\n"
+                "          paper trades once it has accumulated enough price history."
             )
             return
 
@@ -607,10 +624,25 @@ class ReinforcementLearningTrader(TraderAgent):
         ]
 
         # Cross-asset features (64 = 8 × 8)
+        #
+        # Per-asset price normalisers map each asset's typical live price to
+        # the [0, 1] range so the neural network receives bounded inputs.
+        # Using a universal 1/1000 was wrong: BTC at $85k → 85.0, XRP → 0.0005.
+        _PRICE_NORM: dict = {
+            "BTC":  100_000.0,   # ~$85k, cap at $100k
+            "ETH":   10_000.0,   # ~$3k,  cap at $10k
+            "SOL":    1_000.0,   # ~$130, cap at $1k
+            "AVAX":   1_000.0,   # ~$30,  cap at $1k
+            "LINK":     100.0,   # ~$14,  cap at $100
+            "XRP":       10.0,   # ~$2,   cap at $10
+            "XLM":        5.0,   # ~$0.3, cap at $5
+            "HBAR":       2.0,   # ~$0.2, cap at $2
+        }
         for a in self.assets:
-            p = live_prices.get(a, 0.0)
+            p    = live_prices.get(a, 0.0)
+            norm = _PRICE_NORM.get(a, 1_000.0)
             features.extend([
-                p / 1000.0,               # normalized price
+                min(p / norm, 2.0),       # normalized price (capped at 2× for safety)
                 0.0,                      # vol
                 self._momentum(a,  5) / 100.0,
                 self._momentum(a, 20) / 100.0,
@@ -637,7 +669,11 @@ class ReinforcementLearningTrader(TraderAgent):
         """
         # Gate 1 — RL feature flag
         if not self.USE_RL_AGENT:
-            self._zero_exposures("USE_RL_AGENT=false")
+            # Delegate to the deterministic MA crossover strategy.
+            # _run_ma_step() handles price fetching, MA state update, signal
+            # computation, and routes target exposures through _execute_signals()
+            # which shares all safety gates with the RL execution path.
+            self._run_ma_step()
             return
 
         # Gate 2 — trained weights required
@@ -718,52 +754,115 @@ class ReinforcementLearningTrader(TraderAgent):
         print(f"  exposures: {exposure_str}")
 
         # ----------------------------------------------------------------
-        # Action → order conversion
-        #
-        # target_exposures[a] ∈ [-1, +1] is a fraction of total equity.
-        # Positive = long, negative = close/flatten (spot-only, no shorting).
-        # Delta vs current tracked position drives the actual order size.
-        #
-        # Min trade: $1 USD notional (avoids API rejection for dust orders).
+        # Shared execution phase — routes target_exposures to the broker
         # ----------------------------------------------------------------
-        MIN_TRADE_USD = 5.0   # Kraken per-asset minimums; keep well above them
+        self._execute_signals(live_prices)
 
-        # Fee constants — pulled from the broker so they stay in one place.
-        # Kraken spot taker = 0.26 %; round-trip = 0.52 %.
+    # ------------------------------------------------------------------
+    # MA strategy step (called by Gate 1 when USE_RL_AGENT=false)
+    # ------------------------------------------------------------------
+
+    def _run_ma_step(self) -> None:
+        """
+        Fetch fresh prices, advance the MA strategy, compute crossover
+        signals, and route them through _execute_signals().
+
+        Called by step() when USE_RL_AGENT=false so all order-execution
+        safety gates remain active.
+        """
+        if self.broker is not None:
+            self.broker.update_prices_if_needed()
+
+        live_prices: dict = (
+            getattr(self.broker, "live_prices", {}) if self.broker else {}
+        )
+        if not live_prices:
+            self._zero_exposures("no prices available")
+            return
+
+        # Feed the latest bar into the MA history
+        self.ma_strategy.update(live_prices)
+
+        # Warming-up: not enough history yet
+        if not self.ma_strategy.ready:
+            bars    = self.ma_strategy.bars_collected
+            min_bar = min(bars.values()) if bars else 0
+            self._zero_exposures(
+                f"MA warming up ({min_bar}/{self.ma_strategy.long_window} bars)"
+            )
+            return
+
+        # Compute crossover signals → writes to self.target_exposures
+        signals = self.ma_strategy.compute_signals(self)
+
+        longs = [a for a, v in signals.items() if v > 0]
+        flats = [a for a, v in signals.items() if v == 0.0]
+        print(
+            f"[MA STRATEGY] signals  long={longs or 'none'}  flat={flats or 'none'}  "
+            f"{self.ma_strategy.status_line()}"
+        )
+
+        self._execute_signals(live_prices)
+
+    # ------------------------------------------------------------------
+    # Shared execution phase
+    # ------------------------------------------------------------------
+
+    def _execute_signals(self, live_prices: dict) -> None:
+        """
+        Convert self.target_exposures into live orders via the broker.
+
+        Called by both the RL path and the MA strategy path after their
+        respective signal-generation phases have written target exposures.
+
+        Safety gates active in this method
+        -----------------------------------
+        • 5-minute rebalance cooldown (shared with both paths via broker attr)
+        • 6 % minimum drift gate per asset (avoids round-tripping for dust)
+        • MIN_CONFIDENCE gate (MA signals are fixed at 0.02 so confidence =
+          0.02; the gate is relaxed to 0.01 when USE_RL_AGENT is False so
+          MA signals always pass it — the cooldown is the primary rate limiter)
+        • MIN_TRADE_USD dust filter ($5)
+        • Fee-hurdle check on sells
+        • MAX_ORDERS_PER_ROUND cap (4 orders per round)
+        • All broker-level gates: daily loss cap, kill-switch, pre-trade safety
+        """
+        MIN_TRADE_USD = 5.0
+
         TAKER_FEE      = getattr(self.broker, "taker_fee", 0.0026)
-        ROUND_TRIP     = 2.0 * TAKER_FEE          # min gross gain to break even
-        FEE_BUFFER     = 2.0                       # require 2× round-trip to trade
-        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER   # ~1.04 % of notional
+        ROUND_TRIP     = 2.0 * TAKER_FEE
+        FEE_BUFFER     = 2.0
+        MIN_FEE_HURDLE = ROUND_TRIP * FEE_BUFFER
+
+        # MA signals are intentionally small (0.02).  Relax the confidence
+        # gate so they pass; use the 5-min cooldown as the rate limiter.
+        MIN_CONFIDENCE = 0.01 if not self.USE_RL_AGENT else 0.60
 
         # Rebalancing cooldown — 5 minutes between rounds.
-        # 90s was too aggressive for a $100 account: 30 trades/hour limit
-        # was hit within ~45 min, burning $2+ in fees.  At 5 min we get
-        # ≤12 rounds/hour; with the 6 % drift gate and 0.60 min-confidence
-        # filter that typically means 3–8 actual trades per hour.
         REBALANCE_COOLDOWN_SEC = 300
-        _now = time.time()
+        _now        = time.time()
         _last_rebal = getattr(self.broker, "_last_rebalance_time", 0.0)
         if _now - _last_rebal < REBALANCE_COOLDOWN_SEC:
-            return   # too soon — skip this step
+            return
         if self.broker is not None:
             self.broker._last_rebalance_time = _now
 
-        # Refresh balances from Kraken so deposits are picked up immediately
+        # Refresh balances so deposits/fills are reflected immediately
         if hasattr(self.broker, "fetch_live_balances"):
             self.broker.fetch_live_balances()
 
         live_balances = getattr(self.broker, "live_balances", {})
 
-        # Anchor starting equity on first step (prices are loaded by now)
+        # Anchor starting equity on the first execution tick
         if (hasattr(self.broker, "_starting_equity")
                 and self.broker._starting_equity is None
                 and hasattr(self.broker, "compute_total_equity")):
             anchor = self.broker.compute_total_equity()
             if anchor > 0:
                 self.broker._starting_equity = anchor
-                print(f"  [EQUITY ANCHOR] Starting equity = {anchor:.2f} (ZUSD + crypto at live prices)")
+                print(f"  [EQUITY ANCHOR] Starting equity = ${anchor:.2f}")
 
-        # Total portfolio value for position sizing (ZUSD + all crypto at live prices)
+        # Total portfolio value used for position sizing
         if hasattr(self.broker, "compute_total_equity"):
             equity = self.broker.compute_total_equity()
         else:
@@ -773,14 +872,10 @@ class ReinforcementLearningTrader(TraderAgent):
             print("  [ORDER] No equity available — skipping order conversion")
             return
 
-        # Free USD cash caps buy spending; sells are limited by actual holdings
+        # Free cash available for buys; sells capped by actual holdings
         remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
-        # Sync spot_positions from live Kraken balances so sells reflect real holdings.
-        # Values are stored as raw unit quantities (e.g. 300 XLM, 0.5 SOL) so that
-        # the sell-cap logic below (min(delta_units, current_units)) works correctly.
-        # _compute_portfolio_exposure() is overridden in LiveBroker to convert
-        # these to fractional exposures before computing leverage totals.
+        # Sync spot positions from broker/live balances
         spot_positions = getattr(self.broker, "spot_positions", {})
         if hasattr(self.broker, "kraken_balance_keys"):
             for asset, bal_key in self.broker.kraken_balance_keys.items():
@@ -789,13 +884,9 @@ class ReinforcementLearningTrader(TraderAgent):
                     spot_positions[asset] = qty
 
         # ----------------------------------------------------------------
-        # Build a candidate list sorted by urgency (|delta_frac| desc) so
-        # the most out-of-target positions get priority within each round.
-        # Within the same round, execute SELLs before BUYs so the freed
-        # cash is available for the subsequent buy orders.
+        # Build candidate order list, SELLs first (frees cash for BUYs)
         # ----------------------------------------------------------------
-        MIN_DRIFT_FRAC  = 0.06   # 6 % drift gate (3 % was too active on $100 account)
-        MIN_CONFIDENCE  = 0.60   # only act on reasonably high-conviction signals
+        MIN_DRIFT_FRAC = 0.06
         max_notional   = getattr(self.broker, "max_notional_per_asset", 50.0)
 
         candidates = []
@@ -805,41 +896,32 @@ class ReinforcementLearningTrader(TraderAgent):
                 continue
             current_units = spot_positions.get(a, 0.0)
             current_frac  = (current_units * price) / equity
-            # Spot-only: negative target → flatten (0), no shorting
             target_frac   = max(0.0, self.target_exposures.get(a, 0.0))
             delta_frac    = target_frac - current_frac
             if abs(delta_frac) < MIN_DRIFT_FRAC:
-                continue   # within tolerance — nothing to do
+                continue
 
-            # Confidence ∈ [0, 1] = |raw action|; scale notional cap so
-            # high-conviction signals get larger position moves.
-            confidence    = abs(self.target_exposures.get(a, 0.0))
-
-            # Skip low-conviction signals — saves fees on noisy flips
+            confidence = abs(self.target_exposures.get(a, 0.0))
             if confidence < MIN_CONFIDENCE:
                 continue
-            # Scale the cap: 50 % of max_notional at min confidence,
-            # 100 % at confidence ≥ 0.7, linearly interpolated.
-            conf_scale    = min(1.0, max(0.5, confidence / 0.7))
-            scaled_cap    = max_notional * conf_scale
 
-            delta_usd     = delta_frac * equity
-            if delta_usd > 0:
-                delta_usd = min(delta_usd, scaled_cap)
-            else:
-                delta_usd = max(delta_usd, -scaled_cap)
+            conf_scale   = min(1.0, max(0.5, confidence / 0.7))
+            scaled_cap   = max_notional * conf_scale
 
-            notional_usd  = abs(delta_usd)
-            delta_units   = notional_usd / price
+            delta_usd    = delta_frac * equity
+            delta_usd    = (min(delta_usd, scaled_cap) if delta_usd > 0
+                            else max(delta_usd, -scaled_cap))
+            notional_usd = abs(delta_usd)
+            delta_units  = notional_usd / price
 
             if delta_usd < 0:
                 if current_units <= 0:
-                    continue   # nothing to sell
+                    continue
                 delta_units  = min(delta_units, current_units)
                 notional_usd = delta_units * price
 
             if notional_usd < MIN_TRADE_USD:
-                continue   # dust — skip
+                continue
 
             candidates.append({
                 "asset":        a,
@@ -854,13 +936,9 @@ class ReinforcementLearningTrader(TraderAgent):
                 "price":        price,
             })
 
-        # Sort: SELLs first (frees cash), then BUYs; within each group
-        # order by |delta_frac| descending (most urgent first).
         candidates.sort(key=lambda c: (0 if c["side"] == "sell" else 1,
                                        -abs(c["delta_frac"])))
 
-        # Cap orders per round — prevents excess fee burn on a small account.
-        # 4 orders × $0.13 avg fee = $0.52 max fee per 5-min round.
         MAX_ORDERS_PER_ROUND = 4
         orders_placed = 0
 
@@ -875,10 +953,8 @@ class ReinforcementLearningTrader(TraderAgent):
             target_frac  = c["target_frac"]
             current_frac = c["current_frac"]
             confidence   = c["confidence"]
+            est_fee_usd  = notional_usd * TAKER_FEE
 
-            est_fee_usd = notional_usd * TAKER_FEE
-
-            # Sell hurdle: gross position move must cover round-trip fee × buffer
             if side == "sell":
                 gross_move_usd = abs(c["delta_frac"]) * equity
                 min_required   = notional_usd * MIN_FEE_HURDLE
@@ -887,7 +963,6 @@ class ReinforcementLearningTrader(TraderAgent):
                           f"({gross_move_usd:.2f}) < hurdle ({min_required:.2f})")
                     continue
 
-            # Buy: full cost must fit in remaining cash
             if side == "buy":
                 total_cost = notional_usd * (1.0 + TAKER_FEE)
                 if total_cost > remaining_usd:
@@ -896,10 +971,11 @@ class ReinforcementLearningTrader(TraderAgent):
                     continue
 
             print(f"  [ORDER] {side.upper()} {delta_units:.6f} {a}"
-                  f"  Δ={delta_usd:+.2f} USD  conf={confidence:.2f}"
+                  f"  Δ={delta_usd:+.2f} USD  conf={confidence:.3f}"
                   f"  fee≈{est_fee_usd:.3f} USD"
                   f"  (target={target_frac:.3f}  current={current_frac:.3f}"
                   f"  cash_left={remaining_usd:.2f})")
+
             self.place_order(a, side, delta_units)
             orders_placed += 1
 
@@ -912,11 +988,7 @@ class ReinforcementLearningTrader(TraderAgent):
                 remaining_usd += notional_usd * (1.0 - TAKER_FEE)
 
         # ----------------------------------------------------------------
-        # Futures overlay — runs after all spot orders are placed so the
-        # spot core stays exactly as filled.  Uses the same target_exposures
-        # already computed above; the broker applies regime-adaptive sizing,
-        # vol targeting, funding adjustment and leverage caps before sending
-        # any order to Kraken Futures.
+        # Futures overlay (disabled when ENABLE_FUTURES=False)
         # ----------------------------------------------------------------
         if hasattr(self.broker, "run_futures_overlay"):
             self.broker.run_futures_overlay(self, live_prices)
