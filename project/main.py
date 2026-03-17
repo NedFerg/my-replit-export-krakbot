@@ -8,7 +8,7 @@ from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
 from agents.rl_agent import ReinforcementLearningTrader
 from agents.market_agent import MarketAgent
 from market_data.data_source import SimulatedDataSource
-from broker.broker import SimulatedBroker, LiveBroker, run_live_trading_loop
+from broker.broker import SimulatedBroker, LiveBroker, PaperBroker, run_live_trading_loop
 from exchange.exchange import Exchange
 from risk.risk_manager import RiskManager
 from config.config import INITIAL_BALANCE, MARKET_START_PRICE
@@ -147,22 +147,53 @@ def print_risk_summary(risk_manager):
 # Main
 # ---------------------------------------------------------------------------
 
-def run_live():
-    """Launch the Kraken live trading loop (MODE='live')."""
-    print("[MAIN] Starting live trading loop...")
-    broker = LiveBroker(dry_run=False)
+def _broker_mode_label(broker) -> str:
+    if isinstance(broker, PaperBroker):
+        return "PAPER (synthetic fills, CSV log)"
+    if isinstance(broker, LiveBroker) and broker._sandbox_mode:
+        return "SANDBOX (validate=true, no fills)"
+    return "LIVE (real orders)"
 
-    # Fetch futures wallet at startup so the overlay has collateral info
-    # before the first rebalancing window fires.
-    # Paper mode: simulates 25% of spot equity as collateral (no HTTP call).
-    # Live mode: fetches real balance from futures.kraken.com.
+
+def run_live():
+    """
+    Launch the Kraken live trading loop.
+
+    Three-tier broker selection (set in Replit Secrets):
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  USE_PAPER_BROKER=true  (default)                                │
+    │  → PaperBroker: synthetic fills, CSV log, zero API write calls   │
+    │                                                                  │
+    │  USE_PAPER_BROKER=false + KRAKEN_SANDBOX=true                    │
+    │  → LiveBroker with validate=true: Kraken validates, no fills     │
+    │                                                                  │
+    │  USE_PAPER_BROKER=false + KRAKEN_SANDBOX=false                   │
+    │  → LiveBroker full live: real orders, real fills                 │
+    └──────────────────────────────────────────────────────────────────┘
+    """
+    import os as _os
+    use_paper = _os.environ.get("USE_PAPER_BROKER", "true").strip().lower() \
+                not in ("false", "0", "no")
+
+    print("[MAIN] Starting live trading loop...")
+
+    if use_paper:
+        broker = PaperBroker(initial_cash=INITIAL_BALANCE)
+    else:
+        broker = LiveBroker(dry_run=False)
+
+    print(f"[MAIN] Broker mode: {_broker_mode_label(broker)}")
+
+    # Futures wallet — paper-simulated when ENABLE_FUTURES=False (default)
     if broker.futures_paper_mode:
         print("[MAIN] Futures overlay: PAPER mode — simulating collateral from spot equity.")
     else:
         print("[MAIN] Futures overlay: LIVE mode — fetching real collateral from futures.kraken.com.")
     broker.fetch_futures_wallet()
 
-    agent = ReinforcementLearningTrader("RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False)
+    agent = ReinforcementLearningTrader(
+        "RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False
+    )
     agent.warm_up(broker, cycles=5)
 
     if not agent.ready:
@@ -173,25 +204,29 @@ def run_live():
         #      continue; step() returns zero deltas so no orders fire.
         #
         #   B) Broker connectivity failure inside the warm_up cycles.
-        #      The broker's kill-switch would have fired; abort cleanly.
+        #      The broker's kill-switch fires; abort cleanly.
         #
-        # Distinguish by checking the RL gate flags, not the broker state.
+        # Distinguish by the RL gate flags, not broker state.
         if not agent.USE_RL_AGENT or not agent._checkpoint_loaded:
             print(
                 "[MAIN] Entering passive monitoring mode — RL agent is inactive.\n"
                 "       The loop will poll prices and log health metrics.\n"
                 "       No orders will be placed until RL is enabled and validated."
             )
-            # Fall through — run_live_trading_loop will call step() which
-            # returns zero deltas on every tick.
         else:
             print("[MAIN] Warm-up failed (broker/connectivity issue) — aborting.")
+            if isinstance(broker, PaperBroker):
+                broker.close()
             return
-
     else:
         print("[MAIN] Warm-up complete — entering live trading loop (Ctrl-C to stop)")
 
-    run_live_trading_loop(broker, agent)
+    try:
+        run_live_trading_loop(broker, agent)
+    finally:
+        # Always flush the trade log on exit (KeyboardInterrupt, exception, or normal)
+        if isinstance(broker, PaperBroker):
+            broker.close()
 
 
 def main():

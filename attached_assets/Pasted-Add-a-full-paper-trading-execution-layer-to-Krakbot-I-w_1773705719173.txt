@@ -1,0 +1,83 @@
+Add a full paper‑trading execution layer to Krakbot. I want the bot to “think it’s trading” in sandbox mode and produce complete synthetic fills, including entry price, exit price, fees, and PnL. Implement the following changes:
+1. Create a new class: PaperBroker
+
+    It should mirror the interface of LiveBroker so the agent and strategies can call it without modification.
+
+    It must maintain internal state:
+
+        cash balance
+
+        positions per asset
+
+        realized PnL
+
+        unrealized PnL
+
+        cumulative fees
+
+        trade history
+
+2. Synthetic fill model
+
+For each order Krakbot would send:
+
+    Use the current mid‑price from the price cache.
+
+    Apply a small configurable slippage factor (default 0.05%).
+
+    Compute fill price as:
+
+        buy: mid × (1 + slippage)
+
+        sell: mid × (1 - slippage)
+
+    Compute Kraken fees using the same fee schedule as LiveBroker.
+
+    Update cash, positions, and realized PnL accordingly.
+
+3. Structured trade logging
+
+Every synthetic trade must append a row to an in‑memory list and also write to a CSV file in project/logs/paper_trades.csv with columns:
+
+timestamp, asset, side, size_coins, fill_price, notional_usd, fee_usd, realized_pnl_usd, position_after_trade
+4. Integrate PaperBroker into the system
+
+Modify the broker initialization logic so that:
+
+    If SANDBOX_MODE=true, Krakbot uses PaperBroker for all fills.
+
+    LiveBroker is still instantiated but all order submissions include validate=true and their results are ignored.
+
+    The agent should treat PaperBroker as the authoritative source of fills, balances, and PnL.
+
+5. Ensure RL and strategy logic receive correct feedback
+
+    execute_trade() and execute_portfolio_exposure() must return the synthetic fee cost and update the agent’s internal balance.
+
+    Unrealized PnL should be computed from PaperBroker’s positions and the current mid‑prices.
+
+    The agent should behave exactly as if real trades occurred.
+
+6. Add a configuration flag
+
+Add USE_PAPER_BROKER=true (default) so I can toggle between:
+
+    Paper trading
+
+    Live trading with validate=true
+
+    Full live trading (future)
+
+7. Show me the updated files
+
+After implementing all changes, show me:
+
+    the new PaperBroker class
+
+    the updated broker initialization logic
+
+    the updated execution paths
+
+    and a sample of the CSV trade log format
+
+Make sure the system runs in sandbox mode with synthetic fills and logs trades correctly.

@@ -797,20 +797,25 @@ class LiveBroker(SimulatedBroker):
         result      = {}
 
         # Build a reverse map: Kraken-normalised-pair → internal asset name.
-        # Kraken may change the pair key (e.g. XBTUSD → XXBTZUSD) so we match
-        # on the pair value we sent, case-insensitively as a fallback.
+        # Kraken normalises many pairs on the way out (e.g. XBTUSD → XXBTZUSD,
+        # ETHUSD → XETHZUSD, XRPUSD → XXRPZUSD, XLMUSD → XXLMZUSD).
+        # We pre-populate the reverse map with both the "sent" form we requested
+        # AND the known Kraken-normalised form so both match without an HTTP
+        # round-trip to discover the canonical name.
+        _KRAKEN_ALIASES: dict = {
+            "XXBTZUSD": "BTC",   # Kraken normalises XBTUSD  → XXBTZUSD
+            "XETHZUSD": "ETH",   # Kraken normalises ETHUSD  → XETHZUSD
+            "XXRPZUSD": "XRP",   # Kraken normalises XRPUSD  → XXRPZUSD
+            "XXLMZUSD": "XLM",   # Kraken normalises XLMUSD  → XXLMZUSD
+        }
         pair_to_asset = {v.upper(): k for k, v in self.kraken_pairs.items()}
+        pair_to_asset.update(_KRAKEN_ALIASES)   # aliases override if there is a clash
 
         for kraken_key, ticker in ticker_data.items():
             asset = pair_to_asset.get(kraken_key.upper())
             if asset is None:
-                # Try partial match (e.g. "XXBTZUSD" contains "XBTUSD")
-                for sent_pair, a in self.kraken_pairs.items():
-                    if sent_pair.upper() in kraken_key.upper() or kraken_key.upper() in sent_pair.upper():
-                        asset = sent_pair
-                        break
-            if asset is None:
-                print(f"[PRICE FEED] Unknown pair key from Kraken: {kraken_key!r}")
+                print(f"[PRICE FEED] Unknown pair key from Kraken: {kraken_key!r} — "
+                      f"add to _KRAKEN_ALIASES if needed")
                 continue
             try:
                 result[asset] = float(ticker["c"][0])
@@ -2098,6 +2103,410 @@ class LiveBroker(SimulatedBroker):
 # ======================================================================
 # Module-level helper — outside LiveBroker class
 # ======================================================================
+
+# ---------------------------------------------------------------------------
+# PaperBroker — full synthetic execution layer for Krakbot sandbox mode
+# ---------------------------------------------------------------------------
+
+class PaperBroker(LiveBroker):
+    """
+    Fully simulated execution layer for Krakbot sandbox mode.
+
+    PaperBroker mirrors the LiveBroker interface exactly so the agent, strategy,
+    and main loop can call it without any code changes.  Execution is simulated
+    locally via a synthetic fill model:
+
+        fill_price = mid ×  (1 + slippage)   for buys
+        fill_price = mid ×  (1 − slippage)   for sells
+
+    Fees use the same Kraken taker schedule as LiveBroker (0.26%).
+
+    Real Kraken HTTP calls are still made for:
+        · Price data     — /0/public/Ticker (batched, 1 call per refresh)
+        · No order calls — all submission paths are short-circuited
+
+    Every synthetic fill is:
+        · Appended to self.paper_trade_history (in-memory list)
+        · Written to project/logs/paper_trades.csv (structured log)
+        · Reflected immediately in paper_cash, paper_positions, and
+          paper_realized_pnl so the agent receives realistic feedback
+
+    Configuration
+    -------------
+    USE_PAPER_BROKER   env var — toggle in Replit Secrets (default "true")
+    PAPER_SLIPPAGE     env var — override default 0.05% (e.g. "0.001" = 0.1%)
+    """
+
+    DEFAULT_SLIPPAGE: float = 0.0005   # 0.05% — realistic top-of-book crypto
+
+    # Log path — relative to this file's directory
+    LOG_PATH: str = os.path.join(
+        os.path.dirname(__file__), "..", "logs", "paper_trades.csv"
+    )
+
+    def __init__(self, initial_cash: float, slippage: float | None = None, **kwargs):
+        """
+        Parameters
+        ----------
+        initial_cash : Starting USD balance for the paper account.
+        slippage     : Fractional slippage per fill.  Defaults to
+                       PAPER_SLIPPAGE env var → DEFAULT_SLIPPAGE (0.05%).
+        **kwargs     : Forwarded to LiveBroker.__init__.
+        """
+        # LiveBroker must be in dry_run=False so its monitoring infrastructure
+        # (kill switch, health checks, price fetching) is fully armed.
+        # PaperBroker short-circuits order submission before any HTTP write
+        # reaches Kraken — so dry_run=False here is safe.
+        kwargs.setdefault("dry_run", False)
+        super().__init__(**kwargs)
+
+        if slippage is None:
+            slippage = float(os.getenv("PAPER_SLIPPAGE", str(self.DEFAULT_SLIPPAGE)))
+        self.paper_slippage = slippage
+
+        # --- Paper account state ------------------------------------------
+        self.paper_cash            = float(initial_cash)
+        self.paper_positions: dict = {}    # asset → coin quantity (float)
+        self.paper_cost_basis: dict = {}   # asset → weighted avg cost (USD/coin)
+        self.paper_realized_pnl    = 0.0
+        self.paper_cumulative_fees = 0.0
+        self.paper_trade_history: list = []
+
+        # --- CSV log setup ------------------------------------------------
+        import csv as _csv
+        log_path = os.path.abspath(self.LOG_PATH)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._csv_file   = open(log_path, "w", newline="", buffering=1)
+        self._csv_writer = _csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "timestamp", "asset", "side", "size_coins", "fill_price",
+            "notional_usd", "fee_usd", "realized_pnl_usd", "position_after_trade",
+        ])
+        self._csv_file.flush()
+
+        print(
+            f"[PaperBroker] INITIALIZED\n"
+            f"  starting_cash = ${initial_cash:.2f}\n"
+            f"  slippage      = {self.paper_slippage:.4%}\n"
+            f"  trade_log     = {log_path}\n"
+            f"  All fills are synthetic — no real orders sent to Kraken."
+        )
+
+    # ------------------------------------------------------------------
+    # Equity and positions — paper-authoritative (ignores Kraken balances)
+    # ------------------------------------------------------------------
+
+    def compute_total_equity(self) -> float:
+        """
+        Paper equity = paper_cash + all paper positions at current live prices.
+        This is the authoritative equity source for all safety checks,
+        daily-loss limits, and agent balance feedback.
+        """
+        equity = self.paper_cash
+        for asset, qty in self.paper_positions.items():
+            price = self.live_prices.get(asset, 0.0)
+            equity += qty * price
+        return equity
+
+    def get_unrealized_pnl(self) -> float:
+        """
+        Mark-to-market unrealized PnL across all open positions.
+        = sum over assets of (current_price − avg_cost_basis) × qty
+        """
+        total = 0.0
+        for asset, qty in self.paper_positions.items():
+            price = self.live_prices.get(asset, 0.0)
+            cost  = self.paper_cost_basis.get(asset, 0.0)
+            total += (price - cost) * qty
+        return total
+
+    def get_position_summary(self) -> dict:
+        """
+        Per-asset snapshot: qty, avg_cost, current price, mtm value,
+        unrealized PnL, and fractional equity exposure.
+        Useful for periodic health logs and dashboards.
+        """
+        equity = self.compute_total_equity()
+        summary = {}
+        for asset, qty in self.paper_positions.items():
+            if qty == 0.0:
+                continue
+            price = self.live_prices.get(asset, 0.0)
+            cost  = self.paper_cost_basis.get(asset, 0.0)
+            mtm   = qty * price
+            summary[asset] = {
+                "qty":      round(qty, 8),
+                "avg_cost": round(cost, 6),
+                "price":    round(price, 6),
+                "mtm_usd":  round(mtm, 4),
+                "upnl_usd": round((price - cost) * qty, 4),
+                "exposure": round(mtm / equity, 4) if equity > 0 else 0.0,
+            }
+        return summary
+
+    # ------------------------------------------------------------------
+    # Account sync — skip Kraken balance API; fetch prices only
+    # ------------------------------------------------------------------
+
+    def sync_live_account_state(self):
+        """
+        Paper override: fetch live prices from Kraken (needed for PnL and
+        fill calculations), but use internal paper state for balances.
+
+        Returns (pseudo_balances, {}) on success, None on price-fetch failure.
+        The pseudo_balances dict mirrors the Kraken balance-key format so the
+        main loop can log it without modification.
+        """
+        if not self.check_health():
+            print("[PAPER SYNC BLOCKED] Kill-switch active — skipping")
+            return None
+
+        print("[PAPER SYNC] Fetching live prices from Kraken...")
+        self.fetch_live_prices()
+
+        if not self.live_prices:
+            self.trigger_kill_switch(
+                "Paper sync failed — could not fetch any live prices from Kraken"
+            )
+            return None
+
+        # Build pseudo-balance dict (mirrors Kraken key names)
+        pseudo = {"ZUSD": str(round(self.paper_cash, 4))}
+        for asset, qty in self.paper_positions.items():
+            bal_key = self.kraken_balance_keys.get(asset, asset)
+            pseudo[bal_key] = str(round(qty, 8))
+
+        equity = self.compute_total_equity()
+        upnl   = self.get_unrealized_pnl()
+        print(
+            f"[PAPER SYNC] equity=${equity:.2f}  cash=${self.paper_cash:.2f}"
+            f"  upnl=${upnl:+.2f}  rpnl=${self.paper_realized_pnl:+.2f}"
+            f"  fees=${self.paper_cumulative_fees:.4f}"
+            f"  prices={len(self.live_prices)} assets"
+        )
+        return pseudo, {}
+
+    # ------------------------------------------------------------------
+    # Core fill engine — synthetic execution with slippage + fees
+    # ------------------------------------------------------------------
+
+    def _paper_fill(self, asset: str, side: str, coin_units: float,
+                    mid_price: float) -> float:
+        """
+        Execute one synthetic fill.
+
+        Fill model:
+            buy  → fill_price = mid × (1 + slippage)  cash decreases
+            sell → fill_price = mid × (1 - slippage)  cash increases
+
+        Fee = notional × taker_fee (same schedule as LiveBroker).
+        Realized PnL on sells = (fill_price - avg_cost) × qty_sold - fee.
+
+        Updates:
+            paper_cash, paper_positions, paper_cost_basis,
+            paper_realized_pnl, paper_cumulative_fees,
+            cumulative_fees_usd (shared with LiveBroker)
+
+        Appends one row to paper_trade_history and writes to the CSV log.
+
+        Parameters
+        ----------
+        asset      : internal name ("SOL", "BTC", …)
+        side       : "buy" or "sell"
+        coin_units : unsigned quantity in base-asset units (> 0)
+        mid_price  : current mid-price in USD
+
+        Returns
+        -------
+        float — fee_usd charged for this fill
+        """
+        if coin_units <= 0 or mid_price <= 0:
+            return 0.0
+
+        # Apply slippage
+        if side == "buy":
+            fill_price = mid_price * (1.0 + self.paper_slippage)
+        else:
+            fill_price = mid_price * (1.0 - self.paper_slippage)
+
+        notional_usd = coin_units * fill_price
+        fee_usd      = notional_usd * self.taker_fee
+
+        # Current position state
+        cur_qty  = self.paper_positions.get(asset, 0.0)
+        cur_cost = self.paper_cost_basis.get(asset, 0.0)
+        realized_pnl = 0.0
+
+        if side == "buy":
+            new_qty = cur_qty + coin_units
+            # Weighted-average cost update
+            if new_qty > 0:
+                self.paper_cost_basis[asset] = (
+                    (cur_qty * cur_cost + coin_units * fill_price) / new_qty
+                )
+            self.paper_positions[asset] = new_qty
+            # Cash decreases by notional + fee
+            self.paper_cash -= (notional_usd + fee_usd)
+
+        else:  # sell
+            # Only sell what we actually hold (clamp at zero for spot-only)
+            sell_qty = min(coin_units, max(cur_qty, 0.0))
+            if sell_qty < coin_units:
+                print(f"[PAPER FILL] WARNING: tried to sell {coin_units:.6f} {asset}"
+                      f" but only hold {cur_qty:.6f} — clamped to {sell_qty:.6f}")
+                coin_units = sell_qty
+                notional_usd = coin_units * fill_price
+                fee_usd      = notional_usd * self.taker_fee
+
+            realized_pnl = (fill_price - cur_cost) * coin_units - fee_usd
+            self.paper_realized_pnl    += realized_pnl
+            self.paper_positions[asset] = cur_qty - coin_units
+            # Cash increases by proceeds minus fee
+            self.paper_cash += (fill_price * coin_units) - fee_usd
+
+        # Sync fees to the shared LiveBroker counter
+        self.paper_cumulative_fees += fee_usd
+        self.cumulative_fees_usd   += fee_usd
+
+        # Keep spot_positions in sync so execute_portfolio_exposure logic works
+        self.spot_positions[asset] = self.paper_positions.get(asset, 0.0)
+
+        position_after = self.paper_positions.get(asset, 0.0)
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        # In-memory record
+        record = {
+            "timestamp":            ts,
+            "asset":                asset,
+            "side":                 side,
+            "size_coins":           round(coin_units, 8),
+            "fill_price":           round(fill_price, 6),
+            "notional_usd":         round(notional_usd, 4),
+            "fee_usd":              round(fee_usd, 6),
+            "realized_pnl_usd":     round(realized_pnl, 6),
+            "position_after_trade": round(position_after, 8),
+        }
+        self.paper_trade_history.append(record)
+
+        # CSV row (line-buffered — buffering=1 means each row flushes immediately)
+        self._csv_writer.writerow([
+            record["timestamp"],   record["asset"],          record["side"],
+            record["size_coins"],  record["fill_price"],     record["notional_usd"],
+            record["fee_usd"],     record["realized_pnl_usd"], record["position_after_trade"],
+        ])
+
+        print(
+            f"[PAPER FILL] {side.upper():4s} {coin_units:.6f} {asset}"
+            f"  mid=${mid_price:.4f}  fill=${fill_price:.4f}"
+            f"  notional=${notional_usd:.2f}  fee=${fee_usd:.4f}"
+            f"  rpnl=${realized_pnl:+.4f}  pos={position_after:.6f}"
+            f"  cash=${self.paper_cash:.2f}  equity=${self.compute_total_equity():.2f}"
+        )
+        return fee_usd
+
+    # ------------------------------------------------------------------
+    # Execution overrides — route to _paper_fill instead of Kraken HTTP
+    # ------------------------------------------------------------------
+
+    def _execute_spot_trade(self, asset, price, delta_exposure,
+                            microstructure_fn=None) -> float:
+        """
+        Paper execution for the execute_portfolio_exposure() path.
+
+        delta_exposure is a signed fractional exposure delta (from the RL agent).
+        Converts to coin units via _fractional_to_coin_units() and routes to
+        _paper_fill() — matching the convention LiveBroker uses.
+
+        Returns fee_usd so the parent can update agent.balance and realized_pnl.
+        """
+        if not self.check_health():
+            return 0.0
+
+        equity     = self.compute_total_equity() or 1.0
+        coin_units = self._fractional_to_coin_units(delta_exposure, equity, price)
+        notional   = abs(delta_exposure) * equity
+        side       = "buy" if delta_exposure > 0 else "sell"
+
+        if not self._pre_trade_safety(asset, price, notional):
+            print(f"[PAPER SPOT BLOCKED] {asset}  delta={delta_exposure:+.4f}")
+            return 0.0
+
+        if coin_units <= 0:
+            return 0.0
+
+        return self._paper_fill(asset, side, coin_units, price)
+
+    def execute_trade(self, symbol: str, side: str, size: float) -> float:
+        """
+        Paper execution for direct execute_trade() calls (agent.place_order path).
+
+        size is in coin units (positive, unsigned) — same convention as
+        LiveBroker.execute_trade.  Returns fee_usd so callers can update
+        their internal balance (consistent with LiveBroker's return value).
+        """
+        price = self.live_prices.get(symbol)
+        if not price or price <= 0:
+            print(f"[PAPER TRADE SKIPPED] No live price for {symbol}")
+            return 0.0
+
+        notional = size * price
+        if not self._pre_trade_safety(symbol, price, notional):
+            return 0.0
+
+        return self._paper_fill(symbol, side, size, price)
+
+    def _submit_spot_order(self, order: dict):
+        """
+        Safety no-op — this method should never be reached in paper mode
+        because _execute_spot_trade() and execute_trade() both return before
+        reaching the submission path.  Logged as a warning if called.
+        """
+        print(f"[PAPER BROKER] WARNING: _submit_spot_order reached unexpectedly "
+              f"(bug — should not happen).  Order: {order}")
+        return None
+
+    # ------------------------------------------------------------------
+    # Session summary
+    # ------------------------------------------------------------------
+
+    def print_session_summary(self):
+        """Print a human-readable PnL and position summary to the console."""
+        equity = self.compute_total_equity()
+        upnl   = self.get_unrealized_pnl()
+        print(
+            f"\n{'='*60}\n"
+            f"PAPER SESSION SUMMARY\n"
+            f"{'='*60}\n"
+            f"  Cash (USD):        ${self.paper_cash:>12.4f}\n"
+            f"  Unrealized PnL:    ${upnl:>+12.4f}\n"
+            f"  Realized PnL:      ${self.paper_realized_pnl:>+12.4f}\n"
+            f"  Fees paid:         ${self.paper_cumulative_fees:>12.4f}\n"
+            f"  Total equity:      ${equity:>12.4f}\n"
+            f"  Trades filled:     {len(self.paper_trade_history)}\n"
+            f"{'='*60}"
+        )
+        summary = self.get_position_summary()
+        if summary:
+            print("  Open positions:")
+            for asset, d in summary.items():
+                print(f"    {asset:<6}  qty={d['qty']:.6f}  "
+                      f"avg_cost=${d['avg_cost']:.4f}  "
+                      f"price=${d['price']:.4f}  "
+                      f"mtm=${d['mtm_usd']:.2f}  "
+                      f"upnl=${d['upnl_usd']:+.2f}  "
+                      f"exposure={d['exposure']:.2%}")
+        print()
+
+    def close(self):
+        """Flush and close the CSV trade log file.  Call at session end."""
+        self.print_session_summary()
+        try:
+            self._csv_file.flush()
+            self._csv_file.close()
+            print(f"[PaperBroker] Trade log closed: {self.LOG_PATH}")
+        except Exception:
+            pass
+
 
 def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
     """
