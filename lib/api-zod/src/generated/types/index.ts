@@ -6,4 +6,10 @@
  * OpenAPI spec version: 0.1.0
  */
 
+export * from "./getPerformanceParams";
+export * from "./getPerformancePeriod";
 export * from "./healthStatus";
+export * from "./listTradesParams";
+export * from "./performanceSummary";
+export * from "./trade";
+export * from "./tradeList";

@@ -8,3 +8,69 @@
 export interface HealthStatus {
   status: string;
 }
+
+export interface Trade {
+  trade_id: string;
+  timestamp: string;
+  asset: string;
+  side: string;
+  size_coins: number;
+  fill_price: number;
+  notional_usd: number;
+  fee_usd: number;
+  realized_pnl_usd: number;
+  position_after_trade: number;
+  strategy_name: string;
+  return_pct: number;
+  cumulative_volume: number;
+}
+
+export interface TradeList {
+  trades: Trade[];
+  total: number;
+}
+
+export interface PerformanceSummary {
+  period: string;
+  trade_count: number;
+  total_notional_usd: number;
+  total_fees_usd: number;
+  total_realized_pnl_usd: number;
+  win_rate: number;
+  avg_return_pct: number;
+  cumulative_volume_usd: number;
+}
+
+export type ListTradesParams = {
+  /**
+   * Maximum number of trades to return
+   * @minimum 1
+   * @maximum 500
+   */
+  limit?: number;
+  /**
+   * Filter by asset symbol (e.g. SOL, BTC)
+   */
+  asset?: string;
+  /**
+   * Filter by strategy name (e.g. RLTrader, MAStrategy)
+   */
+  strategy?: string;
+};
+
+export type GetPerformanceParams = {
+  /**
+   * Aggregation period
+   */
+  period?: GetPerformancePeriod;
+};
+
+export type GetPerformancePeriod =
+  (typeof GetPerformancePeriod)[keyof typeof GetPerformancePeriod];
+
+export const GetPerformancePeriod = {
+  all: "all",
+  daily: "daily",
+  weekly: "weekly",
+  monthly: "monthly",
+} as const;

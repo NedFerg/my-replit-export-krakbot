@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: trades
+    description: Paper trade history and analytics
 paths:
   /healthz:
     get:
@@ -24,6 +26,59 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /trades:
+    get:
+      operationId: listTrades
+      tags: [trades]
+      summary: List paper trades
+      description: Returns paper trades from the SQLite archive, newest first.
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+          description: Maximum number of trades to return
+        - name: asset
+          in: query
+          schema:
+            type: string
+          description: Filter by asset symbol (e.g. SOL, BTC)
+        - name: strategy
+          in: query
+          schema:
+            type: string
+          description: Filter by strategy name (e.g. RLTrader, MAStrategy)
+      responses:
+        "200":
+          description: Trade list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradeList"
+  /performance:
+    get:
+      operationId: getPerformance
+      tags: [trades]
+      summary: Performance summary
+      description: Returns aggregated performance metrics for the given time period.
+      parameters:
+        - name: period
+          in: query
+          schema:
+            type: string
+            enum: [all, daily, weekly, monthly]
+            default: all
+          description: Aggregation period
+      responses:
+        "200":
+          description: Performance summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PerformanceSummary"
 components:
   schemas:
     HealthStatus:
@@ -33,4 +88,87 @@ components:
           type: string
       required:
         - status
+    Trade:
+      type: object
+      properties:
+        trade_id:
+          type: string
+        timestamp:
+          type: string
+        asset:
+          type: string
+        side:
+          type: string
+        size_coins:
+          type: number
+        fill_price:
+          type: number
+        notional_usd:
+          type: number
+        fee_usd:
+          type: number
+        realized_pnl_usd:
+          type: number
+        position_after_trade:
+          type: number
+        strategy_name:
+          type: string
+        return_pct:
+          type: number
+        cumulative_volume:
+          type: number
+      required:
+        - trade_id
+        - timestamp
+        - asset
+        - side
+        - size_coins
+        - fill_price
+        - notional_usd
+        - fee_usd
+        - realized_pnl_usd
+        - position_after_trade
+        - strategy_name
+        - return_pct
+        - cumulative_volume
+    TradeList:
+      type: object
+      properties:
+        trades:
+          type: array
+          items:
+            $ref: "#/components/schemas/Trade"
+        total:
+          type: integer
+      required:
+        - trades
+        - total
+    PerformanceSummary:
+      type: object
+      properties:
+        period:
+          type: string
+        trade_count:
+          type: integer
+        total_notional_usd:
+          type: number
+        total_fees_usd:
+          type: number
+        total_realized_pnl_usd:
+          type: number
+        win_rate:
+          type: number
+        avg_return_pct:
+          type: number
+        cumulative_volume_usd:
+          type: number
+      required:
+        - period
+        - trade_count
+        - total_notional_usd
+        - total_fees_usd
+        - total_realized_pnl_usd
+        - win_rate
+        - avg_return_pct
+        - cumulative_volume_usd
 

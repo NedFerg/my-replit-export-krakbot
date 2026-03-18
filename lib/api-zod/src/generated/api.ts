@@ -14,3 +14,72 @@ import * as zod from "zod";
 export const HealthCheckResponse = zod.object({
   status: zod.string(),
 });
+
+/**
+ * Returns paper trades from the SQLite archive, newest first.
+ * @summary List paper trades
+ */
+export const listTradesQueryLimitDefault = 50;
+export const listTradesQueryLimitMax = 500;
+
+export const ListTradesQueryParams = zod.object({
+  limit: zod.coerce
+    .number()
+    .min(1)
+    .max(listTradesQueryLimitMax)
+    .default(listTradesQueryLimitDefault)
+    .describe("Maximum number of trades to return"),
+  asset: zod.coerce
+    .string()
+    .optional()
+    .describe("Filter by asset symbol (e.g. SOL, BTC)"),
+  strategy: zod.coerce
+    .string()
+    .optional()
+    .describe("Filter by strategy name (e.g. RLTrader, MAStrategy)"),
+});
+
+export const ListTradesResponse = zod.object({
+  trades: zod.array(
+    zod.object({
+      trade_id: zod.string(),
+      timestamp: zod.string(),
+      asset: zod.string(),
+      side: zod.string(),
+      size_coins: zod.number(),
+      fill_price: zod.number(),
+      notional_usd: zod.number(),
+      fee_usd: zod.number(),
+      realized_pnl_usd: zod.number(),
+      position_after_trade: zod.number(),
+      strategy_name: zod.string(),
+      return_pct: zod.number(),
+      cumulative_volume: zod.number(),
+    }),
+  ),
+  total: zod.number(),
+});
+
+/**
+ * Returns aggregated performance metrics for the given time period.
+ * @summary Performance summary
+ */
+export const getPerformanceQueryPeriodDefault = `all`;
+
+export const GetPerformanceQueryParams = zod.object({
+  period: zod
+    .enum(["all", "daily", "weekly", "monthly"])
+    .default(getPerformanceQueryPeriodDefault)
+    .describe("Aggregation period"),
+});
+
+export const GetPerformanceResponse = zod.object({
+  period: zod.string(),
+  trade_count: zod.number(),
+  total_notional_usd: zod.number(),
+  total_fees_usd: zod.number(),
+  total_realized_pnl_usd: zod.number(),
+  win_rate: zod.number(),
+  avg_return_pct: zod.number(),
+  cumulative_volume_usd: zod.number(),
+});
