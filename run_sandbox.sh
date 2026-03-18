@@ -126,6 +126,7 @@ fi
 # Show current ETP market status — always displayed at launch
 # ---------------------------------------------------------------------------
 python3 - <<'PYEOF'
+import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -139,6 +140,10 @@ mkt_close = now.replace(hour=16, minute=30, second=0, microsecond=0)
 # Bot clock — shown so the operator can confirm the server time is correct
 clock_utc   = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
 clock_et    = now.strftime("%Y-%m-%d %H:%M:%S ET")
+
+# Paper capital — reads the same env var as config.py so they always agree
+paper_capital = float(os.getenv("PAPER_CAPITAL", "1000"))
+capital_str   = f"${paper_capital:,.2f}  (set PAPER_CAPITAL env var to change)"
 
 if weekday < 5 and mkt_open <= now < mkt_close:
     etp_status = "OPEN  ✅  ETP/ETF trades are LIVE right now"
@@ -170,6 +175,7 @@ print(f"""
   ------------------------------------------------------------
   Bot clock: {clock_utc}
              {clock_et}
+  Capital  : {capital_str}
   ------------------------------------------------------------
   Crypto   : 24/7 spot trading always active
              BTC, ETH, SOL, XRP, HBAR, LINK, XLM
