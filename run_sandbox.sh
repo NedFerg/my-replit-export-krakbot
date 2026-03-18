@@ -122,17 +122,59 @@ print(candidate.strftime('%A %Y-%m-%d 09:30 ET'))")
     echo ""
 fi
 
-echo "============================================================"
-echo "  KrakBot — SANDBOX MODE"
-echo "  Strategy : Bull/Bear Rotational Trader"
-echo "  Broker   : PaperBroker (synthetic fills, zero real orders)"
-echo "  Prices   : Live from Kraken public API"
-echo "  Spot     : Crypto 24/7 (BTC, ETH, SOL, XRP, HBAR, LINK, XLM)"
-echo "  ETPs     : Gated — only during US market hours (09:30-16:30 ET)"
-echo "  Entry    : BTC rolling-high breakout from current price"
-echo "             (floor=\$65K; works from any price above floor)"
-echo "============================================================"
-echo ""
+# ---------------------------------------------------------------------------
+# Show current ETP market status — always displayed at launch
+# ---------------------------------------------------------------------------
+python3 - <<'PYEOF'
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+now = datetime.now(ET)
+weekday = now.weekday()
+mkt_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+mkt_close = now.replace(hour=16, minute=30, second=0, microsecond=0)
+
+if weekday < 5 and mkt_open <= now < mkt_close:
+    etp_status = "OPEN  ✅  ETP/ETF trades are LIVE right now"
+    until_close = int((mkt_close - now).total_seconds())
+    ch, cm = divmod(until_close // 60, 60)
+    etp_detail = f"Market closes in {ch}h {cm}m  (at 16:30 ET)"
+elif weekday < 5 and now < mkt_open:
+    wait = int((mkt_open - now).total_seconds())
+    wh, wm = divmod(wait // 60, 60)
+    etp_status = f"CLOSED — opens today in {wh}h {wm}m  (09:30 ET)"
+    etp_detail = "Crypto spot is trading 24/7; ETP entries will unlock at open"
+else:
+    # Weekend or post-close
+    candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    wait = int((candidate - now).total_seconds())
+    wh, wm = divmod(wait // 60, 60)
+    etp_status = f"CLOSED (weekend) — next open {candidate.strftime('%A')} in {wh}h {wm}m"
+    etp_detail = f"Crypto spot is trading 24/7; ETP entries will unlock at {candidate.strftime('%A')} open"
+
+print(f"""
+============================================================
+  KrakBot — SANDBOX MODE  (all fills are PAPER / simulated)
+  Strategy : Bull/Bear Rotational Trader
+  Broker   : PaperBroker — ZERO real orders sent to Kraken
+  Prices   : Live from Kraken public API (no API key needed)
+  ------------------------------------------------------------
+  Crypto   : 24/7 spot trading always active
+             BTC, ETH, SOL, XRP, HBAR, LINK, XLM
+  ETPs     : {etp_status}
+             {etp_detail}
+  Bear short: ETHD 2× inverse (15-25%)  +  SETH 1× inverse (5-8%)
+  ------------------------------------------------------------
+  Entry    : BTC rolling-high breakout (floor=$65K)
+  Ctrl-C   : Graceful shutdown (prints final P&L summary)
+  Keys     : S = paper summary  |  P = phase + positions
+============================================================
+""")
+PYEOF
 
 USE_BULL_BEAR_TRADER=true \
 USE_PAPER_BROKER=true \

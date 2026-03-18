@@ -153,8 +153,14 @@ SPOT_ALT_MIN:     float = 0.02
 SPOT_ALT_MAX:     float = 0.15
 LEVERAGE_ETF_MIN: float = 0.10
 LEVERAGE_ETF_MAX: float = 0.20
-BEAR_SHORT_MIN:   float = 0.15
-BEAR_SHORT_MAX:   float = 0.25
+# ---- Bear market shorts: two-tier layered short ----------------------------
+# ETHD (2× short ETH ETP) — aggressive tier: captures amplified downside.
+# SETH (1× short ETH ETP) — conservative tier: softer hedge, lower volatility.
+# Combined peak exposure: ETHD 25% + SETH 8% = 33% short of portfolio.
+BEAR_SHORT_MIN:        float = 0.15   # ETHD minimum in bear phase
+BEAR_SHORT_MAX:        float = 0.25   # ETHD maximum in bear phase
+SETH_SHORT_MIN:        float = 0.05   # SETH minimum in bear phase (1× inverse)
+SETH_SHORT_MAX:        float = 0.08   # SETH maximum in bear phase (1× inverse)
 CASCADE_ETF_MAX:  float = 0.30   # commodity ETF in alt_cascade phase
 
 ROTATION_EXIT_FRACTION: float = 0.50   # exit 50 % of a peaked alt on rotation
@@ -167,9 +173,13 @@ ROTATION_ENTRY_SIZE:    float = 0.15   # enter 15 % in the next candidate
 # It reads RSI + Bollinger Bands + resistance/support proximity and sizes a
 # small counter-position so the portfolio can profit from either direction.
 #
-# Short hedge (ETHD — 2× Short ETH ETP):
-#   Opens when overbought signals fire (RSI > threshold, price above upper
-#   Bollinger Band, or at rolling resistance).  Max size HEDGE_SHORT_MAX.
+# Short hedge — two-tier short stack:
+#   ETHD (2× Short ETH ETP) — primary/aggressive tier (up to HEDGE_SHORT_MAX):
+#     Opens when overbought signals fire (RSI > threshold, price above upper
+#     Bollinger Band, or at rolling resistance).
+#   SETH (1× Short ETH ETP) — secondary/conservative tier (up to HEDGE_SETH_MAX):
+#     Opened alongside ETHD for a softer, lower-volatility complement.
+#     Sized at half the ETHD score so it scales more conservatively.
 #
 # Long hedge floor (ETHU — 2× Long ETH ETP):
 #   Opens when oversold signals fire (RSI < threshold, price below lower
@@ -181,8 +191,12 @@ ROTATION_ENTRY_SIZE:    float = 0.15   # enter 15 % in the next candidate
 # capture a breakout in either direction.
 #
 # Override via environment variables:
-HEDGE_SHORT_MAX: float = float(os.getenv("HEDGE_SHORT_MAX", "0.08"))   # 8 % cap
+HEDGE_SHORT_MAX: float = float(os.getenv("HEDGE_SHORT_MAX", "0.08"))   # 8 % ETHD cap
+HEDGE_SETH_MAX:  float = float(os.getenv("HEDGE_SETH_MAX",  "0.04"))   # 4 % SETH cap
 HEDGE_LONG_MAX:  float = float(os.getenv("HEDGE_LONG_MAX",  "0.10"))   # 10 % cap
+# SETH is sized at this fraction of the ETHD overbought score so it scales
+# more conservatively — the 1× inverse is already less volatile than 2×.
+SETH_SCALE_FACTOR: float = 0.5
 HEDGE_RSI_OVERBOUGHT: int = int(os.getenv("HEDGE_RSI_OVERBOUGHT", "72"))
 HEDGE_RSI_OVERSOLD:   int = int(os.getenv("HEDGE_RSI_OVERSOLD",   "35"))
 # Assets the hedge overlay tracks (BTC drives the macro signal; ETH is the
@@ -286,6 +300,12 @@ class BullBearRotationalTrader:
         # Rate-limit the "ETP market closed" log to once per 5 minutes
         self._last_etp_closed_log: float = 0.0
 
+        from datetime import datetime as _dt
+        _et_now = _dt.now(_EASTERN)
+        _etp_status = "OPEN" if is_etp_market_open() else (
+            "opens today 09:30 ET" if _et_now.weekday() < 5 and _et_now.hour < 9
+            else "CLOSED (outside Mon-Fri 09:30-16:30 ET)"
+        )
         print(
             f"[BullBearTrader] Initialized — phase: {self.phase}\n"
             f"  BTC_BULL_RUN_FLOOR      = ${BTC_BULL_RUN_FLOOR:,.0f}  "
@@ -293,7 +313,12 @@ class BullBearRotationalTrader:
             f"  BTC_ATH_TARGET          = ${BTC_ATH_TARGET:,.0f}  "
             f"(absolute ATH bonus level)\n"
             f"  BREAKOUT_CONFIDENCE_MIN = {BREAKOUT_CONFIDENCE_MIN:.2f}  "
-            f"(confidence threshold to exit accumulation)"
+            f"(confidence threshold to exit accumulation)\n"
+            f"  Short ETFs (bear phase)  ETHD 2× short {BEAR_SHORT_MIN*100:.0f}-{BEAR_SHORT_MAX*100:.0f}%  |  "
+            f"SETH 1× short {SETH_SHORT_MIN*100:.0f}-{SETH_SHORT_MAX*100:.0f}%\n"
+            f"  Crypto spot             24/7 — always active\n"
+            f"  ETP/ETF trades          {_etp_status}\n"
+            f"  Paper mode              ALL FILLS ARE SIMULATED (no real orders)"
         )
 
     # ====================================================================
@@ -532,10 +557,18 @@ class BullBearRotationalTrader:
 
     def _phase_bear_market(self, prices: dict[str, float]) -> None:
         """
-        Bear market:
-        - Exit all spot longs (reduce to 0 % or 2 %) — always executed
-        - Enter / hold 2× short ETF (ETHD): 15–25 % — ETP market hours only
-        - No long leverage allowed
+        Bear market — two-tier short stack (ETP market hours only for new entries).
+
+        Spot longs:
+          - Exit all KEY_ALTS and COMMODITY_ETFS down to ~2 % residual (always).
+
+        Short ETFs (entered only during US ETP market hours):
+          - ETHD (2× inverse ETH ETP): primary bear position — 15–25 % of portfolio.
+          - SETH (1× inverse ETH ETP): conservative complement — 5–8 % of portfolio.
+
+        Together they create a layered short with blended 1.5–1.8× effective inverse
+        leverage, which is less volatile than ETHD alone while still capturing downside.
+        No long leveraged ETF positions are held in this phase.
         """
         # Trim spot positions to near-zero (always — spot exits don't need market hours)
         for asset in list(self.positions.keys()):
@@ -544,19 +577,28 @@ class BullBearRotationalTrader:
                 if current > 0.02:
                     self._close_position(asset, current - 0.02, prices.get(asset, 0.0))
 
-        # Enter short ETF if not held (ETP market hours only)
+        # Enter / scale short ETFs (ETP market hours only)
         if is_etp_market_open():
-            if "ETHD" not in self.positions:
-                self._open_position("ETHD", BEAR_SHORT_MIN, prices.get("ETHD", prices.get("ETH", 0.0)))
-            else:
-                # Scale up to target if under-allocated
-                current = self.positions.get("ETHD", 0.0)
-                if current < BEAR_SHORT_MIN:
-                    self._open_position(
-                        "ETHD",
-                        BEAR_SHORT_MIN - current,
-                        prices.get("ETHD", prices.get("ETH", 0.0)),
-                    )
+            eth_price = prices.get("ETHD", prices.get("ETH", 0.0))
+            seth_price = prices.get("SETH", prices.get("ETH", 0.0))
+
+            # ---- Primary: ETHD (2× short) ---------------------------------
+            current_ethd = self.positions.get("ETHD", 0.0)
+            if current_ethd < BEAR_SHORT_MIN:
+                self._open_position(
+                    "ETHD",
+                    BEAR_SHORT_MIN - current_ethd,
+                    eth_price,
+                )
+
+            # ---- Secondary: SETH (1× short) --------------------------------
+            current_seth = self.positions.get("SETH", 0.0)
+            if current_seth < SETH_SHORT_MIN:
+                self._open_position(
+                    "SETH",
+                    SETH_SHORT_MIN - current_seth,
+                    seth_price,
+                )
         else:
             self._warn_etp_closed()
 
@@ -625,10 +667,11 @@ class BullBearRotationalTrader:
             for rec in self.hedge_recommendations.values()
         )
 
-        target_short = HEDGE_SHORT_MAX * ob_score   # target ETHD allocation
-        target_long  = HEDGE_LONG_MAX  * os_score   # target ETHU allocation
+        target_short = HEDGE_SHORT_MAX * ob_score                    # target ETHD allocation
+        target_seth  = HEDGE_SETH_MAX  * ob_score * SETH_SCALE_FACTOR  # SETH: half the ob score (conservative)
+        target_long  = HEDGE_LONG_MAX  * os_score                    # target ETHU allocation
 
-        # ---- Short hedge: ETHD ----------------------------------------
+        # ---- Short hedge: ETHD (primary 2× inverse) ----------------------
         current_short = self.positions.get("ETHD", 0.0)
 
         if self.phase == PHASE_BEAR_MARKET:
@@ -650,6 +693,29 @@ class BullBearRotationalTrader:
             self._close_position("ETHD", delta, eth_price)
             self._log(
                 f"[HEDGE] Short trimmed: ETHD -{delta*100:.1f}%  "
+                f"(ob_score={ob_score:.2f})"
+            )
+
+        # ---- Short hedge: SETH (secondary 1× inverse) --------------------
+        current_seth = self.positions.get("SETH", 0.0)
+
+        if self.phase == PHASE_BEAR_MARKET:
+            # Bear phase manages SETH; overlay floors at SETH_SHORT_MIN.
+            target_seth = max(target_seth, SETH_SHORT_MIN)
+
+        seth_price = prices.get("SETH", eth_price)
+        if target_seth > current_seth + 0.005:
+            delta = target_seth - current_seth
+            self._open_position("SETH", delta, seth_price)
+            self._log(
+                f"[HEDGE] Short overlay: SETH +{delta*100:.1f}%  "
+                f"(ob_score={ob_score:.2f})"
+            )
+        elif target_seth < current_seth - 0.005 and self.phase != PHASE_BEAR_MARKET:
+            delta = current_seth - target_seth
+            self._close_position("SETH", delta, seth_price)
+            self._log(
+                f"[HEDGE] Short trimmed: SETH -{delta*100:.1f}%  "
                 f"(ob_score={ob_score:.2f})"
             )
 
