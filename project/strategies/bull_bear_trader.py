@@ -3,15 +3,35 @@ Bull/Bear Rotational Trading System
 ====================================
 BullBearRotationalTrader orchestrates a 4-phase market-cycle trading strategy:
 
-  "accumulation"   → Waiting for BTC ATH breakout. Zero trades.
-  "bull_alt_season"→ BTC held ATH, alts rising. Spot + 2× leverage longs.
-  "alt_cascade"    → ETH reversed + legislation catalyst. Max commodity ETF positions.
+  "accumulation"   → Waiting for a confirmed BTC uptrend.  Zero trades.
+  "bull_alt_season"→ BTC in sustained uptrend; alts rising. Spot + 2× longs.
+  "alt_cascade"    → ETH reversed + legislation catalyst. Max commodity ETF.
   "bear_market"    → Market topping. 2× short ETFs, reduced/no spot exposure.
+
+The strategy works from **any** BTC price level, not just above $100 K.
+When BTC is at $74 K and trending upward the rolling-high breakout
+component in BTCBreakoutDetector will accumulate confidence and trigger
+bull_alt_season once the threshold is reached.
 
 Configuration
 -------------
-All tuneable constants are at the top of this file.  Override via env vars
-where noted, or subclass and override the class attributes.
+All tuneable constants are at the top of this file.  The key parameters
+are now readable from environment variables so no code changes are needed
+to adapt to a different market entry price:
+
+  BTC_ATH_TARGET           Hard price level for the absolute ATH bonus.
+                            Set to 0 to rely entirely on rolling-high detection.
+                            Default: 100000
+
+  BTC_BULL_RUN_FLOOR       Minimum BTC price before the bot enters any bull
+                            phase.  Guards against buying into a bear-market
+                            dead-cat bounce.  Set this to just below the
+                            current market price when starting the bot.
+                            Default: 65000  (well below $74 K current price)
+
+  BREAKOUT_CONFIDENCE_MIN  Confidence threshold to leave accumulation.
+                            Default: 0.55  (lower than 0.60 to compensate for
+                            the ATH component scoring 0 at $74 K)
 
 Integration
 -----------
@@ -55,8 +75,12 @@ ETF_UNDERLYING: dict[str, str] = {
     "SETH": "ETH",   # ETH 1× Short ETP
 }
 
-BTC_ATH_TARGET:         float = 100_000.0
-BREAKOUT_CONFIDENCE_MIN: float = 0.60   # minimum confidence to leave accumulation
+BTC_ATH_TARGET:         float = float(os.getenv("BTC_ATH_TARGET",          "100000"))
+BREAKOUT_CONFIDENCE_MIN: float = float(os.getenv("BREAKOUT_CONFIDENCE_MIN",   "0.55"))
+# Minimum BTC price before the bot enters any bull phase.
+# Prevents buying into a dead-cat bounce during a true bear market.
+# Set this below the current market price (e.g. $65 000 when BTC is at $74 K).
+BTC_BULL_RUN_FLOOR:     float = float(os.getenv("BTC_BULL_RUN_FLOOR",        "65000"))
 
 RSI_OVERBOUGHT:  int   = 80
 RSI_UNDERBOUGHT: int   = 30
@@ -123,7 +147,11 @@ class BullBearRotationalTrader:
         self._phase_entered_at: float = time.time()
 
         # ---- Signal engines ---------------------------------------------
-        self.btc_detector      = BTCBreakoutDetector(ath_target=BTC_ATH_TARGET)
+        self.btc_detector      = BTCBreakoutDetector(
+            ath_target=BTC_ATH_TARGET,
+            rolling_high_window=int(os.getenv("BTC_ROLLING_HIGH_WINDOW", "60")),
+            rolling_high_hold=int(os.getenv("BTC_ROLLING_HIGH_HOLD",    "2")),
+        )
         self.alt_detector      = AltPumpDetector(
             consolidation_bars=CONSOLIDATION_DAYS,
             volume_spike_ratio=MIN_VOLUME_SPIKE,
@@ -151,7 +179,15 @@ class BullBearRotationalTrader:
         # ---- Log buffer (for display in main loop) ---------------------
         self._log_lines: list[str] = []
 
-        print(f"[BullBearTrader] Initialized — phase: {self.phase}")
+        print(
+            f"[BullBearTrader] Initialized — phase: {self.phase}\n"
+            f"  BTC_BULL_RUN_FLOOR      = ${BTC_BULL_RUN_FLOOR:,.0f}  "
+            f"(bot enters bull phases only above this price)\n"
+            f"  BTC_ATH_TARGET          = ${BTC_ATH_TARGET:,.0f}  "
+            f"(absolute ATH bonus level)\n"
+            f"  BREAKOUT_CONFIDENCE_MIN = {BREAKOUT_CONFIDENCE_MIN:.2f}  "
+            f"(confidence threshold to exit accumulation)"
+        )
 
     # ====================================================================
     # Main entry point
@@ -216,7 +252,8 @@ class BullBearRotationalTrader:
         old_phase = self.phase
 
         if self.phase == PHASE_ACCUMULATION:
-            if btc_confidence >= BREAKOUT_CONFIDENCE_MIN:
+            btc_price = prices.get("BTC", 0.0)
+            if btc_price >= BTC_BULL_RUN_FLOOR and btc_confidence >= BREAKOUT_CONFIDENCE_MIN:
                 self._transition_to(
                     PHASE_BULL_ALT,
                     reason=f"BTC breakout confirmed (confidence={btc_confidence:.2f})",
@@ -538,7 +575,7 @@ class BullBearRotationalTrader:
         if hasattr(self.broker, "compute_total_equity"):
             equity = self.broker.compute_total_equity() or 10_000.0
         else:
-            equity = 10_000.0   # fallback: assume $10k starting capital
+            equity = 10_000.0   # fallback: assume $10 K starting capital
 
         if equity <= 0 or trade_price <= 0:
             return

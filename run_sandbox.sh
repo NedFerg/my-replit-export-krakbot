@@ -36,6 +36,8 @@ echo "  KrakBot — SANDBOX MODE"
 echo "  Strategy : Bull/Bear Rotational Trader"
 echo "  Broker   : PaperBroker (synthetic fills, zero real orders)"
 echo "  Prices   : Live from Kraken public API"
+echo "  Entry    : BTC rolling-high breakout from current price"
+echo "             (floor=\$65K; works from any price above floor)"
 echo "============================================================"
 echo ""
 
@@ -43,4 +45,6 @@ USE_BULL_BEAR_TRADER=true \
 USE_PAPER_BROKER=true \
 KRAKEN_SANDBOX=true \
 BOT_MODE=live \
+BTC_BULL_RUN_FLOOR=65000 \
+BREAKOUT_CONFIDENCE_MIN=0.55 \
 python3 project/main.py
