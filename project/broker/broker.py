@@ -1261,7 +1261,7 @@ class LiveBroker(SimulatedBroker):
             if self.kill_switch:
                 print("[HEARTBEAT] Kill switch active — heartbeat suppressed")
             else:
-                print(f"[HEARTBEAT] alive at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"[HEARTBEAT] alive at {time.strftime('%Y-%m-%d %H:%M:%S')} local  |  {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC")
                 self.emit_health_check()
             self._last_heartbeat = now
 

@@ -126,14 +126,19 @@ fi
 # Show current ETP market status — always displayed at launch
 # ---------------------------------------------------------------------------
 python3 - <<'PYEOF'
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 now = datetime.now(ET)
+now_utc = datetime.now(timezone.utc)
 weekday = now.weekday()
 mkt_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
 mkt_close = now.replace(hour=16, minute=30, second=0, microsecond=0)
+
+# Bot clock — shown so the operator can confirm the server time is correct
+clock_utc   = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+clock_et    = now.strftime("%Y-%m-%d %H:%M:%S ET")
 
 if weekday < 5 and mkt_open <= now < mkt_close:
     etp_status = "OPEN  ✅  ETP/ETF trades are LIVE right now"
@@ -162,6 +167,9 @@ print(f"""
   Strategy : Bull/Bear Rotational Trader
   Broker   : PaperBroker — ZERO real orders sent to Kraken
   Prices   : Live from Kraken public API (no API key needed)
+  ------------------------------------------------------------
+  Bot clock: {clock_utc}
+             {clock_et}
   ------------------------------------------------------------
   Crypto   : 24/7 spot trading always active
              BTC, ETH, SOL, XRP, HBAR, LINK, XLM

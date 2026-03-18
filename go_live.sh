@@ -163,14 +163,18 @@ PYEOF
 # Current ETP market status
 # ---------------------------------------------------------------------------
 python3 - <<'PYEOF'
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 now = datetime.now(ET)
+now_utc = datetime.now(timezone.utc)
 weekday = now.weekday()
 mkt_open  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
 mkt_close = now.replace(hour=16, minute=30, second=0, microsecond=0)
+
+clock_utc = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+clock_et  = now.strftime("%Y-%m-%d %H:%M:%S ET")
 
 if weekday < 5 and mkt_open <= now < mkt_close:
     etp_status = "OPEN  ✅  ETP/ETF trades active immediately"
@@ -181,9 +185,9 @@ elif weekday < 5 and now < mkt_open:
     etp_detail = "Crypto spot starts immediately; ETP entries unlock at open"
 else:
     candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    candidate += __import__("datetime").timedelta(days=1)
+    candidate += timedelta(days=1)
     while candidate.weekday() >= 5:
-        candidate += __import__("datetime").timedelta(days=1)
+        candidate += timedelta(days=1)
     wait = int((candidate - now).total_seconds())
     etp_status = f"CLOSED (weekend) — next open {candidate.strftime('%A')} in {wait//3600}h {(wait%3600)//60}m"
     etp_detail = f"ETP entries unlock {candidate.strftime('%A')} at 09:30 ET"
@@ -194,6 +198,9 @@ print(f"""
   Strategy : Bull/Bear Rotational Trader
   Broker   : LiveBroker — orders sent to api.kraken.com
   Prices   : Live from Kraken public API
+  ------------------------------------------------------------
+  Bot clock: {clock_utc}
+             {clock_et}
   ------------------------------------------------------------
   Crypto   : 24/7 spot trading (BTC, ETH, SOL, XRP, HBAR, LINK, XLM)
   ETPs     : {etp_status}
