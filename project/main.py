@@ -275,18 +275,21 @@ def run_live():
                     print("[MAIN] Kill switch active — exiting loop")
                     break
 
-                # Auto-shutdown at 4:30 PM ET — end of US trading session.
-                # The EOD report is saved automatically by broker.close() in the
-                # finally block below.
-                _now_et = _datetime.datetime.now(_ET)
-                if (_now_et.weekday() < 5 and
-                        _now_et >= _now_et.replace(
-                            hour=16, minute=30, second=0, microsecond=0)):
-                    print(
-                        "[MAIN] 16:30 ET reached — end-of-day auto-shutdown.\n"
-                        "[MAIN] All trades recorded. EOD report will be saved now."
-                    )
-                    break
+                # Optional auto-shutdown at 4:30 PM ET.
+                # Disabled by default so the bot runs 24/7 (crypto never closes).
+                # Enable with: AUTO_SHUTDOWN_ET=true ./run_sandbox.sh
+                _auto_shutdown = _os.environ.get(
+                    "AUTO_SHUTDOWN_ET", "false").strip().lower() in ("true", "1", "yes")
+                if _auto_shutdown:
+                    _now_et = _datetime.datetime.now(_ET)
+                    if (_now_et.weekday() < 5 and
+                            _now_et >= _now_et.replace(
+                                hour=16, minute=30, second=0, microsecond=0)):
+                        print(
+                            "[MAIN] 16:30 ET reached — end-of-day auto-shutdown.\n"
+                            "[MAIN] All trades recorded. EOD report will be saved now."
+                        )
+                        break
 
                 # Keyboard commands
                 try:

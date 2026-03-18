@@ -15,30 +15,26 @@
 # All trades, P&L, and positions are simulated locally in the paper account.
 #
 # Trading schedule:
-#   • By default the script waits until 09:30 ET (US market open) before
-#     starting, then auto-shuts down at 16:30 ET (market close).
-#   • An end-of-day report is saved automatically to project/logs/eod_YYYYMMDD.txt
-#     so you can review tonight what the bot traded.
+#   • Runs 24/7 — crypto spot trades any time (BTC, ETH, SOL, XRP, HBAR, LINK, XLM)
+#   • ETP/short-ETF trades (ETHD, SETH) fire only during US market hours (Mon-Fri 09:30-16:30 ET)
+#   • The ETP gate is enforced in the strategy code automatically — no manual scheduling needed
 #
 # Log files written to project/logs/:
 #   paper_trades.csv      — every synthetic fill (CSV, one row per trade)
 #   trade_archive.db      — SQLite archive (trades + phase transitions + rotations)
-#   eod_YYYYMMDD.txt      — end-of-day analysis report (saved at 16:30 shutdown)
+#   eod_YYYYMMDD.txt      — end-of-day analysis report (written by Ctrl-C or AUTO_SHUTDOWN_ET)
 #
 # Keyboard commands (type in this terminal + Enter):
 #   S  — print paper trading summary (trades, P&L, positions)
 #   P  — print phase status (BTC confidence, signal scores, open positions)
 #   Ctrl-C — graceful shutdown (saves EOD report and prints final summary)
 #
-# Scheduling options (set before running):
+# Options (set before running):
 #
-#   Skip the 09:30 ET wait and start immediately:
-#       SKIP_MARKET_WAIT=true ./run_sandbox.sh
+#   Stop automatically at 16:30 ET each day (ETP market close):
+#       AUTO_SHUTDOWN_ET=true ./run_sandbox.sh
 #
-#   Start in N hours from now instead:
-#       START_DELAY_HOURS=2 ./run_sandbox.sh
-#
-#   Auto-wait until next weekday 09:30 ET (useful if running over the weekend):
+#   Wait until next weekday 09:30 ET before starting:
 #       WAIT_FOR_ETP_MARKET=true ./run_sandbox.sh
 #
 # Usage:
@@ -160,88 +156,10 @@ except Exception as e:
 PYEOF
 
 # ---------------------------------------------------------------------------
-# Default: auto-wait until today's 9:30 AM ET market open
-# Runs only when no other schedule flag is given AND the market hasn't opened.
-# Override: set START_DELAY_HOURS or WAIT_FOR_ETP_MARKET=true to use those
-# mechanisms instead; or set SKIP_MARKET_WAIT=true to start immediately.
+# Optional: wait until next ETP market open (WAIT_FOR_ETP_MARKET=true)
+# By default the bot starts immediately — crypto trades 24/7.
 # ---------------------------------------------------------------------------
-if [[ -z "${START_DELAY_HOURS:-}" \
-      && "${WAIT_FOR_ETP_MARKET:-false}" != "true" \
-      && "${SKIP_MARKET_WAIT:-false}" != "true" ]]; then
-    delay_sec=$(python3 - <<'PYEOF'
-from datetime import datetime
-from zoneinfo import ZoneInfo
-import math
-
-ET = ZoneInfo("America/New_York")
-now = datetime.now(ET)
-
-# Only wait if today is a weekday and we're before today's 9:30 AM open
-target = now.replace(hour=9, minute=30, second=0, microsecond=0)
-if now.weekday() < 5 and now < target:
-    print(math.ceil((target - now).total_seconds()))
-else:
-    print(0)
-PYEOF
-    )
-    if (( delay_sec > 0 )); then
-        start_at=$(python3 -c "
-from datetime import datetime
-from zoneinfo import ZoneInfo
-ET = ZoneInfo('America/New_York')
-now = datetime.now(ET)
-print(now.replace(hour=9, minute=30, second=0, microsecond=0).strftime('%A %Y-%m-%d 09:30 ET'))")
-        echo "⏰  Market opens at 09:30 ET — sleeping until then (${delay_sec}s)"
-        echo "    Start time : ${start_at}"
-        echo "    Crypto spot (BTC/ETH/SOL/…) will begin trading at open."
-        echo "    Press Ctrl-C to cancel, or set SKIP_MARKET_WAIT=true to start now."
-        echo ""
-        elapsed=0
-        while (( elapsed < delay_sec )); do
-            remaining=$(( delay_sec - elapsed ))
-            remaining_h=$(( remaining / 3600 ))
-            remaining_m=$(( (remaining % 3600) / 60 ))
-            echo "    ⏳  ${remaining_h}h ${remaining_m}m until 09:30 ET market open..."
-            sleep_chunk=$(( remaining < 1800 ? remaining : 1800 ))
-            sleep "${sleep_chunk}"
-            elapsed=$(( elapsed + sleep_chunk ))
-        done
-        echo "⏰  09:30 ET — market open, starting KrakBot now."
-        echo ""
-    fi
-fi
-
-# ---------------------------------------------------------------------------
-# Scheduled start: sleep until the requested start time
-# ---------------------------------------------------------------------------
-# Option 1 — explicit delay: START_DELAY_HOURS=11 ./run_sandbox.sh
-if [[ -n "${START_DELAY_HOURS:-}" ]]; then
-    delay_sec=$(python3 -c "import math; print(math.ceil(float('${START_DELAY_HOURS}') * 3600))")
-    start_at=$(date -d "+${delay_sec} seconds" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null \
-               || python3 -c "
-import datetime, time
-t = datetime.datetime.now() + datetime.timedelta(seconds=${delay_sec})
-print(t.strftime('%Y-%m-%d %H:%M:%S local'))")
-    echo "⏰  Scheduled start in ${START_DELAY_HOURS}h (${delay_sec}s)"
-    echo "    Will start at: ${start_at}"
-    echo "    Press Ctrl-C to cancel."
-    echo ""
-    # Print a countdown every 30 minutes so the terminal stays informative
-    elapsed=0
-    while (( elapsed < delay_sec )); do
-        remaining=$(( delay_sec - elapsed ))
-        remaining_h=$(( remaining / 3600 ))
-        remaining_m=$(( (remaining % 3600) / 60 ))
-        echo "    ⏳  ${remaining_h}h ${remaining_m}m remaining until start..."
-        sleep_chunk=$(( remaining < 1800 ? remaining : 1800 ))
-        sleep "${sleep_chunk}"
-        elapsed=$(( elapsed + sleep_chunk ))
-    done
-    echo "⏰  Delay complete — starting KrakBot now."
-    echo ""
-
-# Option 2 — auto-wait for next ETP market open: WAIT_FOR_ETP_MARKET=true
-elif [[ "${WAIT_FOR_ETP_MARKET:-false}" == "true" ]]; then
+if [[ "${WAIT_FOR_ETP_MARKET:-false}" == "true" ]]; then
     delay_sec=$(python3 - <<'PYEOF'
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -253,7 +171,6 @@ now = datetime.now(ET)
 # Find next weekday 09:30 ET
 candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
 if now >= candidate or now.weekday() >= 5:
-    # Already past today's open (or weekend) — move to next weekday
     candidate += timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate += timedelta(days=1)
@@ -275,7 +192,7 @@ if now >= candidate or now.weekday() >= 5:
 print(candidate.strftime('%A %Y-%m-%d 09:30 ET'))")
     echo "⏰  WAIT_FOR_ETP_MARKET=true — sleeping until next US ETP market open"
     echo "    Next open: ${start_at}  (${delay_sec}s from now)"
-    echo "    Press Ctrl-C to cancel."
+    echo "    Press Ctrl-C to cancel, or Ctrl-C and rerun without WAIT_FOR_ETP_MARKET to start now."
     echo ""
     elapsed=0
     while (( elapsed < delay_sec )); do
@@ -352,10 +269,12 @@ print(f"""
              {etp_detail}
   Bear short: ETHD 2× inverse (15-25%)  +  SETH 1× inverse (5-8%)
   ------------------------------------------------------------
-  Entry    : BTC rolling-high breakout (floor=$65K)
-  Ctrl-C   : Graceful shutdown (prints final P&L summary)
-  Keys     : S = paper summary  |  P = phase + positions
-  Review   : python3 review_performance.py  (any time)
+  Spot trade: 24/7 — buys/sells alts based on signals any time
+  Short ETFs: ETP market hours only (auto-gated in strategy)
+  Shutdown  : runs until Ctrl-C  (AUTO_SHUTDOWN_ET=true to stop at 16:30)
+  Ctrl-C    : Graceful shutdown (prints final P&L summary)
+  Keys      : S = paper summary  |  P = phase + positions
+  Review    : python3 review_performance.py  (any time)
 ============================================================
 """)
 PYEOF

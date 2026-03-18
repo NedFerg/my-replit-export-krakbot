@@ -152,6 +152,7 @@ MIN_ROTATION_GAIN: float = 0.10   # 10 % gain before considering rotation exit
 # Position size bounds by phase (fraction of total portfolio)
 SPOT_ALT_MIN:     float = 0.02
 SPOT_ALT_MAX:     float = 0.15
+SPOT_ALT_ACCUM_MAX: float = 0.08   # smaller cap during accumulation (conservative)
 LEVERAGE_ETF_MIN: float = 0.10
 LEVERAGE_ETF_MAX: float = 0.20
 # ---- Bear market shorts: two-tier layered short ----------------------------
@@ -204,6 +205,18 @@ HEDGE_RSI_OVERSOLD:   int = int(os.getenv("HEDGE_RSI_OVERSOLD",   "35"))
 # most liquid hedge vehicle).
 HEDGE_ASSETS: list[str] = ["BTC", "ETH"]
 
+# ---------------------------------------------------------------------------
+# Bear-entry parameters (used by accumulation → bear_market transition)
+# ---------------------------------------------------------------------------
+# The bot enters bear_market from accumulation when BTC makes N consecutive
+# lower closes AND has fallen at least BTC_BEAR_DROP_PCT from its recent high.
+# No absolute price floor is used — this is a relative momentum signal so it
+# fires at any BTC price level (e.g. $71K falling to $69K is a valid trigger).
+BTC_BEAR_CONFIRM_BARS_DEFAULT: int   = int(os.getenv("BTC_BEAR_CONFIRM_BARS", "5"))
+BTC_BEAR_DROP_PCT:             float = float(os.getenv("BTC_BEAR_DROP_PCT",   "0.02"))
+# Rolling-high look-back for the % drop check (number of bars).
+BTC_BEAR_ROLLING_HIGH_BARS:    int   = int(os.getenv("BTC_BEAR_ROLLING_HIGH_BARS", "20"))
+
 
 # ---------------------------------------------------------------------------
 # Phase constants
@@ -250,15 +263,15 @@ class BullBearRotationalTrader:
         self._phase_entered_at: float = time.time()
 
         # ---- BTC downtrend tracker (for accumulation → bear transition) -----
-        # Keeps a short rolling window of BTC prices to detect a confirmed
-        # downtrend when the bot cold-starts during a falling market.
-        # Threshold: BTC must be below the bull floor AND have made a lower
-        # close for BTC_BEAR_CONFIRM_BARS consecutive bars before the bot
-        # transitions directly to bear_market from accumulation.
-        self._btc_price_window: deque = deque(
-            maxlen=int(os.getenv("BTC_BEAR_CONFIRM_BARS", "5")) + 1
-        )
-        self._btc_bear_confirm_bars: int = int(os.getenv("BTC_BEAR_CONFIRM_BARS", "5"))
+        # Tracks a rolling window of BTC prices long enough for both:
+        #   • Consecutive-lower-close check (BTC_BEAR_CONFIRM_BARS bars)
+        #   • % drop from recent high (BTC_BEAR_ROLLING_HIGH_BARS bars)
+        # The bear trigger fires when BOTH conditions hold simultaneously,
+        # at any BTC price level (no absolute floor — relative momentum only).
+        self._btc_bear_confirm_bars: int   = BTC_BEAR_CONFIRM_BARS_DEFAULT
+        self._btc_bear_drop_pct:     float = BTC_BEAR_DROP_PCT
+        _window_size = max(BTC_BEAR_ROLLING_HIGH_BARS, self._btc_bear_confirm_bars + 1)
+        self._btc_price_window: deque = deque(maxlen=_window_size)
 
         # ---- Signal engines ---------------------------------------------
         self.btc_detector      = BTCBreakoutDetector(
@@ -325,9 +338,12 @@ class BullBearRotationalTrader:
             f"  BTC_ATH_TARGET          = ${BTC_ATH_TARGET:,.0f}  "
             f"(absolute ATH bonus level)\n"
             f"  BREAKOUT_CONFIDENCE_MIN = {BREAKOUT_CONFIDENCE_MIN:.2f}  "
-            f"(confidence threshold to exit accumulation)\n"
+            f"(confidence threshold to exit accumulation → bull)\n"
             f"  Bear trigger            : {self._btc_bear_confirm_bars} consecutive lower BTC closes "
-            f"below ${BTC_BULL_RUN_FLOOR:,.0f} → direct bear_market entry\n"
+            f"+ ≥{self._btc_bear_drop_pct*100:.0f}% drop from {BTC_BEAR_ROLLING_HIGH_BARS}-bar high "
+            f"→ accumulation → bear_market (no absolute floor)\n"
+            f"  Accumulation spot       : buys alts when score ≥ 0.40 (up to {SPOT_ALT_ACCUM_MAX*100:.0f}% each), "
+            f"sells when topping\n"
             f"  Short ETFs (bear phase)  ETHD 2× short {BEAR_SHORT_MIN*100:.0f}-{BEAR_SHORT_MAX*100:.0f}%  |  "
             f"SETH 1× short {SETH_SHORT_MIN*100:.0f}-{SETH_SHORT_MAX*100:.0f}%\n"
             f"  Crypto spot             24/7 — always active\n"
@@ -405,25 +421,40 @@ class BullBearRotationalTrader:
 
     def _btc_in_downtrend(self) -> bool:
         """
-        Return True when BTC has made a confirmed downtrend during accumulation.
+        Return True when BTC is in a confirmed downtrend — at any price level.
 
-        Criteria (both must hold):
-          1. BTC is currently below BTC_BULL_RUN_FLOOR (already implied by
-             being in accumulation, but checked explicitly for safety).
-          2. Every bar in the rolling price window is lower than the previous
-             bar — i.e., BTC_BEAR_CONFIRM_BARS consecutive lower closes.
+        Criteria (both must hold simultaneously):
+          1. Consecutive lower closes: the most recent BTC_BEAR_CONFIRM_BARS bars
+             each close lower than the previous bar.
+          2. Meaningful drop: the current price is at least BTC_BEAR_DROP_PCT
+             below the rolling high of the last BTC_BEAR_ROLLING_HIGH_BARS bars.
 
-        This lets the bot cold-start directly into bear_market when the market
-        is already falling, without needing to first pass through a bull phase.
-        The window defaults to 5 bars (≈ 5 seconds at 1 tick/sec, or ≈ 5
-        minutes at 1 tick/min); override via BTC_BEAR_CONFIRM_BARS env var.
+        No absolute price floor is used.  This fires when BTC drops from any
+        local high — e.g. $74K → $71K (4% drop) triggers the same way as
+        $67K → $65K.  The consecutive-close check prevents single-tick noise
+        from triggering a phase change.
+
+        Override via env vars:
+          BTC_BEAR_CONFIRM_BARS      (default 5)  — consecutive bars required
+          BTC_BEAR_DROP_PCT          (default 0.02) — minimum % drop from high
+          BTC_BEAR_ROLLING_HIGH_BARS (default 20)  — bars for the rolling high
         """
         prices = list(self._btc_price_window)
         if len(prices) < self._btc_bear_confirm_bars + 1:
-            return False                          # not enough history yet
+            return False   # not enough history yet
+
+        # 1. N consecutive lower closes (need N+1 prices to compare N pairs)
         recent = prices[-(self._btc_bear_confirm_bars + 1):]
-        # Every step must be a lower close
-        return all(recent[i] > recent[i + 1] for i in range(len(recent) - 1))
+        if not all(recent[i] > recent[i + 1] for i in range(len(recent) - 1)):
+            return False
+
+        # 2. Meaningful % drop from the rolling high
+        rolling_high = max(prices)
+        current      = prices[-1]
+        if rolling_high <= 0:
+            return False
+        drop_pct = (rolling_high - current) / rolling_high
+        return drop_pct >= self._btc_bear_drop_pct
 
     def _evaluate_phase_transition(
         self,
@@ -444,16 +475,18 @@ class BullBearRotationalTrader:
                     prices=prices,
                     confidence=btc_confidence,
                 )
-            elif btc_price < BTC_BULL_RUN_FLOOR and self._btc_in_downtrend():
-                # BTC is below the bull floor AND has printed consecutive lower
-                # closes — market is already in a downtrend.  Skip the bull
-                # phase and go directly to bear_market so ETHD/SETH shorts fire.
+            elif self._btc_in_downtrend():
+                # BTC has made consecutive lower closes AND dropped ≥ BTC_BEAR_DROP_PCT
+                # from its recent high — confirmed downtrend at any price level.
+                # Go directly to bear_market so ETHD/SETH shorts fire at market open.
+                rolling_high = max(self._btc_price_window) if self._btc_price_window else btc_price
+                drop_pct = (rolling_high - btc_price) / rolling_high if rolling_high > 0 else 0.0
                 self._transition_to(
                     PHASE_BEAR_MARKET,
                     reason=(
-                        f"BTC downtrend confirmed below bull floor "
-                        f"(${btc_price:,.0f} < ${BTC_BULL_RUN_FLOOR:,.0f}, "
-                        f"{self._btc_bear_confirm_bars} consecutive lower closes)"
+                        f"BTC downtrend confirmed: ${btc_price:,.0f} is "
+                        f"{drop_pct*100:.1f}% below {BTC_BEAR_ROLLING_HIGH_BARS}-bar high "
+                        f"(${rolling_high:,.0f}) with {self._btc_bear_confirm_bars} consecutive lower closes"
                     ),
                     prices=prices,
                     confidence=btc_confidence,
@@ -534,7 +567,7 @@ class BullBearRotationalTrader:
     def _execute_phase(self, prices: dict[str, float]) -> None:
         """Dispatch to the appropriate phase handler."""
         if self.phase == PHASE_ACCUMULATION:
-            self._phase_accumulation()
+            self._phase_accumulation(prices)
         elif self.phase == PHASE_BULL_ALT:
             self._phase_bull_alt_season(prices)
         elif self.phase == PHASE_ALT_CASCADE:
@@ -542,10 +575,38 @@ class BullBearRotationalTrader:
         elif self.phase == PHASE_BEAR_MARKET:
             self._phase_bear_market(prices)
 
-    def _phase_accumulation(self) -> None:
-        """Accumulation: stay in cash, no trades, wait for BTC breakout."""
-        # No orders — signal-driven only; do nothing until breakout fires.
-        pass
+    def _phase_accumulation(self, prices: dict[str, float]) -> None:
+        """
+        Accumulation: conservative spot trading while waiting for a breakout.
+
+        The bot is not in a confirmed bull or bear phase, but crypto trades 24/7.
+        Rather than sitting idle, it takes small spot positions in alts that show
+        positive momentum, and exits when they top out.
+
+        Rules:
+          - No leveraged ETFs or short ETPs (those belong to bull/bear phases).
+          - Position cap is SPOT_ALT_ACCUM_MAX (8%) — half the bull-phase cap.
+          - Entry threshold is 0.40 (slightly lower than bull's 0.50) since we
+            are not in a confirmed bull but still want to participate in moves.
+          - Exit immediately when the alt_detector flags topping.
+        """
+        # Exit any positions that are now topping
+        for asset in list(self.positions.keys()):
+            if asset not in KEY_ALTS:
+                continue
+            if self.alt_detector.is_topping(asset):
+                self._close_position(asset, self.positions[asset], prices.get(asset, 0.0))
+
+        # Enter alts with meaningful positive momentum (conservative size cap)
+        scores = {
+            a: self.alt_detector.last_scores.get(a, 0.0)
+            for a in KEY_ALTS
+            if a not in self.positions
+        }
+        for asset, score in sorted(scores.items(), key=lambda x: -x[1]):
+            if score >= 0.40:
+                size = min(self._position_size_bull(score), SPOT_ALT_ACCUM_MAX)
+                self._open_position(asset, size, prices.get(asset, 0.0))
 
     def _phase_bull_alt_season(self, prices: dict[str, float]) -> None:
         """
