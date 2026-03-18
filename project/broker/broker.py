@@ -618,12 +618,9 @@ class LiveBroker(SimulatedBroker):
 
         # Map internal asset names → Kraken ticker symbols used for the
         # public /0/public/Ticker price-feed batch request.
-        # Only include standard spot pairs that Kraken's public API supports.
-        # Leveraged ETP tokens (ETHU, ETHD, SLON, XXRP ETF, SETH) are NOT
-        # listed here because they are traded via Kraken's ETP platform and
-        # are not available on the standard public Ticker endpoint.
-        # BullBearRotationalTrader uses the underlying asset price (e.g. ETH)
-        # for paper-fill pricing of these tokens.
+        # Crypto spot pairs use Kraken's X-prefixed legacy names.
+        # ETHD (2× Short ETH ETP) and SETH (1× Short ETH ETP) are available
+        # on Kraken's ETP/stock trading platform and use plain USD pairs.
         self.kraken_pairs = {
             "BTC":  "XBTUSD",
             "ETH":  "ETHUSD",
@@ -633,6 +630,8 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
+            "ETHD": "ETHDUSD",   # ETH 2× Short ETP — Kraken stock/ETP platform
+            "SETH": "SETHUSD",   # ETH 1× Short ETP — Kraken stock/ETP platform
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
@@ -649,7 +648,8 @@ class LiveBroker(SimulatedBroker):
         }
 
         # Kraken balance-dict keys for each tracked asset
-        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names)
+        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names;
+        # ETP tickers ETHD/SETH use their plain ticker as the balance key)
         self.kraken_balance_keys = {
             "BTC":  "XXBT",
             "ETH":  "XETH",
@@ -659,6 +659,8 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBAR",
             "XRP":  "XXRP",
             "XLM":  "XXLM",
+            "ETHD": "ETHD",
+            "SETH": "SETH",
         }
 
         # Live price cache (populated by fetch_live_prices)
@@ -942,13 +944,33 @@ class LiveBroker(SimulatedBroker):
         Fetch the latest last-trade price for all tracked assets via Kraken's
         public Ticker endpoint in a SINGLE batched HTTP request.
 
-        Previous implementation made 8 separate calls (one per asset).  Kraken
-        accepts a comma-separated pair list, returning all tickers in one
-        response — 8× fewer API calls, much lower rate-limit risk.
-
         'c' field = last trade closed: [price, lot_volume].
         Returns the result dict and updates self.live_prices on success.
+        Logs all fetched prices and warns loudly if any deviate from
+        PRICE_SANITY_RANGES (configurable, defaults to known good ranges).
         """
+        # Known-good reference ranges:  (min, max) USD per asset.
+        # Override any entry via env vars: e.g. BTC_PRICE_MIN=60000
+        # These are generous ±50 % bounds around typical market prices so the
+        # check flags impossible values (wrong pair, wrong currency, stale cache)
+        # without triggering on normal market moves.
+        PRICE_SANITY_RANGES: dict[str, tuple[float, float]] = {
+            "BTC":  (float(os.getenv("BTC_PRICE_MIN",  "30000")),
+                     float(os.getenv("BTC_PRICE_MAX",  "200000"))),
+            "ETH":  (float(os.getenv("ETH_PRICE_MIN",  "500")),
+                     float(os.getenv("ETH_PRICE_MAX",  "10000"))),
+            "SOL":  (float(os.getenv("SOL_PRICE_MIN",  "10")),
+                     float(os.getenv("SOL_PRICE_MAX",  "1000"))),
+            "XRP":  (float(os.getenv("XRP_PRICE_MIN",  "0.10")),
+                     float(os.getenv("XRP_PRICE_MAX",  "20"))),
+            "LINK": (float(os.getenv("LINK_PRICE_MIN", "1")),
+                     float(os.getenv("LINK_PRICE_MAX", "100"))),
+            "HBAR": (float(os.getenv("HBAR_PRICE_MIN", "0.01")),
+                     float(os.getenv("HBAR_PRICE_MAX", "1"))),
+            "XLM":  (float(os.getenv("XLM_PRICE_MIN",  "0.01")),
+                     float(os.getenv("XLM_PRICE_MAX",  "5"))),
+        }
+
         # Build comma-separated pair string once
         pairs_str = ",".join(self.kraken_pairs.values())
         data = self._kraken_public("/0/public/Ticker", {"pair": pairs_str})
@@ -963,9 +985,6 @@ class LiveBroker(SimulatedBroker):
         # Build a reverse map: Kraken-normalised-pair → internal asset name.
         # Kraken normalises many pairs on the way out (e.g. XBTUSD → XXBTZUSD,
         # ETHUSD → XETHZUSD, XRPUSD → XXRPZUSD, XLMUSD → XXLMZUSD).
-        # We pre-populate the reverse map with both the "sent" form we requested
-        # AND the known Kraken-normalised form so both match without an HTTP
-        # round-trip to discover the canonical name.
         _KRAKEN_ALIASES: dict = {
             "XXBTZUSD": "BTC",   # Kraken normalises XBTUSD  → XXBTZUSD
             "XETHZUSD": "ETH",   # Kraken normalises ETHUSD  → XETHZUSD
@@ -989,6 +1008,29 @@ class LiveBroker(SimulatedBroker):
         if result:
             self.live_prices          = result
             self.last_price_timestamp = time.time()
+
+            # ---- Log every fetched price so the feed is fully auditable ----
+            price_line = "  ".join(
+                f"{a}=${result[a]:,.2f}"
+                for a in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM",
+                           "ETHD", "SETH"]
+                if a in result
+            )
+            print(f"[PRICE FEED] {price_line}")
+
+            # ---- Sanity check — flag prices outside known-good ranges ------
+            bad = []
+            for asset, (lo, hi) in PRICE_SANITY_RANGES.items():
+                price = result.get(asset)
+                if price is not None and not (lo <= price <= hi):
+                    bad.append(f"{asset}=${price:,.2f} (expected ${lo:,.0f}–${hi:,.0f})")
+            if bad:
+                print(
+                    f"[PRICE FEED ⚠️  SANITY FAIL] The following prices are outside "
+                    f"expected ranges — verify your Kraken connection is returning "
+                    f"real spot USD prices:\n  " + "\n  ".join(bad)
+                )
+
             missing = [a for a in self.kraken_pairs if a not in result]
             if missing:
                 print(f"[PRICE FEED] Missing prices for: {missing}")

@@ -69,6 +69,8 @@ try:
         "HBAR": "HBARUSD",
         "LINK": "LINKUSD",
         "XLM":  "XLMUSD",
+        "ETHD": "ETHDUSD",
+        "SETH": "SETHUSD",
     }
     ALIASES = {
         "XXBTZUSD": "BTC",
@@ -77,12 +79,25 @@ try:
         "XXLMZUSD": "XLM",
     }
 
+    # Sanity ranges — prices outside these mean something is wrong with the feed
+    SANITY = {
+        "BTC":  (30_000, 200_000),
+        "ETH":  (500,    10_000),
+        "SOL":  (10,     1_000),
+        "XRP":  (0.10,   20),
+        "LINK": (1,      100),
+        "HBAR": (0.01,   1),
+        "XLM":  (0.01,   5),
+    }
+
     pairs_str = ",".join(PAIRS.values())
     url = "https://api.kraken.com/0/public/Ticker?" + urllib.parse.urlencode({"pair": pairs_str})
 
+    print(f"    Fetching: {url}")
     t0 = time.time()
     with urllib.request.urlopen(url, timeout=8) as resp:
-        data = json.loads(resp.read())
+        raw = resp.read()
+        data = json.loads(raw)
     latency_ms = int((time.time() - t0) * 1000)
 
     if data.get("error"):
@@ -104,21 +119,38 @@ try:
 
     if not prices:
         print("⚠️   Could not parse any prices from Kraken response.")
+        print(f"    Raw response: {raw[:500]}")
         sys.exit(0)
 
     print()
     print("🔌  Live Kraken price feed — CONFIRMED  ✅")
-    print(f"    Source  : https://api.kraken.com/0/public/Ticker")
+    print(f"    Source  : api.kraken.com/0/public/Ticker  (last-trade 'c' field)")
     print(f"    Latency : {latency_ms} ms")
     print(f"    Assets  : {len(prices)}/{len(PAIRS)} responding")
     print()
-    for asset in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM"]:
+
+    bad = []
+    for asset in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM", "ETHD", "SETH"]:
         price = prices.get(asset)
-        if price is not None:
-            print(f"    {asset:<6}  ${price:>12,.4f}")
+        if price is None:
+            print(f"    {asset:<6}  (not returned by Kraken)")
+            continue
+        lo, hi = SANITY.get(asset, (0, float("inf")))
+        flag = "  ⚠️  OUT OF RANGE" if not (lo <= price <= hi) else ""
+        print(f"    {asset:<6}  ${price:>12,.4f}{flag}")
+        if flag:
+            bad.append(f"{asset} ${price:,.2f} (expected ${lo:,.0f}–${hi:,.0f})")
+
     print()
-    print("    All fills will be SIMULATED against these live prices.")
-    print("    No API key required — public feed only.")
+    if bad:
+        print("⚠️  PRICE SANITY FAILED — these prices look wrong:")
+        for b in bad:
+            print(f"      {b}")
+        print("   Check your network connection and verify against your Kraken app.")
+        print("   Do NOT start trading until prices match what you see on Kraken.")
+    else:
+        print("    ✅  All prices within expected ranges.")
+        print("    All fills will be SIMULATED against these live prices.")
     print()
 
 except Exception as e:
@@ -308,7 +340,7 @@ print(f"""
   KrakBot — SANDBOX MODE  (all fills are PAPER / simulated)
   Strategy : Bull/Bear Rotational Trader
   Broker   : PaperBroker — ZERO real orders sent to Kraken
-  Prices   : Live from Kraken public API (no API key needed)
+  Prices   : Live from Kraken public API (crypto + ETHD/SETH ETPs)
   ------------------------------------------------------------
   Bot clock: {clock_utc}
              {clock_et}

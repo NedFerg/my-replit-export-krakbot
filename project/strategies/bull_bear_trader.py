@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -248,6 +249,17 @@ class BullBearRotationalTrader:
         self.phase: str = initial_phase
         self._phase_entered_at: float = time.time()
 
+        # ---- BTC downtrend tracker (for accumulation → bear transition) -----
+        # Keeps a short rolling window of BTC prices to detect a confirmed
+        # downtrend when the bot cold-starts during a falling market.
+        # Threshold: BTC must be below the bull floor AND have made a lower
+        # close for BTC_BEAR_CONFIRM_BARS consecutive bars before the bot
+        # transitions directly to bear_market from accumulation.
+        self._btc_price_window: deque = deque(
+            maxlen=int(os.getenv("BTC_BEAR_CONFIRM_BARS", "5")) + 1
+        )
+        self._btc_bear_confirm_bars: int = int(os.getenv("BTC_BEAR_CONFIRM_BARS", "5"))
+
         # ---- Signal engines ---------------------------------------------
         self.btc_detector      = BTCBreakoutDetector(
             ath_target=BTC_ATH_TARGET,
@@ -314,6 +326,8 @@ class BullBearRotationalTrader:
             f"(absolute ATH bonus level)\n"
             f"  BREAKOUT_CONFIDENCE_MIN = {BREAKOUT_CONFIDENCE_MIN:.2f}  "
             f"(confidence threshold to exit accumulation)\n"
+            f"  Bear trigger            : {self._btc_bear_confirm_bars} consecutive lower BTC closes "
+            f"below ${BTC_BULL_RUN_FLOOR:,.0f} → direct bear_market entry\n"
             f"  Short ETFs (bear phase)  ETHD 2× short {BEAR_SHORT_MIN*100:.0f}-{BEAR_SHORT_MAX*100:.0f}%  |  "
             f"SETH 1× short {SETH_SHORT_MIN*100:.0f}-{SETH_SHORT_MAX*100:.0f}%\n"
             f"  Crypto spot             24/7 — always active\n"
@@ -345,6 +359,10 @@ class BullBearRotationalTrader:
         btc_price = prices.get("BTC", 0.0)
         btc_vol   = volumes.get("BTC", 0.0)
         btc_confidence = self.btc_detector.update(btc_price, btc_vol)
+
+        # Track BTC price history for downtrend detection
+        if btc_price > 0:
+            self._btc_price_window.append(btc_price)
 
         for asset in KEY_ALTS:
             price = prices.get(asset, 0.0)
@@ -385,6 +403,28 @@ class BullBearRotationalTrader:
     # Phase state machine
     # ====================================================================
 
+    def _btc_in_downtrend(self) -> bool:
+        """
+        Return True when BTC has made a confirmed downtrend during accumulation.
+
+        Criteria (both must hold):
+          1. BTC is currently below BTC_BULL_RUN_FLOOR (already implied by
+             being in accumulation, but checked explicitly for safety).
+          2. Every bar in the rolling price window is lower than the previous
+             bar — i.e., BTC_BEAR_CONFIRM_BARS consecutive lower closes.
+
+        This lets the bot cold-start directly into bear_market when the market
+        is already falling, without needing to first pass through a bull phase.
+        The window defaults to 5 bars (≈ 5 seconds at 1 tick/sec, or ≈ 5
+        minutes at 1 tick/min); override via BTC_BEAR_CONFIRM_BARS env var.
+        """
+        prices = list(self._btc_price_window)
+        if len(prices) < self._btc_bear_confirm_bars + 1:
+            return False                          # not enough history yet
+        recent = prices[-(self._btc_bear_confirm_bars + 1):]
+        # Every step must be a lower close
+        return all(recent[i] > recent[i + 1] for i in range(len(recent) - 1))
+
     def _evaluate_phase_transition(
         self,
         prices: dict[str, float],
@@ -401,6 +441,20 @@ class BullBearRotationalTrader:
                 self._transition_to(
                     PHASE_BULL_ALT,
                     reason=f"BTC breakout confirmed (confidence={btc_confidence:.2f})",
+                    prices=prices,
+                    confidence=btc_confidence,
+                )
+            elif btc_price < BTC_BULL_RUN_FLOOR and self._btc_in_downtrend():
+                # BTC is below the bull floor AND has printed consecutive lower
+                # closes — market is already in a downtrend.  Skip the bull
+                # phase and go directly to bear_market so ETHD/SETH shorts fire.
+                self._transition_to(
+                    PHASE_BEAR_MARKET,
+                    reason=(
+                        f"BTC downtrend confirmed below bull floor "
+                        f"(${btc_price:,.0f} < ${BTC_BULL_RUN_FLOOR:,.0f}, "
+                        f"{self._btc_bear_confirm_bars} consecutive lower closes)"
+                    ),
                     prices=prices,
                     confidence=btc_confidence,
                 )

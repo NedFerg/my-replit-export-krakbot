@@ -330,11 +330,14 @@ def main() -> None:
         print(f"    EOD report       : {eod_path}")
     print()
     if not paper_trades and not jsonl_trades:
-        print("  💡  No trades found. Run ./run_sandbox.sh to start the bot.")
-    elif len(paper_trades) <= 1 and not eod_path:
-        print("  💡  Only 1 paper trade found — the bot may still be starting up,")
-        print("      or market conditions did not trigger entries yet today.")
-        print("      Run ./run_sandbox.sh to start a fresh session.")
+        print("  💡  No trades yet this session.")
+        print("      Run ./run_sandbox.sh to start the bot.")
+        print("      Prices are fetched live from Kraken on every tick.")
+    elif not paper_trades and not eod_path:
+        print("  💡  Bot started but no fills yet — market conditions haven't")
+        print("      triggered an entry signal, or ETP market is not open yet.")
+        print("      Prices are fetched live from Kraken. Watch the bot output")
+        print("      for '[PRICE FEED] BTC=... ETH=...' to confirm live data.")
     print("=" * 70)
     print()
 
