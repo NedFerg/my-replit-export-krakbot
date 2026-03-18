@@ -519,11 +519,11 @@ class LiveBroker(SimulatedBroker):
         self.kill_switch      = False  # set True to halt all order flow immediately
 
         # Fee accounting
-        # Kraken spot taker fee for standard volume tier (< $50k/month).
-        # Maker = 0.16 %, taker = 0.26 %.  Limit orders earn maker rebate when
+        # Kraken spot taker fee for retail tier (< $10k 30-day volume).
+        # Maker = 0.16 %, taker = 0.40 %.  Limit orders earn maker rebate when
         # they rest on the book; we default to limit orders now.
-        # Round-trip taker cost = 2 × 0.26 % = 0.52 % per trade.
-        self.taker_fee           = 0.0026   # 0.26 % taker
+        # Round-trip taker cost = 2 × 0.40 % = 0.80 % per trade.
+        self.taker_fee           = 0.004    # 0.40 % taker (retail tier < $10k/30d)
         self.maker_fee           = 0.0016   # 0.16 % maker (earned on limit orders)
         self.cumulative_fees_usd = 0.0      # total estimated fees paid this session
 
@@ -651,6 +651,53 @@ class LiveBroker(SimulatedBroker):
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
         self._starting_equity    = None # total equity at first live trade of the session
+
+    # ------------------------------------------------------------------
+    # Fee tier helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_kraken_taker_fee(trading_volume_30d: float) -> float:
+        """
+        Return the Kraken spot taker fee rate for the given 30-day USD volume.
+
+        Tier schedule (as of 2025):
+            < $10,000  → 0.40 %
+            < $50,000  → 0.35 %
+            < $100,000 → 0.24 %
+            < $250,000 → 0.22 %
+            < $500,000 → 0.20 %
+            < $1M      → 0.18 %
+            < $2.5M    → 0.16 %
+            < $5M      → 0.14 %
+            ≥ $5M      → 0.12 %
+
+        Parameters
+        ----------
+        trading_volume_30d : Total USD notional traded in the last 30 days.
+
+        Returns
+        -------
+        float — taker fee as a decimal fraction (e.g. 0.004 for 0.40 %).
+        """
+        if trading_volume_30d < 10_000:
+            return 0.0040
+        elif trading_volume_30d < 50_000:
+            return 0.0035
+        elif trading_volume_30d < 100_000:
+            return 0.0024
+        elif trading_volume_30d < 250_000:
+            return 0.0022
+        elif trading_volume_30d < 500_000:
+            return 0.0020
+        elif trading_volume_30d < 1_000_000:
+            return 0.0018
+        elif trading_volume_30d < 2_500_000:
+            return 0.0016
+        elif trading_volume_30d < 5_000_000:
+            return 0.0014
+        else:
+            return 0.0012
 
     # ------------------------------------------------------------------
     # Portfolio exposure — live override
@@ -1301,7 +1348,7 @@ class LiveBroker(SimulatedBroker):
         This replaces unconditional market orders.  On liquid pairs the limit
         fills immediately at or better than the limit price; on thin books it
         prevents catastrophic slippage on HBAR/XLM.
-        Limit orders also qualify for maker fee (0.16%) rather than taker (0.26%)
+        Limit orders also qualify for maker fee (0.16%) rather than taker (0.40%)
         when they rest on the book.
 
         Returns None for invalid inputs (triggers kill switch on unknown asset or
@@ -2119,7 +2166,7 @@ class PaperBroker(LiveBroker):
         fill_price = mid ×  (1 + slippage)   for buys
         fill_price = mid ×  (1 − slippage)   for sells
 
-    Fees use the same Kraken taker schedule as LiveBroker (0.26%).
+    Fees use the same Kraken taker schedule as LiveBroker (0.40% retail tier).
 
     Real Kraken HTTP calls are still made for:
         · Price data     — /0/public/Ticker (batched, 1 call per refresh)
@@ -2144,14 +2191,18 @@ class PaperBroker(LiveBroker):
         os.path.dirname(__file__), "..", "logs", "paper_trades.csv"
     )
 
-    def __init__(self, initial_cash: float, slippage: float | None = None, **kwargs):
+    def __init__(self, initial_cash: float, slippage: float | None = None,
+                 trade_archive=None, **kwargs):
         """
         Parameters
         ----------
-        initial_cash : Starting USD balance for the paper account.
-        slippage     : Fractional slippage per fill.  Defaults to
-                       PAPER_SLIPPAGE env var → DEFAULT_SLIPPAGE (0.05%).
-        **kwargs     : Forwarded to LiveBroker.__init__.
+        initial_cash  : Starting USD balance for the paper account.
+        slippage      : Fractional slippage per fill.  Defaults to
+                        PAPER_SLIPPAGE env var → DEFAULT_SLIPPAGE (0.05%).
+        trade_archive : Optional TradeArchive instance for persistent SQLite
+                        logging.  When provided, every fill is recorded via
+                        archive.record_trade().
+        **kwargs      : Forwarded to LiveBroker.__init__.
         """
         # LiveBroker must be in dry_run=False so its monitoring infrastructure
         # (kill switch, health checks, price fetching) is fully armed.
@@ -2172,6 +2223,12 @@ class PaperBroker(LiveBroker):
         self.paper_cumulative_fees = 0.0
         self.paper_trade_history: list = []
 
+        # --- SQLite trade archive (optional) ------------------------------
+        self._trade_archive = trade_archive  # TradeArchive | None
+        # Active strategy name — updated by set_strategy_name() so the
+        # archive can attribute each fill to the agent that generated it.
+        self._current_strategy: str = ""
+
         # --- CSV log setup ------------------------------------------------
         import csv as _csv
         log_path = os.path.abspath(self.LOG_PATH)
@@ -2189,12 +2246,22 @@ class PaperBroker(LiveBroker):
             f"  starting_cash = ${initial_cash:.2f}\n"
             f"  slippage      = {self.paper_slippage:.4%}\n"
             f"  trade_log     = {log_path}\n"
+            f"  archive       = {'enabled (' + self._trade_archive.db_path + ')' if self._trade_archive else 'disabled'}\n"
             f"  All fills are synthetic — no real orders sent to Kraken."
         )
 
     # ------------------------------------------------------------------
     # Equity and positions — paper-authoritative (ignores Kraken balances)
     # ------------------------------------------------------------------
+
+    def set_strategy_name(self, name: str) -> None:
+        """
+        Set the active strategy name for archive attribution.
+
+        Call this before (or immediately after) each group of fills so the
+        archive can tag trades with the agent/strategy that generated them.
+        """
+        self._current_strategy = name
 
     def compute_total_equity(self) -> float:
         """
@@ -2395,6 +2462,15 @@ class PaperBroker(LiveBroker):
             record["fee_usd"],     record["realized_pnl_usd"], record["position_after_trade"],
         ])
 
+        # SQLite archive (optional) — non-fatal if unavailable
+        if self._trade_archive is not None:
+            try:
+                self._trade_archive.record_trade(
+                    record, strategy_name=self._current_strategy
+                )
+            except Exception as _exc:  # noqa: BLE001
+                print(f"[TradeArchive] WARNING: failed to record trade: {_exc}")
+
         print(
             f"[PAPER FILL] {side.upper():4s} {coin_units:.6f} {asset}"
             f"  mid=${mid_price:.4f}  fill=${fill_price:.4f}"
@@ -2573,7 +2649,7 @@ class PaperBroker(LiveBroker):
         print()
 
     def close(self):
-        """Flush and close the CSV trade log file.  Call at session end."""
+        """Flush and close the CSV trade log file and SQLite archive.  Call at session end."""
         self.print_session_summary()
         try:
             self._csv_file.flush()
@@ -2581,6 +2657,12 @@ class PaperBroker(LiveBroker):
             print(f"[PaperBroker] Trade log closed: {self.LOG_PATH}")
         except Exception:
             pass
+        if self._trade_archive is not None:
+            try:
+                self._trade_archive.close()
+                print(f"[PaperBroker] Trade archive closed: {self._trade_archive.db_path}")
+            except Exception:
+                pass
 
 
 def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
