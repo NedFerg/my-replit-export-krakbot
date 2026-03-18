@@ -8,6 +8,25 @@ BullBearRotationalTrader orchestrates a 4-phase market-cycle trading strategy:
   "alt_cascade"    → ETH reversed + legislation catalyst. Max commodity ETF.
   "bear_market"    → Market topping. 2× short ETFs, reduced/no spot exposure.
 
+In addition to the 4-phase logic, a **hedge overlay** runs every bar
+in every phase.  The overlay uses RSI, Bollinger Bands, and resistance /
+support proximity to size a small bidirectional position:
+
+  Short hedge (ETHD — 2× Short ETH ETP):
+    Opened when overbought signals fire — RSI > 72, price above upper
+    Bollinger Band, or price at rolling resistance.  Provides downside
+    protection and profits if the market reverses.
+
+  Long hedge floor (ETHU — 2× Long ETH ETP):
+    Opened when oversold signals fire — RSI < 35, price below lower
+    Bollinger Band, or price at rolling support.  Ensures the bot holds
+    leveraged long exposure for a sharp bounce even if it hasn't yet
+    transitioned to bull_alt_season.
+
+Together these two legs mean the bot is positioned for the most probable
+move but has resources on the other side so it can profit regardless of
+whether the next move is up or down.
+
 The strategy works from **any** BTC price level, not just above $100 K.
 When BTC is at $74 K and trending upward the rolling-high breakout
 component in BTCBreakoutDetector will accumulate confidence and trigger
@@ -33,6 +52,18 @@ to adapt to a different market entry price:
                             Default: 0.55  (lower than 0.60 to compensate for
                             the ATH component scoring 0 at $74 K)
 
+  HEDGE_SHORT_MAX          Max short-ETF (ETHD) allocation as fraction of equity.
+                            Default: 0.08 (8 %)
+
+  HEDGE_LONG_MAX           Max long-ETF (ETHU) floor allocation as fraction of equity.
+                            Default: 0.10 (10 %)
+
+  HEDGE_RSI_OVERBOUGHT     RSI level that triggers the short hedge.
+                            Default: 72
+
+  HEDGE_RSI_OVERSOLD       RSI level that triggers the long hedge floor.
+                            Default: 35
+
 Integration
 -----------
     from strategies.bull_bear_trader import BullBearRotationalTrader
@@ -53,6 +84,7 @@ from strategies.signals.btc_breakout_detector   import BTCBreakoutDetector
 from strategies.signals.alt_pump_detector        import AltPumpDetector
 from strategies.signals.market_topping_detector  import MarketToppingDetector
 from strategies.signals.recovery_detector        import RecoveryDetector
+from strategies.signals.hedge_signal_detector    import HedgeSignalDetector
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +132,35 @@ CASCADE_ETF_MAX:  float = 0.30   # commodity ETF in alt_cascade phase
 
 ROTATION_EXIT_FRACTION: float = 0.50   # exit 50 % of a peaked alt on rotation
 ROTATION_ENTRY_SIZE:    float = 0.15   # enter 15 % in the next candidate
+
+# ---------------------------------------------------------------------------
+# Hedge overlay configuration
+# ---------------------------------------------------------------------------
+# The hedge overlay runs every bar regardless of the current phase.
+# It reads RSI + Bollinger Bands + resistance/support proximity and sizes a
+# small counter-position so the portfolio can profit from either direction.
+#
+# Short hedge (ETHD — 2× Short ETH ETP):
+#   Opens when overbought signals fire (RSI > threshold, price above upper
+#   Bollinger Band, or at rolling resistance).  Max size HEDGE_SHORT_MAX.
+#
+# Long hedge floor (ETHU — 2× Long ETH ETP):
+#   Opens when oversold signals fire (RSI < threshold, price below lower
+#   Bollinger Band, or at rolling support).  Max size HEDGE_LONG_MAX.
+#
+# The overlay is additive to the phase positions.  During bull_alt_season the
+# long ETFs already carry most of the upside; the short hedge is a small
+# insurance layer.  During accumulation both layers operate so the bot can
+# capture a breakout in either direction.
+#
+# Override via environment variables:
+HEDGE_SHORT_MAX: float = float(os.getenv("HEDGE_SHORT_MAX", "0.08"))   # 8 % cap
+HEDGE_LONG_MAX:  float = float(os.getenv("HEDGE_LONG_MAX",  "0.10"))   # 10 % cap
+HEDGE_RSI_OVERBOUGHT: int = int(os.getenv("HEDGE_RSI_OVERBOUGHT", "72"))
+HEDGE_RSI_OVERSOLD:   int = int(os.getenv("HEDGE_RSI_OVERSOLD",   "35"))
+# Assets the hedge overlay tracks (BTC drives the macro signal; ETH is the
+# most liquid hedge vehicle).
+HEDGE_ASSETS: list[str] = ["BTC", "ETH"]
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +226,23 @@ class BullBearRotationalTrader:
         )
         self.recovery_detector = RecoveryDetector(assets=KEY_ALTS)
 
+        # ---- Hedge overlay detectors ------------------------------------
+        # One per tracked anchor asset (BTC + ETH).
+        # Detectors are keyed by the spot asset name even though the actual
+        # hedge instrument is an ETF (ETHD for short, ETHU for long).
+        self.hedge_detectors: dict[str, HedgeSignalDetector] = {
+            asset: HedgeSignalDetector(
+                asset=asset,
+                rsi_overbought=HEDGE_RSI_OVERBOUGHT,
+                rsi_oversold=HEDGE_RSI_OVERSOLD,
+                max_short=HEDGE_SHORT_MAX,
+                max_long=HEDGE_LONG_MAX,
+            )
+            for asset in HEDGE_ASSETS
+        }
+        # Cache of last hedge recommendations (keyed by asset)
+        self.hedge_recommendations: dict[str, Any] = {}
+
         # ---- Position tracking ------------------------------------------
         # Maps asset → fraction of portfolio currently allocated
         self.positions: dict[str, float] = {}
@@ -223,12 +301,21 @@ class BullBearRotationalTrader:
         market_topping = self.topping_detector.update(prices)
         recovering     = self.recovery_detector.update(prices)
 
+        # ---- Update hedge overlay detectors ----------------------------
+        for asset in HEDGE_ASSETS:
+            price = prices.get(asset, 0.0)
+            vol   = volumes.get(asset, 0.0)
+            if price > 0:
+                rec = self.hedge_detectors[asset].update(price, vol)
+                self.hedge_recommendations[asset] = rec
+
         self.last_signals = {
-            "btc_price":       btc_price,
-            "btc_confidence":  btc_confidence,
-            "market_topping":  market_topping,
-            "recovering":      recovering,
-            "alt_scores":      dict(self.alt_detector.last_scores),
+            "btc_price":            btc_price,
+            "btc_confidence":       btc_confidence,
+            "market_topping":       market_topping,
+            "recovering":           recovering,
+            "alt_scores":           dict(self.alt_detector.last_scores),
+            "hedge_recommendations": dict(self.hedge_recommendations),
         }
 
         # ---- Phase transition logic ------------------------------------
@@ -236,6 +323,9 @@ class BullBearRotationalTrader:
 
         # ---- Phase execution logic ------------------------------------
         self._execute_phase(prices)
+
+        # ---- Hedge overlay (runs every bar, every phase) ---------------
+        self._apply_hedge_overlay(prices)
 
     # ====================================================================
     # Phase state machine
