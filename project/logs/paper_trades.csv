@@ -1,1 +1,2 @@
 timestamp,asset,side,size_coins,fill_price,notional_usd,fee_usd,realized_pnl_usd,position_after_trade
+2026-03-18T03:05:59Z,ETH,buy,0.11544589,4622.31,533.6267,2.134507,0.0,0.11544589

@@ -10,6 +10,40 @@ from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 
 
+# ===========================================================================
+# ASSET ALLOWLIST — only these tickers may ever be traded by this bot.
+#
+# Even if the Kraken API key has "Allow trading of stocks and ETFs" enabled
+# in the account security settings, the bot will NEVER submit an order for
+# a stock or non-crypto instrument.  Any asset name not in this set is
+# rejected before reaching the order-builder or Kraken API, with a clear
+# log message explaining the rejection.
+#
+# To add a new asset: extend this set AND add it to self.kraken_pairs in
+# LiveBroker.__init__ so price feeds and order routing also know about it.
+# DO NOT add stock tickers here — this bot is crypto-only.
+# ===========================================================================
+APPROVED_ASSETS: frozenset[str] = frozenset({
+    # --- Spot crypto (the universe the bot watches and trades) -----------
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP",
+    "LINK",
+    "HBAR",
+    "XLM",
+    "AVAX",
+    # --- Kraken crypto ETP / leveraged tokens ----------------------------
+    # These are crypto-underlying products listed on Kraken's ETP platform.
+    # They are NOT stocks — they are crypto-collateralised structured tokens.
+    "ETHU",   # ETH 2× Long ETP
+    "ETHD",   # ETH 2× Short ETP
+    "SLON",   # SOL 2× Long ETP
+    "XXRP",   # XRP 2× Long ETP
+    "SETH",   # ETH 1× Short ETP
+})
+
+
 # --- Per-asset beta categories ----------------------------------------
 # High-beta alts get more futures overlay (tactical/reactive).
 # Low-beta majors get more spot core (stable/conviction).
@@ -1569,6 +1603,15 @@ class LiveBroker(SimulatedBroker):
         Returns False (and triggers the kill switch where appropriate) if any
         check fails.  Called at the top of every live execution path.
 
+        Checks (in order)
+        -----------------
+        1. Kill-switch / health               — halt if system is unhealthy
+        2. Asset allowlist (APPROVED_ASSETS)  — reject non-crypto immediately
+        3. Trade rate limiter                 — enforce order-per-hour cap
+        4. Per-asset notional cap             — skip oversized single orders
+        5. Total portfolio notional cap       — skip when book is full
+        6. Daily loss cap                     — halt if drawdown limit hit
+
         Parameters
         ----------
         asset        : internal asset name ("SOL", "BTC", …)
@@ -1579,6 +1622,22 @@ class LiveBroker(SimulatedBroker):
                          _execute_spot_trade → abs(delta_frac) × equity
         """
         if not self.check_health():
+            return False
+
+        # ----------------------------------------------------------------
+        # ASSET ALLOWLIST — block anything not in the approved crypto set.
+        # This fires before every other check so a rejected asset never
+        # reaches the order-builder or Kraken API, regardless of what
+        # permissions are enabled on the API key (including stock trading).
+        # ----------------------------------------------------------------
+        if asset not in APPROVED_ASSETS:
+            print(
+                f"[SAFETY] Order BLOCKED — '{asset}' is not in the approved "
+                f"crypto asset list.  This bot trades only: "
+                f"{sorted(APPROVED_ASSETS)}.  "
+                f"No stock or non-crypto instrument will ever be submitted, "
+                f"even if the API key has stock-trading permission enabled."
+            )
             return False
 
         if not self._check_trade_rate():

@@ -535,6 +535,105 @@ class BullBearRotationalTrader:
         return LEVERAGE_ETF_MIN + (LEVERAGE_ETF_MAX - LEVERAGE_ETF_MIN) * min(score, 1.0)
 
     # ====================================================================
+    # Hedge overlay
+    # ====================================================================
+
+    def _apply_hedge_overlay(self, prices: dict[str, float]) -> None:
+        """
+        Real-time bidirectional hedge overlay — runs every bar in every phase.
+
+        Reads the hedge recommendations computed in step() for BTC and ETH
+        and adjusts two instrument positions accordingly:
+
+          ETHD (2× Short ETH ETP) — the short hedge leg
+            Sized proportional to ``overbought_score``.  Opened when RSI is
+            elevated, price is above the upper Bollinger Band, or price is
+            testing rolling resistance.  Trimmed when overbought signals fade.
+
+          ETHU (2× Long ETH ETP) — the long hedge floor
+            Sized proportional to ``oversold_score``.  Opened when RSI is
+            depressed, price is below the lower Bollinger Band, or price is
+            testing rolling support.  Trimmed when oversold signals fade.
+
+        The hedge sizes are the **maximum** of the BTC and ETH signals so
+        that a strong signal on either anchor asset drives the overlay.
+
+        In the bear_market phase the short hedge from ``_phase_bear_market``
+        takes priority: this overlay will not reduce positions that the phase
+        logic already sized to BEAR_SHORT_MIN or above.
+        """
+        if not self.hedge_recommendations:
+            return
+
+        eth_price = prices.get("ETH", 0.0)
+        if eth_price <= 0:
+            return
+
+        # ---- Aggregate signals across anchor assets --------------------
+        # Take the max signal strength so either BTC or ETH can trigger.
+        ob_score = max(
+            rec.overbought_score
+            for rec in self.hedge_recommendations.values()
+        )
+        os_score = max(
+            rec.oversold_score
+            for rec in self.hedge_recommendations.values()
+        )
+
+        target_short = HEDGE_SHORT_MAX * ob_score   # target ETHD allocation
+        target_long  = HEDGE_LONG_MAX  * os_score   # target ETHU allocation
+
+        # ---- Short hedge: ETHD ----------------------------------------
+        current_short = self.positions.get("ETHD", 0.0)
+
+        if self.phase == PHASE_BEAR_MARKET:
+            # Bear phase logic manages ETHD via _phase_bear_market().
+            # The overlay only top-ups; it never reduces below BEAR_SHORT_MIN.
+            target_short = max(target_short, BEAR_SHORT_MIN)
+
+        if target_short > current_short + 0.005:
+            # Need more short hedge
+            delta = target_short - current_short
+            self._open_position("ETHD", delta, eth_price)
+            self._log(
+                f"[HEDGE] Short overlay: ETHD +{delta*100:.1f}%  "
+                f"(ob_score={ob_score:.2f})"
+            )
+        elif target_short < current_short - 0.005 and self.phase != PHASE_BEAR_MARKET:
+            # Signal faded — trim short hedge (not in bear phase where it's deliberate)
+            delta = current_short - target_short
+            self._close_position("ETHD", delta, eth_price)
+            self._log(
+                f"[HEDGE] Short trimmed: ETHD -{delta*100:.1f}%  "
+                f"(ob_score={ob_score:.2f})"
+            )
+
+        # ---- Long hedge floor: ETHU -----------------------------------
+        current_long = self.positions.get("ETHU", 0.0)
+
+        if self.phase == PHASE_BEAR_MARKET:
+            # No long ETF positions in a bear market.
+            if current_long > 0.005:
+                self._close_position("ETHU", current_long, eth_price)
+                self._log("[HEDGE] Bear phase: closing long ETF floor (ETHU)")
+            return
+
+        if target_long > current_long + 0.005:
+            delta = target_long - current_long
+            self._open_position("ETHU", delta, eth_price)
+            self._log(
+                f"[HEDGE] Long floor: ETHU +{delta*100:.1f}%  "
+                f"(os_score={os_score:.2f})"
+            )
+        elif target_long < current_long - 0.005:
+            delta = current_long - target_long
+            self._close_position("ETHU", delta, eth_price)
+            self._log(
+                f"[HEDGE] Long trimmed: ETHU -{delta*100:.1f}%  "
+                f"(os_score={os_score:.2f})"
+            )
+
+    # ====================================================================
     # Order helpers
     # ====================================================================
 

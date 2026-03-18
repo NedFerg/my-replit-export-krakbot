@@ -327,12 +327,20 @@ class TradeArchive:
 
         Parameters
         ----------
-        table   : Table name.  Must be a hardcoded string (not user input).
+        table   : Table name.  Must be one of the allowed table names below.
+                  A ValueError is raised on any other value so user-controlled
+                  input can never reach the SQL string.
         filters : List of (column_expr, value) pairs, e.g. [("from_phase = ?", "accumulation")].
                   The column expressions are hardcoded by the caller; values are
                   passed as bound parameters so there is no SQL injection risk.
         limit   : Maximum rows to return.
         """
+        _ALLOWED_TABLES = {"phase_transitions", "rotations", "trades"}
+        if table not in _ALLOWED_TABLES:
+            raise ValueError(
+                f"_query_table: '{table}' is not an allowed table name. "
+                f"Must be one of {sorted(_ALLOWED_TABLES)}."
+            )
         clauses = [col for col, _ in filters]
         params:  list[Any] = [val for _, val in filters]
         where   = ("WHERE " + " AND ".join(clauses)) if clauses else ""
