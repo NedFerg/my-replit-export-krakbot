@@ -79,12 +79,39 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from strategies.signals.btc_breakout_detector   import BTCBreakoutDetector
 from strategies.signals.alt_pump_detector        import AltPumpDetector
 from strategies.signals.market_topping_detector  import MarketToppingDetector
 from strategies.signals.recovery_detector        import RecoveryDetector
 from strategies.signals.hedge_signal_detector    import HedgeSignalDetector
+
+
+# ---------------------------------------------------------------------------
+# ETP / ETF market hours guard
+# ---------------------------------------------------------------------------
+# US-listed leveraged/short ETPs (ETHU, ETHD, SLON, XXRP, SETH) are only
+# tradeable during NYSE/ARCA hours: Mon-Fri 09:30-16:30 Eastern.
+# Crypto spot (BTC, ETH, SOL, XRP, …) trades 24/7 and is never gated.
+# ---------------------------------------------------------------------------
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def is_etp_market_open() -> bool:
+    """Return True when US ETP/ETF markets are open (Mon-Fri 09:30-16:30 ET).
+
+    Outside these hours the strategy's ETP/ETF order paths are skipped so the
+    bot restricts itself to crypto spot trading only — which runs 24/7.
+    Signal computation (RSI, Bollinger Bands, breakout detectors) continues
+    uninterrupted so indicators are warm and ready when the market reopens.
+    """
+    now_et = datetime.now(_EASTERN)
+    if now_et.weekday() >= 5:           # Saturday=5, Sunday=6
+        return False
+    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=30, second=0, microsecond=0)
+    return market_open <= now_et < market_close
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +283,8 @@ class BullBearRotationalTrader:
 
         # ---- Log buffer (for display in main loop) ---------------------
         self._log_lines: list[str] = []
+        # Rate-limit the "ETP market closed" log to once per 5 minutes
+        self._last_etp_closed_log: float = 0.0
 
         print(
             f"[BullBearTrader] Initialized — phase: {self.phase}\n"
@@ -468,29 +497,35 @@ class BullBearRotationalTrader:
                 size = self._position_size_bull(score)
                 self._open_position(asset, size, prices.get(asset, 0.0))
 
-        # --- Leveraged ETFs: enter if not already held ------------------
-        for etf, underlying in [("ETHU", "ETH"), ("SLON", "SOL"), ("XXRP", "XRP")]:
-            if etf not in self.positions:
-                underlying_score = self.alt_detector.last_scores.get(underlying, 0.0)
-                if underlying_score >= 0.40:
-                    size = self._position_size_bull_etf(underlying_score)
-                    self._open_position(etf, size, prices.get(etf, prices.get(underlying, 0.0)))
+        # --- Leveraged ETFs: enter if not already held (ETP market hours only) --
+        if is_etp_market_open():
+            for etf, underlying in [("ETHU", "ETH"), ("SLON", "SOL"), ("XXRP", "XRP")]:
+                if etf not in self.positions:
+                    underlying_score = self.alt_detector.last_scores.get(underlying, 0.0)
+                    if underlying_score >= 0.40:
+                        size = self._position_size_bull_etf(underlying_score)
+                        self._open_position(etf, size, prices.get(etf, prices.get(underlying, 0.0)))
+        else:
+            self._warn_etp_closed()
 
     def _phase_alt_cascade(self, prices: dict[str, float]) -> None:
         """
         Alt cascade:
-        - Max out commodity ETF positions (XXRP, SLON, ETHU)
+        - Max out commodity ETF positions (XXRP, SLON, ETHU) — ETP market hours only
         - Continue rotating between alts as they peak
         """
-        for etf in COMMODITY_ETFS:
-            current_size = self.positions.get(etf, 0.0)
-            if current_size < CASCADE_ETF_MAX:
-                ref_asset = {"XXRP": "XRP", "SLON": "SOL", "ETHU": "ETH"}.get(etf, etf)
-                self._open_position(
-                    etf,
-                    CASCADE_ETF_MAX - current_size,
-                    prices.get(etf, prices.get(ref_asset, 0.0)),
-                )
+        if is_etp_market_open():
+            for etf in COMMODITY_ETFS:
+                current_size = self.positions.get(etf, 0.0)
+                if current_size < CASCADE_ETF_MAX:
+                    ref_asset = {"XXRP": "XRP", "SLON": "SOL", "ETHU": "ETH"}.get(etf, etf)
+                    self._open_position(
+                        etf,
+                        CASCADE_ETF_MAX - current_size,
+                        prices.get(etf, prices.get(ref_asset, 0.0)),
+                    )
+        else:
+            self._warn_etp_closed()
 
         # Continue alt rotation
         self._phase_bull_alt_season(prices)
@@ -498,29 +533,32 @@ class BullBearRotationalTrader:
     def _phase_bear_market(self, prices: dict[str, float]) -> None:
         """
         Bear market:
-        - Exit all spot longs (reduce to 0 % or 2 %)
-        - Enter / hold 2× short ETF (ETHD): 15–25 %
+        - Exit all spot longs (reduce to 0 % or 2 %) — always executed
+        - Enter / hold 2× short ETF (ETHD): 15–25 % — ETP market hours only
         - No long leverage allowed
         """
-        # Trim spot positions to near-zero
+        # Trim spot positions to near-zero (always — spot exits don't need market hours)
         for asset in list(self.positions.keys()):
             if asset in KEY_ALTS or asset in COMMODITY_ETFS:
                 current = self.positions.get(asset, 0.0)
                 if current > 0.02:
                     self._close_position(asset, current - 0.02, prices.get(asset, 0.0))
 
-        # Enter short ETF if not held
-        if "ETHD" not in self.positions:
-            self._open_position("ETHD", BEAR_SHORT_MIN, prices.get("ETHD", prices.get("ETH", 0.0)))
+        # Enter short ETF if not held (ETP market hours only)
+        if is_etp_market_open():
+            if "ETHD" not in self.positions:
+                self._open_position("ETHD", BEAR_SHORT_MIN, prices.get("ETHD", prices.get("ETH", 0.0)))
+            else:
+                # Scale up to target if under-allocated
+                current = self.positions.get("ETHD", 0.0)
+                if current < BEAR_SHORT_MIN:
+                    self._open_position(
+                        "ETHD",
+                        BEAR_SHORT_MIN - current,
+                        prices.get("ETHD", prices.get("ETH", 0.0)),
+                    )
         else:
-            # Scale up to target if under-allocated
-            current = self.positions.get("ETHD", 0.0)
-            if current < BEAR_SHORT_MIN:
-                self._open_position(
-                    "ETHD",
-                    BEAR_SHORT_MIN - current,
-                    prices.get("ETHD", prices.get("ETH", 0.0)),
-                )
+            self._warn_etp_closed()
 
     # ====================================================================
     # Position sizing
@@ -561,7 +599,14 @@ class BullBearRotationalTrader:
         In the bear_market phase the short hedge from ``_phase_bear_market``
         takes priority: this overlay will not reduce positions that the phase
         logic already sized to BEAR_SHORT_MIN or above.
+
+        The overlay is skipped entirely outside US ETP market hours (Mon-Fri
+        09:30-16:30 ET).  Crypto spot trades continue unaffected.
         """
+        # ETP/ETF instruments only trade during US market hours.
+        if not is_etp_market_open():
+            return
+
         if not self.hedge_recommendations:
             return
 
@@ -782,6 +827,18 @@ class BullBearRotationalTrader:
     # Reporting / display helpers
     # ====================================================================
 
+    def _warn_etp_closed(self) -> None:
+        """Log that ETP market is closed — rate-limited to once per 5 minutes."""
+        now = time.time()
+        if now - self._last_etp_closed_log >= 300:
+            self._log(
+                "[ETP] US ETP/ETF market closed — leveraged/short ETP orders skipped. "
+                "Crypto spot trading continues normally. "
+                f"Market hours: Mon-Fri 09:30-16:30 ET  "
+                f"(current ET: {datetime.now(_EASTERN).strftime('%a %H:%M')})"
+            )
+            self._last_etp_closed_log = now
+
     def _log(self, msg: str) -> None:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         line = f"{ts}  {msg}"
@@ -791,23 +848,26 @@ class BullBearRotationalTrader:
     def status_summary(self) -> dict[str, Any]:
         """Return a dict suitable for display in the main loop."""
         return {
-            "phase":          self.phase,
-            "positions":      dict(self.positions),
-            "btc_confidence": self.last_signals.get("btc_confidence", 0.0),
-            "market_topping": self.last_signals.get("market_topping", False),
-            "recovering":     self.last_signals.get("recovering", False),
-            "alt_scores":     self.last_signals.get("alt_scores", {}),
+            "phase":            self.phase,
+            "positions":        dict(self.positions),
+            "btc_confidence":   self.last_signals.get("btc_confidence", 0.0),
+            "market_topping":   self.last_signals.get("market_topping", False),
+            "recovering":       self.last_signals.get("recovering", False),
+            "alt_scores":       self.last_signals.get("alt_scores", {}),
+            "etp_market_open":  is_etp_market_open(),
         }
 
     def print_status(self) -> None:
         """Print a formatted status block to stdout."""
         s = self.status_summary()
+        etp_state = "OPEN" if s["etp_market_open"] else "CLOSED (crypto spot only)"
         print(
             f"\n{'='*60}\n"
             f"[BullBearTrader] Phase: {s['phase'].upper()}\n"
             f"  BTC breakout confidence : {s['btc_confidence']:.2f}\n"
             f"  Market topping          : {s['market_topping']}\n"
             f"  Recovery signal         : {s['recovering']}\n"
+            f"  ETP market              : {etp_state}\n"
             f"  Current positions       : {s['positions']}\n"
             f"  Alt scores              : {s['alt_scores']}\n"
             f"{'='*60}\n"
