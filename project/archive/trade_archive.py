@@ -54,7 +54,36 @@ CREATE TABLE IF NOT EXISTS trades (
     position_after_trade REAL NOT NULL,
     strategy_name       TEXT NOT NULL DEFAULT '',
     return_pct          REAL NOT NULL DEFAULT 0.0,
-    cumulative_volume   REAL NOT NULL DEFAULT 0.0
+    cumulative_volume   REAL NOT NULL DEFAULT 0.0,
+    signal_confidence   REAL NOT NULL DEFAULT 0.0,
+    leverage_ratio      REAL NOT NULL DEFAULT 1.0
+);
+"""
+
+_CREATE_PHASE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS phase_transitions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp        TEXT NOT NULL,
+    from_phase       TEXT NOT NULL,
+    to_phase         TEXT NOT NULL,
+    trigger_reason   TEXT NOT NULL DEFAULT '',
+    btc_price        REAL NOT NULL DEFAULT 0.0,
+    signal_confidence REAL NOT NULL DEFAULT 0.0
+);
+"""
+
+_CREATE_ROTATIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS rotations (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp        TEXT NOT NULL,
+    from_asset       TEXT NOT NULL,
+    to_asset         TEXT NOT NULL,
+    from_exit_price  REAL NOT NULL DEFAULT 0.0,
+    from_position_pct REAL NOT NULL DEFAULT 0.0,
+    to_entry_price   REAL NOT NULL DEFAULT 0.0,
+    to_position_pct  REAL NOT NULL DEFAULT 0.0,
+    from_gain_pct    REAL NOT NULL DEFAULT 0.0,
+    rationale        TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -62,6 +91,8 @@ _CREATE_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_asset     ON trades (asset);
 CREATE INDEX IF NOT EXISTS idx_trades_strategy  ON trades (strategy_name);
+CREATE INDEX IF NOT EXISTS idx_phase_timestamp  ON phase_transitions (timestamp);
+CREATE INDEX IF NOT EXISTS idx_rotations_timestamp ON rotations (timestamp);
 """
 
 
@@ -89,7 +120,30 @@ class TradeArchive:
     def _init_db(self) -> None:
         """Create tables and indexes if they don't exist yet."""
         cur = self._conn.cursor()
-        cur.executescript(_CREATE_TABLE_SQL + _CREATE_INDEX_SQL)
+        cur.executescript(
+            _CREATE_TABLE_SQL
+            + _CREATE_PHASE_TABLE_SQL
+            + _CREATE_ROTATIONS_TABLE_SQL
+            + _CREATE_INDEX_SQL
+        )
+        self._conn.commit()
+        # Migrate existing databases that lack the new columns
+        self._migrate_db()
+
+    def _migrate_db(self) -> None:
+        """Add columns introduced in newer schema versions to existing databases."""
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        if "signal_confidence" not in existing:
+            self._conn.execute(
+                "ALTER TABLE trades ADD COLUMN signal_confidence REAL NOT NULL DEFAULT 0.0"
+            )
+        if "leverage_ratio" not in existing:
+            self._conn.execute(
+                "ALTER TABLE trades ADD COLUMN leverage_ratio REAL NOT NULL DEFAULT 1.0"
+            )
         self._conn.commit()
 
     def _cumulative_volume(self) -> float:
@@ -107,6 +161,8 @@ class TradeArchive:
         self,
         record: dict[str, Any],
         strategy_name: str = "",
+        signal_confidence: float = 0.0,
+        leverage_ratio: float = 1.0,
     ) -> str:
         """
         Persist one fill to the archive.
@@ -118,6 +174,9 @@ class TradeArchive:
                         notional_usd, fee_usd, realized_pnl_usd,
                         position_after_trade.
         strategy_name : Name of the strategy/agent that generated the trade.
+        signal_confidence : Confidence score (0–1) of the signal that triggered
+                        this trade (used for backtesting analysis).
+        leverage_ratio : Spot-to-leveraged ratio for this asset (1.0 = pure spot).
 
         Returns
         -------
@@ -141,8 +200,9 @@ class TradeArchive:
             INSERT INTO trades (
                 trade_id, timestamp, asset, side, size_coins,
                 fill_price, notional_usd, fee_usd, realized_pnl_usd,
-                position_after_trade, strategy_name, return_pct, cumulative_volume
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                position_after_trade, strategy_name, return_pct, cumulative_volume,
+                signal_confidence, leverage_ratio
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade_id,
@@ -158,10 +218,165 @@ class TradeArchive:
                 strategy_name,
                 return_pct,
                 cumvol,
+                float(signal_confidence),
+                float(leverage_ratio),
             ),
         )
         self._conn.commit()
         return trade_id
+
+    # ------------------------------------------------------------------
+    # Phase transition + rotation write API
+    # ------------------------------------------------------------------
+
+    def record_phase_transition(
+        self,
+        from_phase: str,
+        to_phase: str,
+        trigger_reason: str = "",
+        btc_price: float = 0.0,
+        signal_confidence: float = 0.0,
+    ) -> int:
+        """
+        Persist a phase transition event.
+
+        Parameters
+        ----------
+        from_phase        : Previous phase name.
+        to_phase          : New phase name.
+        trigger_reason    : Human-readable reason for the transition.
+        btc_price         : BTC/USD price at transition time.
+        signal_confidence : Confidence score (0–1) of the triggering signal.
+
+        Returns
+        -------
+        int — the auto-incremented row id.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
+            """
+            INSERT INTO phase_transitions
+                (timestamp, from_phase, to_phase, trigger_reason, btc_price, signal_confidence)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (ts, from_phase, to_phase, trigger_reason, float(btc_price), float(signal_confidence)),
+        )
+        self._conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def record_rotation(
+        self,
+        from_asset: str,
+        to_asset: str,
+        from_exit_price: float = 0.0,
+        from_position_pct: float = 0.0,
+        to_entry_price: float = 0.0,
+        to_position_pct: float = 0.0,
+        from_gain_pct: float = 0.0,
+        rationale: str = "",
+    ) -> int:
+        """
+        Persist an alt rotation event (exit one alt, enter another).
+
+        Parameters
+        ----------
+        from_asset        : Ticker being exited.
+        to_asset          : Ticker being entered.
+        from_exit_price   : Exit price of from_asset.
+        from_position_pct : Fraction of portfolio exited (0–1).
+        to_entry_price    : Entry price of to_asset.
+        to_position_pct   : Fraction of portfolio entered (0–1).
+        from_gain_pct     : P&L percentage realised on from_asset.
+        rationale         : Human-readable reason for the rotation.
+
+        Returns
+        -------
+        int — the auto-incremented row id.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.execute(
+            """
+            INSERT INTO rotations
+                (timestamp, from_asset, to_asset, from_exit_price, from_position_pct,
+                 to_entry_price, to_position_pct, from_gain_pct, rationale)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts, from_asset, to_asset,
+                float(from_exit_price), float(from_position_pct),
+                float(to_entry_price), float(to_position_pct),
+                float(from_gain_pct), rationale,
+            ),
+        )
+        self._conn.commit()
+        return cur.lastrowid  # type: ignore[return-value]
+
+    def get_phase_transitions(
+        self,
+        from_phase: str | None = None,
+        to_phase: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Return phase transition records, most recent first.
+
+        Parameters
+        ----------
+        from_phase : Filter by origin phase.
+        to_phase   : Filter by destination phase.
+        limit      : Maximum number of rows to return.
+        """
+        clauses: list[str] = []
+        params:  list[Any] = []
+        if from_phase:
+            clauses.append("from_phase = ?")
+            params.append(from_phase)
+        if to_phase:
+            clauses.append("to_phase = ?")
+            params.append(to_phase)
+        # Safety note: `clauses` only contains hardcoded string literals (e.g.
+        # "from_phase = ?"); all caller-supplied values flow through the params
+        # list as bound parameters, so this f-string is not vulnerable to SQL
+        # injection.
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM phase_transitions {where} ORDER BY timestamp DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_rotations(
+        self,
+        from_asset: str | None = None,
+        to_asset: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """
+        Return rotation records, most recent first.
+
+        Parameters
+        ----------
+        from_asset : Filter by exited asset ticker.
+        to_asset   : Filter by entered asset ticker.
+        limit      : Maximum number of rows to return.
+        """
+        clauses: list[str] = []
+        params:  list[Any] = []
+        if from_asset:
+            clauses.append("from_asset = ?")
+            params.append(from_asset)
+        if to_asset:
+            clauses.append("to_asset = ?")
+            params.append(to_asset)
+        # Safety note: same pattern as above — clauses are hardcoded literals.
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM rotations {where} ORDER BY timestamp DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Read / query API

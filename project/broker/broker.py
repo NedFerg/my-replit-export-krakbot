@@ -592,6 +592,12 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
+            # Leveraged / short ETF tickers traded on Kraken
+            "XXRP": "XXRPZUSD",   # XRP 2× Long
+            "SLON": "SLON",        # SOL 2× Long
+            "ETHU": "ETHU",        # ETH 2× Long
+            "ETHD": "ETHD",        # ETH 2× Short
+            "SETH": "SETH",        # ETH 1× Short
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
@@ -698,6 +704,46 @@ class LiveBroker(SimulatedBroker):
             return 0.0014
         else:
             return 0.0012
+
+    def sync_fee_tier_from_kraken(self) -> float:
+        """
+        Fetch the user's current 30-day trading volume directly from Kraken and
+        update self.taker_fee / self.maker_fee to match the live tier.
+
+        Calls the private /0/private/TradeVolume endpoint, which returns the
+        authenticated user's 30-day USD volume.  Falls back to the current
+        self.taker_fee value on any error (credentials missing, network issue).
+
+        Returns
+        -------
+        float — the taker fee rate now in effect (e.g. 0.004 for 0.40 %).
+        """
+        result = self._kraken_private("/0/private/TradeVolume", {"fee-info": "true"})
+        if not result or "result" not in result:
+            print("[LiveBroker] sync_fee_tier_from_kraken: API call failed — keeping current tier")
+            return self.taker_fee
+
+        volume_usd = 0.0
+        try:
+            volume_usd = float(result["result"].get("volume", 0.0))
+        except (KeyError, ValueError, TypeError):
+            print("[LiveBroker] sync_fee_tier_from_kraken: unexpected response format")
+            return self.taker_fee
+
+        new_taker = self.get_kraken_taker_fee(volume_usd)
+        # Maker fee is typically 60 % of taker for Kraken spot (0.40 % → 0.16 %)
+        new_maker = round(new_taker * 0.40, 6)
+
+        if new_taker != self.taker_fee:
+            print(
+                f"[LiveBroker] Fee tier updated: "
+                f"taker {self.taker_fee*100:.3f}% → {new_taker*100:.3f}%  "
+                f"(30d volume: ${volume_usd:,.0f})"
+            )
+
+        self.taker_fee = new_taker
+        self.maker_fee = new_maker
+        return self.taker_fee
 
     # ------------------------------------------------------------------
     # Portfolio exposure — live override
