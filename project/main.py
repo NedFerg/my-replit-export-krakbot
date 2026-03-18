@@ -12,6 +12,7 @@ from broker.broker import SimulatedBroker, LiveBroker, PaperBroker, run_live_tra
 from exchange.exchange import Exchange
 from risk.risk_manager import RiskManager
 from config.config import INITIAL_BALANCE, MARKET_START_PRICE
+from archive.trade_archive import TradeArchive
 
 # ---------------------------------------------------------------------------
 # Mode switch — "sim" runs the local simulation; "live" starts the Kraken
@@ -178,7 +179,8 @@ def run_live():
     print("[MAIN] Starting live trading loop...")
 
     if use_paper:
-        broker = PaperBroker(initial_cash=INITIAL_BALANCE)
+        archive = TradeArchive()
+        broker = PaperBroker(initial_cash=INITIAL_BALANCE, trade_archive=archive)
     else:
         broker = LiveBroker(dry_run=False)
 
