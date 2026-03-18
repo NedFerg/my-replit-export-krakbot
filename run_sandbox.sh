@@ -9,27 +9,36 @@
 #   • KRAKEN_SANDBOX=true        — orders would be validated only (belt+braces)
 #   • BOT_MODE=live              — starts the live price-feed + trading loop
 #
+# Capital: $1,000 paper money (set PAPER_CAPITAL env var to change)
+#
 # Prices are fetched live from Kraken's public API (no API key needed).
 # All trades, P&L, and positions are simulated locally in the paper account.
 #
-# Crypto spot trades 24/7.  ETP/ETF hedge positions (ETHU, ETHD, SLON, XXRP)
-# are only opened when US markets are open (Mon-Fri 09:30-16:30 ET).
+# Trading schedule:
+#   • By default the script waits until 09:30 ET (US market open) before
+#     starting, then auto-shuts down at 16:30 ET (market close).
+#   • An end-of-day report is saved automatically to project/logs/eod_YYYYMMDD.txt
+#     so you can review tonight what the bot traded.
 #
 # Log files written to project/logs/:
-#   paper_trades.csv      — every synthetic fill
+#   paper_trades.csv      — every synthetic fill (CSV, one row per trade)
 #   trade_archive.db      — SQLite archive (trades + phase transitions + rotations)
+#   eod_YYYYMMDD.txt      — end-of-day analysis report (saved at 16:30 shutdown)
 #
 # Keyboard commands (type in this terminal + Enter):
 #   S  — print paper trading summary (trades, P&L, positions)
 #   P  — print phase status (BTC confidence, signal scores, open positions)
-#   Ctrl-C — graceful shutdown (prints final summary automatically)
+#   Ctrl-C — graceful shutdown (saves EOD report and prints final summary)
 #
 # Scheduling options (set before running):
 #
-#   Start in N hours from now:
-#       START_DELAY_HOURS=11 ./run_sandbox.sh
+#   Skip the 09:30 ET wait and start immediately:
+#       SKIP_MARKET_WAIT=true ./run_sandbox.sh
 #
-#   Auto-wait until next US ETP market open (Mon-Fri 09:30 ET):
+#   Start in N hours from now instead:
+#       START_DELAY_HOURS=2 ./run_sandbox.sh
+#
+#   Auto-wait until next weekday 09:30 ET (useful if running over the weekend):
 #       WAIT_FOR_ETP_MARKET=true ./run_sandbox.sh
 #
 # Usage:
@@ -41,6 +50,58 @@ set -e
 
 # Change to repo root regardless of where the script is called from
 cd "$(dirname "$0")"
+
+# ---------------------------------------------------------------------------
+# Default: auto-wait until today's 9:30 AM ET market open
+# Runs only when no other schedule flag is given AND the market hasn't opened.
+# Override: set START_DELAY_HOURS or WAIT_FOR_ETP_MARKET=true to use those
+# mechanisms instead; or set SKIP_MARKET_WAIT=true to start immediately.
+# ---------------------------------------------------------------------------
+if [[ -z "${START_DELAY_HOURS:-}" \
+      && "${WAIT_FOR_ETP_MARKET:-false}" != "true" \
+      && "${SKIP_MARKET_WAIT:-false}" != "true" ]]; then
+    delay_sec=$(python3 - <<'PYEOF'
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import math
+
+ET = ZoneInfo("America/New_York")
+now = datetime.now(ET)
+
+# Only wait if today is a weekday and we're before today's 9:30 AM open
+target = now.replace(hour=9, minute=30, second=0, microsecond=0)
+if now.weekday() < 5 and now < target:
+    print(math.ceil((target - now).total_seconds()))
+else:
+    print(0)
+PYEOF
+    )
+    if (( delay_sec > 0 )); then
+        start_at=$(python3 -c "
+from datetime import datetime
+from zoneinfo import ZoneInfo
+ET = ZoneInfo('America/New_York')
+now = datetime.now(ET)
+print(now.replace(hour=9, minute=30, second=0, microsecond=0).strftime('%A %Y-%m-%d 09:30 ET'))")
+        echo "⏰  Market opens at 09:30 ET — sleeping until then (${delay_sec}s)"
+        echo "    Start time : ${start_at}"
+        echo "    Crypto spot (BTC/ETH/SOL/…) will begin trading at open."
+        echo "    Press Ctrl-C to cancel, or set SKIP_MARKET_WAIT=true to start now."
+        echo ""
+        elapsed=0
+        while (( elapsed < delay_sec )); do
+            remaining=$(( delay_sec - elapsed ))
+            remaining_h=$(( remaining / 3600 ))
+            remaining_m=$(( (remaining % 3600) / 60 ))
+            echo "    ⏳  ${remaining_h}h ${remaining_m}m until 09:30 ET market open..."
+            sleep_chunk=$(( remaining < 1800 ? remaining : 1800 ))
+            sleep "${sleep_chunk}"
+            elapsed=$(( elapsed + sleep_chunk ))
+        done
+        echo "⏰  09:30 ET — market open, starting KrakBot now."
+        echo ""
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Scheduled start: sleep until the requested start time

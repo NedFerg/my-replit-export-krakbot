@@ -2358,6 +2358,7 @@ class PaperBroker(LiveBroker):
         self.paper_slippage = slippage
 
         # --- Paper account state ------------------------------------------
+        self._initial_cash         = float(initial_cash)  # preserved for EOD report
         self.paper_cash            = float(initial_cash)
         self.paper_positions: dict = {}    # asset → coin quantity (float)
         self.paper_cost_basis: dict = {}   # asset → weighted avg cost (USD/coin)
@@ -2801,9 +2802,100 @@ class PaperBroker(LiveBroker):
                       f"exposure={d['exposure']:.2%}")
         print()
 
+    def save_eod_report(self) -> str:
+        """Write a dated end-of-day analysis report to project/logs/eod_YYYYMMDD.txt.
+
+        The file contains:
+          • Session summary (starting capital, final equity, PnL, fees, win rate)
+          • Open positions at close
+          • Full trade-by-trade log (timestamp, asset, side, size, price, notional, fee, rPnL)
+          • Paths to the CSV and SQLite logs for deeper analysis
+
+        Returns the absolute path of the file written.
+        """
+        import datetime as _dt
+
+        now       = _dt.datetime.now()
+        date_str  = now.strftime("%Y%m%d")
+        ts_str    = now.strftime("%Y-%m-%d %H:%M:%S")
+        log_dir   = os.path.dirname(os.path.abspath(self.LOG_PATH))
+        report_path = os.path.join(log_dir, f"eod_{date_str}.txt")
+
+        s = self.summary()
+
+        lines = [
+            f"KrakBot — End-of-Day Sandbox Report  ({ts_str})",
+            "=" * 60,
+            f"  Starting capital:  ${self._initial_cash:>10,.2f}",
+            f"  Final equity:      ${s['equity']:>10.2f}",
+            f"  Cash remaining:    ${self.paper_cash:>10.2f}",
+            f"  Realized PnL:      ${s['realized_pnl_usd']:>+10.2f}",
+            f"  Unrealized PnL:    ${s['unrealized_pnl_usd']:>+10.2f}",
+            f"  Total fees:        ${s['total_fees_usd']:>10.4f}",
+            f"  Net return:        ${(s['equity'] - self._initial_cash):>+10.2f}"
+            f"  ({(s['equity'] / self._initial_cash - 1) * 100:>+.2f}%)",
+            f"  Total trades:      {s['total_trades']}"
+            f"  ({s['total_buys']} buys, {s['total_sells']} sells)",
+            f"  Win rate:          {s['win_rate']:.1f}%",
+            f"  Average win:       ${s['average_win']:>+10.4f}",
+            f"  Average loss:      ${s['average_loss']:>+10.4f}",
+            f"  Largest win:       ${s['largest_win']:>+10.4f}",
+            f"  Largest loss:      ${s['largest_loss']:>+10.4f}",
+            "",
+            "  Open Positions at Close:",
+        ]
+
+        if s["current_positions"]:
+            for asset, qty in sorted(s["current_positions"].items()):
+                price = self.live_prices.get(asset, 0.0)
+                value = qty * price
+                lines.append(
+                    f"    {asset:<6}  {qty:.6f} coins"
+                    f"  @ ${price:>10.2f}  ≈ ${value:>8.2f}"
+                )
+        else:
+            lines.append("    (none)")
+
+        # Trade-by-trade log
+        lines += [
+            "",
+            "  Trade Log:",
+            (
+                f"  {'#':>4}  {'Timestamp':19}  {'Asset':6}  {'Side':4}"
+                f"  {'Size (coins)':>12}  {'Fill $':>10}  {'Notional':>10}"
+                f"  {'Fee':>8}  {'rPnL':>10}"
+            ),
+            "  " + "-" * 90,
+        ]
+        for i, t in enumerate(self.paper_trade_history, 1):
+            lines.append(
+                f"  {i:>4}  {t['timestamp']:19}  {t['asset']:<6}  {t['side']:<4}"
+                f"  {t['size_coins']:>12.6f}  {t['fill_price']:>10.4f}"
+                f"  {t['notional_usd']:>10.2f}  {t['fee_usd']:>8.4f}"
+                f"  {t['realized_pnl_usd']:>+10.4f}"
+            )
+        if not self.paper_trade_history:
+            lines.append("    (no trades executed this session)")
+
+        lines += [
+            "",
+            "  Log files:",
+            f"    CSV trades : {os.path.abspath(self.LOG_PATH)}",
+            f"    SQLite DB  : {self._trade_archive.db_path if self._trade_archive else 'N/A'}",
+            f"    EOD report : {report_path}",
+            "=" * 60,
+        ]
+
+        with open(report_path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+        print(f"[PaperBroker] EOD report saved: {report_path}")
+        return report_path
+
     def close(self):
         """Flush and close the CSV trade log file and SQLite archive.  Call at session end."""
         self.print_session_summary()
+        self.save_eod_report()
         try:
             self._csv_file.flush()
             self._csv_file.close()

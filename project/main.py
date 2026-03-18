@@ -187,6 +187,10 @@ def run_live():
     └──────────────────────────────────────────────────────────────────┘
     """
     import os as _os
+    import datetime as _datetime
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _ET = _ZoneInfo("America/New_York")
+
     use_paper = _os.environ.get("USE_PAPER_BROKER", "true").strip().lower() \
                 not in ("false", "0", "no")
 
@@ -269,6 +273,19 @@ def run_live():
             while True:
                 if broker.kill_switch:
                     print("[MAIN] Kill switch active — exiting loop")
+                    break
+
+                # Auto-shutdown at 4:30 PM ET — end of US trading session.
+                # The EOD report is saved automatically by broker.close() in the
+                # finally block below.
+                _now_et = _datetime.datetime.now(_ET)
+                if (_now_et.weekday() < 5 and
+                        _now_et >= _now_et.replace(
+                            hour=16, minute=30, second=0, microsecond=0)):
+                    print(
+                        "[MAIN] 16:30 ET reached — end-of-day auto-shutdown.\n"
+                        "[MAIN] All trades recorded. EOD report will be saved now."
+                    )
                     break
 
                 # Keyboard commands
