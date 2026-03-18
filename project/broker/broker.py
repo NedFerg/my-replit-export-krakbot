@@ -582,7 +582,14 @@ class LiveBroker(SimulatedBroker):
             print("[FUTURES] DISABLED — ENABLE_FUTURES=False. "
                   "All futures code paths are fully suppressed.")
 
-        # Map internal asset names → Kraken ticker symbols
+        # Map internal asset names → Kraken ticker symbols used for the
+        # public /0/public/Ticker price-feed batch request.
+        # Only include standard spot pairs that Kraken's public API supports.
+        # Leveraged ETP tokens (ETHU, ETHD, SLON, XXRP ETF, SETH) are NOT
+        # listed here because they are traded via Kraken's ETP platform and
+        # are not available on the standard public Ticker endpoint.
+        # BullBearRotationalTrader uses the underlying asset price (e.g. ETH)
+        # for paper-fill pricing of these tokens.
         self.kraken_pairs = {
             "BTC":  "XBTUSD",
             "ETH":  "ETHUSD",
@@ -592,12 +599,6 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
-            # Leveraged / short ETF tickers traded on Kraken
-            "XXRP": "XXRPZUSD",   # XRP 2× Long
-            "SLON": "SLON",        # SOL 2× Long
-            "ETHU": "ETHU",        # ETH 2× Long
-            "ETHD": "ETHD",        # ETH 2× Short
-            "SETH": "SETH",        # ETH 1× Short
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
@@ -2287,12 +2288,23 @@ class PaperBroker(LiveBroker):
         ])
         self._csv_file.flush()
 
+        # --- Scale safety caps to paper account size ----------------------
+        # LiveBroker's first-night harness defaults ($50/trade, $200 total)
+        # are sized for small real-money accounts, not a paper simulation.
+        # Scale to realistic multiples of the paper starting cash so that
+        # BullBearRotationalTrader can take normal-sized positions (e.g.
+        # 10-20% of $10,000 = $1,000-$2,000 per order).
+        self.max_notional_per_asset = initial_cash * 0.35   # 35% max per single order
+        self.max_total_notional     = initial_cash * 2.0    # 2× equity max total exposure
+
         print(
             f"[PaperBroker] INITIALIZED\n"
-            f"  starting_cash = ${initial_cash:.2f}\n"
-            f"  slippage      = {self.paper_slippage:.4%}\n"
-            f"  trade_log     = {log_path}\n"
-            f"  archive       = {'enabled (' + self._trade_archive.db_path + ')' if self._trade_archive else 'disabled'}\n"
+            f"  starting_cash          = ${initial_cash:.2f}\n"
+            f"  slippage               = {self.paper_slippage:.4%}\n"
+            f"  max_notional_per_asset = ${self.max_notional_per_asset:.2f}\n"
+            f"  max_total_notional     = ${self.max_total_notional:.2f}\n"
+            f"  trade_log              = {log_path}\n"
+            f"  archive                = {'enabled (' + self._trade_archive.db_path + ')' if self._trade_archive else 'disabled'}\n"
             f"  All fills are synthetic — no real orders sent to Kraken."
         )
 

@@ -311,6 +311,38 @@ class TradeArchive:
         self._conn.commit()
         return cur.lastrowid  # type: ignore[return-value]
 
+    # ------------------------------------------------------------------
+    # Internal query helpers
+    # ------------------------------------------------------------------
+
+    def _query_table(
+        self,
+        table: str,
+        filters: list[tuple[str, Any]],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Execute a safe parameterised SELECT on *table* with optional equality
+        filters and a result LIMIT.
+
+        Parameters
+        ----------
+        table   : Table name.  Must be a hardcoded string (not user input).
+        filters : List of (column_expr, value) pairs, e.g. [("from_phase = ?", "accumulation")].
+                  The column expressions are hardcoded by the caller; values are
+                  passed as bound parameters so there is no SQL injection risk.
+        limit   : Maximum rows to return.
+        """
+        clauses = [col for col, _ in filters]
+        params:  list[Any] = [val for _, val in filters]
+        where   = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM {table} {where} ORDER BY timestamp DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_phase_transitions(
         self,
         from_phase: str | None = None,
@@ -326,25 +358,12 @@ class TradeArchive:
         to_phase   : Filter by destination phase.
         limit      : Maximum number of rows to return.
         """
-        clauses: list[str] = []
-        params:  list[Any] = []
+        filters: list[tuple[str, Any]] = []
         if from_phase:
-            clauses.append("from_phase = ?")
-            params.append(from_phase)
+            filters.append(("from_phase = ?", from_phase))
         if to_phase:
-            clauses.append("to_phase = ?")
-            params.append(to_phase)
-        # Safety note: `clauses` only contains hardcoded string literals (e.g.
-        # "from_phase = ?"); all caller-supplied values flow through the params
-        # list as bound parameters, so this f-string is not vulnerable to SQL
-        # injection.
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.append(limit)
-        rows = self._conn.execute(
-            f"SELECT * FROM phase_transitions {where} ORDER BY timestamp DESC LIMIT ?",
-            params,
-        ).fetchall()
-        return [dict(row) for row in rows]
+            filters.append(("to_phase = ?", to_phase))
+        return self._query_table("phase_transitions", filters, limit)
 
     def get_rotations(
         self,
@@ -361,22 +380,12 @@ class TradeArchive:
         to_asset   : Filter by entered asset ticker.
         limit      : Maximum number of rows to return.
         """
-        clauses: list[str] = []
-        params:  list[Any] = []
+        filters: list[tuple[str, Any]] = []
         if from_asset:
-            clauses.append("from_asset = ?")
-            params.append(from_asset)
+            filters.append(("from_asset = ?", from_asset))
         if to_asset:
-            clauses.append("to_asset = ?")
-            params.append(to_asset)
-        # Safety note: same pattern as above — clauses are hardcoded literals.
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.append(limit)
-        rows = self._conn.execute(
-            f"SELECT * FROM rotations {where} ORDER BY timestamp DESC LIMIT ?",
-            params,
-        ).fetchall()
-        return [dict(row) for row in rows]
+            filters.append(("to_asset = ?", to_asset))
+        return self._query_table("rotations", filters, limit)
 
     # ------------------------------------------------------------------
     # Read / query API

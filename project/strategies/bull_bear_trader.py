@@ -43,6 +43,18 @@ COMMODITY_ETFS: list[str] = ["XXRP", "SLON", "ETHU"]
 KEY_ALTS:       list[str] = ["SOL", "XRP", "HBAR", "LINK", "XLM"]
 ALL_ASSETS:     list[str] = KEY_ALTS + COMMODITY_ETFS + ["ETHD", "SETH"]
 
+# Mapping from leveraged/short ETF ticker → underlying spot asset.
+# Used for price lookups: ETF prices are not available on the standard
+# Kraken public ticker endpoint, so we use the underlying spot price for
+# paper-fill calculations.
+ETF_UNDERLYING: dict[str, str] = {
+    "XXRP": "XRP",   # XRP 2× Long ETP
+    "SLON": "SOL",   # SOL 2× Long ETP
+    "ETHU": "ETH",   # ETH 2× Long ETP
+    "ETHD": "ETH",   # ETH 2× Short ETP
+    "SETH": "ETH",   # ETH 1× Short ETP
+}
+
 BTC_ATH_TARGET:         float = 100_000.0
 BREAKOUT_CONFIDENCE_MIN: float = 0.60   # minimum confidence to leave accumulation
 
@@ -499,17 +511,46 @@ class BullBearRotationalTrader:
 
     def _submit_order(self, asset: str, side: str, size: float, price: float) -> None:
         """
-        Route an order through the broker.
+        Route an order through the broker for paper/live execution.
 
-        Uses the broker's target_exposures dict if available (PaperBroker / LiveBroker),
-        otherwise logs a warning.
+        For PaperBroker (sandbox mode): calls broker.execute_trade() which
+        routes to _paper_fill() — producing a synthetic fill with realistic
+        slippage + fees, updating cash/positions, and logging to CSV/SQLite.
+
+        For LiveBroker: same execute_trade() path, which places a real limit
+        order on Kraken (guarded by dry_run / kill-switch).
+
+        Parameters
+        ----------
+        asset : Internal asset ticker (e.g. "SOL", "ETHU").
+        side  : "buy" or "sell".
+        size  : Fractional portfolio allocation (0.10 = 10% of equity).
+        price : Reference price used to convert the fraction to coin units.
+                For ETF tickers (ETHU, ETHD, etc.) this is the underlying
+                spot price; the broker will use self.live_prices for the fill.
         """
-        if not hasattr(self.broker, "target_exposures"):
-            self._log(f"[WARN] Broker has no target_exposures — order for {asset} skipped")
+        # For ETF tokens, resolve the tradeable underlying asset and its price
+        # since the broker's live_prices only has spot data.
+        trade_asset = ETF_UNDERLYING.get(asset, asset)
+        trade_price = price
+
+        # Derive the equity base for converting fractional size → coin units
+        if hasattr(self.broker, "compute_total_equity"):
+            equity = self.broker.compute_total_equity() or 10_000.0
+        else:
+            equity = 10_000.0   # fallback: assume $10k starting capital
+
+        if equity <= 0 or trade_price <= 0:
             return
 
-        # Express desired total allocation; broker handles delta computation
-        self.broker.target_exposures[asset] = self.positions.get(asset, 0.0)
+        coin_units = (size * equity) / trade_price
+        if coin_units <= 0:
+            return
+
+        if hasattr(self.broker, "execute_trade"):
+            self.broker.execute_trade(trade_asset, side, coin_units)
+        else:
+            self._log(f"[WARN] Broker has no execute_trade method — order for {asset} skipped")
 
     # ====================================================================
     # Reporting / display helpers

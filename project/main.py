@@ -222,6 +222,11 @@ def run_live():
             initial_phase="accumulation",
         )
 
+        # Tag paper fills with the strategy name so the archive and CSV log
+        # attribute trades to "BullBearTrader" instead of an empty string.
+        if isinstance(broker, PaperBroker):
+            broker.set_strategy_name("BullBearTrader")
+
         # Sync fee tier if using live broker
         if isinstance(broker, LiveBroker) and not isinstance(broker, PaperBroker):
             broker.sync_fee_tier_from_kraken()
@@ -236,10 +241,13 @@ def run_live():
 
         balances, positions = state
         print(f"[MAIN] Initial balances: {balances}")
-        print("[MAIN] Type 'S' + Enter in the console to print status. 'P' for phase summary.")
+        print(
+            "[MAIN] Commands: 'S' + Enter = paper summary  |  'P' = phase status  |  Ctrl-C = stop"
+        )
 
-        SUMMARY_INTERVAL_SEC = 900
+        SUMMARY_INTERVAL_SEC = 900   # 15 minutes
         _last_summary_ts     = time.time()
+        _tick                = 0
 
         import queue, threading
 
@@ -269,6 +277,8 @@ def run_live():
                     if cmd == "S":
                         if isinstance(broker, PaperBroker):
                             broker.print_summary()
+                        else:
+                            print("[MAIN] Summary only available in PAPER mode.")
                     elif cmd == "P":
                         bull_bear_trader.print_status()
                     else:
@@ -276,28 +286,59 @@ def run_live():
                 except queue.Empty:
                     pass
 
-                # Auto summary
+                # Auto summary every 15 minutes
                 _now = time.time()
                 if _now - _last_summary_ts >= SUMMARY_INTERVAL_SEC:
                     print("[MAIN] 15-minute auto-summary:")
+                    if isinstance(broker, PaperBroker):
+                        broker.print_summary()
                     bull_bear_trader.print_status()
                     _last_summary_ts = _now
 
-                # Fetch prices and step the strategy
+                # Fetch live prices from Kraken public API
                 broker.fetch_live_prices()
                 prices = dict(broker.live_prices)
 
                 if prices:
                     bull_bear_trader.step(prices)
-                    # Display current phase on every step
+
+                    # ---- Live performance display --------------------------------
                     status = bull_bear_trader.status_summary()
+                    _tick += 1
+
+                    # Build equity/P&L string for paper mode
+                    if isinstance(broker, PaperBroker):
+                        equity  = broker.compute_total_equity()
+                        rpnl    = broker.paper_realized_pnl
+                        upnl    = broker.get_unrealized_pnl()
+                        n_fills = len(broker.paper_trade_history)
+                        pnl_str = (
+                            f"  equity=${equity:.2f}"
+                            f"  rpnl=${rpnl:+.2f}"
+                            f"  upnl=${upnl:+.2f}"
+                            f"  fills={n_fills}"
+                        )
+                    else:
+                        pnl_str = ""
+
+                    btc_price = prices.get("BTC", 0.0)
                     print(
-                        f"[MAIN] Phase={status['phase']}  "
-                        f"BTC_conf={status['btc_confidence']:.2f}  "
-                        f"Topping={status['market_topping']}  "
-                        f"Recovering={status['recovering']}  "
-                        f"Positions={status['positions']}"
+                        f"[MAIN #{_tick:04d}] "
+                        f"BTC=${btc_price:,.0f}  "
+                        f"phase={status['phase']}  "
+                        f"conf={status['btc_confidence']:.2f}  "
+                        f"top={status['market_topping']}  "
+                        f"rec={status['recovering']}"
+                        f"{pnl_str}"
                     )
+
+                    # Show open positions (condensed, only when non-empty)
+                    if status["positions"]:
+                        pos_str = "  ".join(
+                            f"{a}={v*100:.1f}%"
+                            for a, v in status["positions"].items()
+                        )
+                        print(f"         positions: {pos_str}")
 
                 broker.heartbeat()
                 broker.record_health_metrics()
@@ -308,6 +349,9 @@ def run_live():
 
         except KeyboardInterrupt:
             print("[MAIN] KeyboardInterrupt — shutting down cleanly")
+            if isinstance(broker, PaperBroker):
+                broker.print_summary()
+            bull_bear_trader.print_status()
         except Exception as e:
             print(f"[MAIN] Unhandled exception: {e}")
             broker.trigger_kill_switch(f"Main loop exception: {e}")

@@ -19,7 +19,6 @@ Usage::
 from __future__ import annotations
 
 from collections import deque
-from typing import Optional
 
 from strategies.signals.indicators import rsi as _rsi_fn
 
