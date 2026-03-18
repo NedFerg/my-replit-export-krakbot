@@ -52,6 +52,82 @@ set -e
 cd "$(dirname "$0")"
 
 # ---------------------------------------------------------------------------
+# Live Kraken price feed connectivity check
+# Fetches current prices from api.kraken.com right now and displays them
+# so you can confirm the feed is live before the trading session begins.
+# ---------------------------------------------------------------------------
+python3 - <<'PYEOF'
+import sys
+try:
+    import urllib.request, urllib.parse, json, time
+
+    PAIRS = {
+        "BTC":  "XBTUSD",
+        "ETH":  "ETHUSD",
+        "SOL":  "SOLUSD",
+        "XRP":  "XRPUSD",
+        "HBAR": "HBARUSD",
+        "LINK": "LINKUSD",
+        "XLM":  "XLMUSD",
+    }
+    ALIASES = {
+        "XXBTZUSD": "BTC",
+        "XETHZUSD": "ETH",
+        "XXRPZUSD": "XRP",
+        "XXLMZUSD": "XLM",
+    }
+
+    pairs_str = ",".join(PAIRS.values())
+    url = "https://api.kraken.com/0/public/Ticker?" + urllib.parse.urlencode({"pair": pairs_str})
+
+    t0 = time.time()
+    with urllib.request.urlopen(url, timeout=8) as resp:
+        data = json.loads(resp.read())
+    latency_ms = int((time.time() - t0) * 1000)
+
+    if data.get("error"):
+        print(f"⚠️   Kraken API error: {data['error']}")
+        sys.exit(0)
+
+    result = data.get("result", {})
+    reverse = {v.upper(): k for k, v in PAIRS.items()}
+    reverse.update(ALIASES)
+
+    prices = {}
+    for key, ticker in result.items():
+        asset = reverse.get(key.upper())
+        if asset:
+            try:
+                prices[asset] = float(ticker["c"][0])
+            except Exception:
+                pass
+
+    if not prices:
+        print("⚠️   Could not parse any prices from Kraken response.")
+        sys.exit(0)
+
+    print()
+    print("🔌  Live Kraken price feed — CONFIRMED  ✅")
+    print(f"    Source  : https://api.kraken.com/0/public/Ticker")
+    print(f"    Latency : {latency_ms} ms")
+    print(f"    Assets  : {len(prices)}/{len(PAIRS)} responding")
+    print()
+    for asset in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM"]:
+        price = prices.get(asset)
+        if price is not None:
+            print(f"    {asset:<6}  ${price:>12,.4f}")
+    print()
+    print("    All fills will be SIMULATED against these live prices.")
+    print("    No API key required — public feed only.")
+    print()
+
+except Exception as e:
+    print(f"⚠️   Price feed check failed: {e}")
+    print("    The bot will retry automatically once the trading loop starts.")
+    print()
+PYEOF
+
+# ---------------------------------------------------------------------------
 # Default: auto-wait until today's 9:30 AM ET market open
 # Runs only when no other schedule flag is given AND the market hasn't opened.
 # Override: set START_DELAY_HOURS or WAIT_FOR_ETP_MARKET=true to use those
