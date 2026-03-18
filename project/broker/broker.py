@@ -828,6 +828,42 @@ class LiveBroker(SimulatedBroker):
         self.last_api_error = reason
         print(f"[KILL SWITCH] Triggered: {reason}")
 
+    def validate_credentials(self) -> bool:
+        """
+        Confirm that KRAKEN_API_KEY and KRAKEN_API_SECRET are valid by calling
+        the authenticated ``/0/private/Balance`` endpoint.
+
+        Returns True on success (credentials accepted by Kraken) or False if
+        the credentials are missing, malformed, or rejected.  On failure the
+        kill switch is **not** triggered here — the caller decides whether to
+        abort or fall back to paper mode.
+
+        Intended to be called once at startup from ``go_live.sh`` / main.py
+        before enabling live order submission.
+        """
+        if not self.kraken_api_key or not self.kraken_api_secret:
+            print("[LiveBroker] validate_credentials: no API credentials configured.")
+            return False
+
+        print("[LiveBroker] Validating API credentials against Kraken…")
+        result = self._kraken_private("/0/private/Balance")
+        if result is None:
+            print("[LiveBroker] validate_credentials: request failed (network error).")
+            return False
+
+        errors = result.get("error", [])
+        if errors:
+            print(f"[LiveBroker] validate_credentials: Kraken rejected credentials — {errors}")
+            return False
+
+        # Success — log the USD balance so the operator can confirm the right account
+        usd_balance = float(result.get("result", {}).get("ZUSD", 0.0))
+        print(
+            f"[LiveBroker] ✅  Credentials valid — Kraken account balance: "
+            f"${usd_balance:,.2f} USD"
+        )
+        return True
+
     # ------------------------------------------------------------------
     # Kraken REST client (scaffolding — not yet wired into the main loop)
     # ------------------------------------------------------------------

@@ -52,3 +52,6 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *.pyo
+
+# Environment / secrets — NEVER commit real API keys
+.env
