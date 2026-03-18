@@ -13,7 +13,13 @@ import type {
   UseQueryResult,
 } from "@tanstack/react-query";
 
-import type { HealthStatus } from "./api.schemas";
+import type {
+  GetPerformanceParams,
+  HealthStatus,
+  ListTradesParams,
+  PerformanceSummary,
+  TradeList,
+} from "./api.schemas";
 
 import { customFetch } from "../custom-fetch";
 import type { ErrorType } from "../custom-fetch";
@@ -92,6 +98,196 @@ export function useHealthCheck<
   request?: SecondParameter<typeof customFetch>;
 }): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
   const queryOptions = getHealthCheckQueryOptions(options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * Returns paper trades from the SQLite archive, newest first.
+ * @summary List paper trades
+ */
+export const getListTradesUrl = (params?: ListTradesParams) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : value.toString());
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/trades?${stringifiedParams}`
+    : `/api/trades`;
+};
+
+export const listTrades = async (
+  params?: ListTradesParams,
+  options?: RequestInit,
+): Promise<TradeList> => {
+  return customFetch<TradeList>(getListTradesUrl(params), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getListTradesQueryKey = (params?: ListTradesParams) => {
+  return [`/api/trades`, ...(params ? [params] : [])] as const;
+};
+
+export const getListTradesQueryOptions = <
+  TData = Awaited<ReturnType<typeof listTrades>>,
+  TError = ErrorType<unknown>,
+>(
+  params?: ListTradesParams,
+  options?: {
+    query?: UseQueryOptions<
+      Awaited<ReturnType<typeof listTrades>>,
+      TError,
+      TData
+    >;
+    request?: SecondParameter<typeof customFetch>;
+  },
+) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getListTradesQueryKey(params);
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof listTrades>>> = ({
+    signal,
+  }) => listTrades(params, { signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof listTrades>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type ListTradesQueryResult = NonNullable<
+  Awaited<ReturnType<typeof listTrades>>
+>;
+export type ListTradesQueryError = ErrorType<unknown>;
+
+/**
+ * @summary List paper trades
+ */
+
+export function useListTrades<
+  TData = Awaited<ReturnType<typeof listTrades>>,
+  TError = ErrorType<unknown>,
+>(
+  params?: ListTradesParams,
+  options?: {
+    query?: UseQueryOptions<
+      Awaited<ReturnType<typeof listTrades>>,
+      TError,
+      TData
+    >;
+    request?: SecondParameter<typeof customFetch>;
+  },
+): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getListTradesQueryOptions(params, options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * Returns aggregated performance metrics for the given time period.
+ * @summary Performance summary
+ */
+export const getGetPerformanceUrl = (params?: GetPerformanceParams) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : value.toString());
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/performance?${stringifiedParams}`
+    : `/api/performance`;
+};
+
+export const getPerformance = async (
+  params?: GetPerformanceParams,
+  options?: RequestInit,
+): Promise<PerformanceSummary> => {
+  return customFetch<PerformanceSummary>(getGetPerformanceUrl(params), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetPerformanceQueryKey = (params?: GetPerformanceParams) => {
+  return [`/api/performance`, ...(params ? [params] : [])] as const;
+};
+
+export const getGetPerformanceQueryOptions = <
+  TData = Awaited<ReturnType<typeof getPerformance>>,
+  TError = ErrorType<unknown>,
+>(
+  params?: GetPerformanceParams,
+  options?: {
+    query?: UseQueryOptions<
+      Awaited<ReturnType<typeof getPerformance>>,
+      TError,
+      TData
+    >;
+    request?: SecondParameter<typeof customFetch>;
+  },
+) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getGetPerformanceQueryKey(params);
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getPerformance>>> = ({
+    signal,
+  }) => getPerformance(params, { signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof getPerformance>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type GetPerformanceQueryResult = NonNullable<
+  Awaited<ReturnType<typeof getPerformance>>
+>;
+export type GetPerformanceQueryError = ErrorType<unknown>;
+
+/**
+ * @summary Performance summary
+ */
+
+export function useGetPerformance<
+  TData = Awaited<ReturnType<typeof getPerformance>>,
+  TError = ErrorType<unknown>,
+>(
+  params?: GetPerformanceParams,
+  options?: {
+    query?: UseQueryOptions<
+      Awaited<ReturnType<typeof getPerformance>>,
+      TError,
+      TData
+    >;
+    request?: SecondParameter<typeof customFetch>;
+  },
+): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getGetPerformanceQueryOptions(params, options);
 
   const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
     queryKey: QueryKey;

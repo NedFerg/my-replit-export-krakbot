@@ -1,3 +1,4 @@
+import os
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for file output
 import matplotlib.pyplot as plt
@@ -17,8 +18,9 @@ from archive.trade_archive import TradeArchive
 # ---------------------------------------------------------------------------
 # Mode switch — "sim" runs the local simulation; "live" starts the Kraken
 # live trading loop (requires KRAKEN_API_KEY / KRAKEN_API_SECRET secrets).
+# Override via BOT_MODE environment variable: BOT_MODE=sim python3 main.py
 # ---------------------------------------------------------------------------
-MODE = "live"
+MODE = os.environ.get("BOT_MODE", "live")
 
 NUM_EPISODES = 10
 
@@ -275,8 +277,9 @@ def main():
             broker = SimulatedBroker(Exchange())
         else:
             raise NotImplementedError(
-                f"MODE={MODE!r} is not implemented. "
-                "Add a MarketDataSource and Broker subclass for live or paper trading."
+                f"BOT_MODE={MODE!r} is not a valid simulation mode. "
+                "Use BOT_MODE=sim for the multi-agent simulation, or "
+                "BOT_MODE=live (default) for the live/paper trading loop."
             )
 
         # --- Fresh simulation with shared agents and risk manager --------
