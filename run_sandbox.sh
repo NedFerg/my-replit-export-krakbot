@@ -323,6 +323,7 @@ print(f"""
   Entry    : BTC rolling-high breakout (floor=$65K)
   Ctrl-C   : Graceful shutdown (prints final P&L summary)
   Keys     : S = paper summary  |  P = phase + positions
+  Review   : python3 review_performance.py  (any time)
 ============================================================
 """)
 PYEOF
