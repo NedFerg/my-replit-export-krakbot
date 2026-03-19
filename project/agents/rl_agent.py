@@ -5,9 +5,19 @@ import time
 import json
 import os
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
+# PyTorch is optional — only needed when USE_RL_AGENT=true.
+# When running the Bull/Bear sandbox (USE_BULL_BEAR_TRADER=true), this module
+# is imported but the RL classes are never instantiated, so missing torch is fine.
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    _TORCH_AVAILABLE = True
+except ImportError:
+    torch = None        # type: ignore[assignment]
+    nn = None           # type: ignore[assignment]
+    optim = None        # type: ignore[assignment]
+    _TORCH_AVAILABLE = False
 
 from agents.trader_agent import TraderAgent
 from agents.ma_strategy import MAStrategy
@@ -217,6 +227,13 @@ class ReinforcementLearningTrader(TraderAgent):
     )
 
     def __init__(self, name, balance, latency=2, broker=None, dry_run=True):
+        if not _TORCH_AVAILABLE:
+            raise ImportError(
+                "PyTorch is required to use ReinforcementLearningTrader. "
+                "Install it with: pip install torch\n"
+                "If you only need the Bull/Bear sandbox, set USE_BULL_BEAR_TRADER=true "
+                "and USE_RL_AGENT=false (torch is not needed in that mode)."
+            )
         super().__init__(name, balance, latency)
 
         # Live-broker wiring — None in pure-simulation mode

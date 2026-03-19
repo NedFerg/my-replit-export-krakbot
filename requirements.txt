@@ -1,0 +1,14 @@
+# KrakBot runtime dependencies
+# Install with:  pip install -r requirements.txt
+# For live RL agent (USE_RL_AGENT=true) also install:  pip install torch
+
+# Core numerics — used by simulation and signal indicators
+numpy>=1.24
+
+# Charting — used by main.py for equity curve / price chart output
+matplotlib>=3.7
+
+# PyTorch — OPTIONAL, only needed when USE_RL_AGENT=true
+# Not required for sandbox / bull-bear-trader mode.
+# Commented out so the default install stays lightweight.
+# torch>=2.0
