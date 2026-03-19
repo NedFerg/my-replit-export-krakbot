@@ -160,7 +160,7 @@ PYEOF
 # By default the bot starts immediately — crypto trades 24/7.
 # ---------------------------------------------------------------------------
 if [[ "${WAIT_FOR_ETP_MARKET:-false}" == "true" ]]; then
-    delay_sec=$(python3 - <<'PYEOF'
+    read -r delay_sec start_at < <(python3 - <<'PYEOF'
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import math
@@ -175,21 +175,11 @@ if now >= candidate or now.weekday() >= 5:
     while candidate.weekday() >= 5:
         candidate += timedelta(days=1)
 
-seconds = max(0, (candidate - now).total_seconds())
-print(math.ceil(seconds))
+delay = math.ceil(max(0, (candidate - now).total_seconds()))
+label = candidate.strftime("%A %Y-%m-%d 09:30 ET")
+print(delay, label)
 PYEOF
     )
-    start_at=$(python3 -c "
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-ET = ZoneInfo('America/New_York')
-now = datetime.now(ET)
-candidate = now.replace(hour=9, minute=30, second=0, microsecond=0)
-if now >= candidate or now.weekday() >= 5:
-    candidate += __import__('datetime').timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate += __import__('datetime').timedelta(days=1)
-print(candidate.strftime('%A %Y-%m-%d 09:30 ET'))")
     echo "⏰  WAIT_FOR_ETP_MARKET=true — sleeping until next US ETP market open"
     echo "    Next open: ${start_at}  (${delay_sec}s from now)"
     echo "    Press Ctrl-C to cancel, or Ctrl-C and rerun without WAIT_FOR_ETP_MARKET to start now."

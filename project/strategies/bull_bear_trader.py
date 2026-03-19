@@ -446,7 +446,7 @@ class BullBearRotationalTrader:
 
         # 1. N consecutive lower closes (need N+1 prices to compare N pairs)
         recent = prices[-(self._btc_bear_confirm_bars + 1):]
-        if not all(recent[i] > recent[i + 1] for i in range(len(recent) - 1)):
+        if not all(a > b for a, b in zip(recent, recent[1:])):
             return False
 
         # 2. Meaningful % drop from the rolling high

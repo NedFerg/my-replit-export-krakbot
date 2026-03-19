@@ -99,7 +99,7 @@ print(t.strftime('%Y-%m-%d %H:%M:%S local'))")
     echo ""
 
 elif [[ "${WAIT_FOR_ETP_MARKET:-false}" == "true" ]]; then
-    delay_sec=$(python3 - <<'PYEOF'
+    read -r delay_sec start_at < <(python3 - <<'PYEOF'
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import math
@@ -110,20 +110,11 @@ if now >= candidate or now.weekday() >= 5:
     candidate += timedelta(days=1)
     while candidate.weekday() >= 5:
         candidate += timedelta(days=1)
-print(math.ceil(max(0, (candidate - now).total_seconds())))
+delay = math.ceil(max(0, (candidate - now).total_seconds()))
+label = candidate.strftime("%A %Y-%m-%d 09:30 ET")
+print(delay, label)
 PYEOF
     )
-    start_at=$(python3 -c "
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-ET = ZoneInfo('America/New_York')
-now = datetime.now(ET)
-c = now.replace(hour=9, minute=30, second=0, microsecond=0)
-if now >= c or now.weekday() >= 5:
-    c += __import__('datetime').timedelta(days=1)
-    while c.weekday() >= 5:
-        c += __import__('datetime').timedelta(days=1)
-print(c.strftime('%A %Y-%m-%d 09:30 ET'))")
     echo "⏰  WAIT_FOR_ETP_MARKET=true — waiting for next ETP market open"
     echo "    Live trading starts: ${start_at}  (${delay_sec}s from now)"
     echo "    Press Ctrl-C to cancel."
