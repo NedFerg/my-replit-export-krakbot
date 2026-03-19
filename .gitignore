@@ -52,3 +52,9 @@ Thumbs.db
 __pycache__/
 *.py[cod]
 *.pyo
+
+# Backtesting — downloaded data and generated results (large files, gitkeep preserves dirs)
+data/historical/*.csv
+data/test_windows/bull/*.csv
+data/test_windows/bear/*.csv
+results/full_backtests/**/
