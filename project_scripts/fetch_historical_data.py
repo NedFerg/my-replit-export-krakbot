@@ -3,7 +3,7 @@
 fetch_historical_data.py — Download OHLCV data from Kraken via CCXT.
 
 Fetches candle data for all configured assets and timeframes over the
-standard date ranges (2019–2021 and 2023–2024), then saves each dataset
+standard date ranges (2019–2021 and 2024–2025), then saves each dataset
 as a CSV in data/historical/.
 
 Usage

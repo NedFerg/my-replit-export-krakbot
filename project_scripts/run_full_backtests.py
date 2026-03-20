@@ -2,7 +2,7 @@
 """
 run_full_backtests.py — Macro-level backtest runner.
 
-Runs the bot through full historical cycles for 2019–2021 and 2023–2024
+Runs the bot through full historical cycles for 2019–2021 and 2024–2025
 across the primary assets, producing:
     - Equity curves
     - Drawdown charts
@@ -52,7 +52,7 @@ SYMBOLS = [
 TIMEFRAME = DEFAULT_TIMEFRAME   # "1h"
 DATE_RANGES = [
     ("2019-01-01", "2021-12-31"),
-    ("2023-01-01", "2024-12-31"),
+    ("2024-01-01", "2025-12-31"),
 ]
 
 
