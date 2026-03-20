@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from project.backtest.runner import BacktestRunner
-from project.backtest.config import INITIAL_USD, DEFAULT_TIMEFRAME
+from project.backtest.config import INITIAL_USD, DEFAULT_TIMEFRAME, RESULTS_DIR
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,23 +108,39 @@ def main() -> None:
 
     # Final summary table
     if summary_rows:
-        print("\n" + "=" * 90)
-        print("  MACRO BACKTEST SUMMARY")
-        print("=" * 90)
-        print(f"  {'Symbol':<12} {'Period':<14} {'Return':>9} {'MaxDD':>8} "
-              f"{'Sharpe':>8} {'Sortino':>8} {'Trades':>7} {'Win%':>6}")
-        print("  " + "-" * 88)
+        header_line = (
+            f"  {'Asset':<12} {'Period':<14} {'Return':>9} {'MaxDD':>8} "
+            f"{'Sharpe':>8} {'Sortino':>8} {'Trades':>7} {'Win%':>6}"
+        )
+        separator = "  " + "-" * 88
+        data_lines = []
         for row in summary_rows:
-            print(
-                f"  {row['symbol']:<12} {row['period']:<14} "
+            data_lines.append(
+                f"  {row['symbol'].split('/')[0]:<12} {row['period']:<14} "
                 f"{row['return_pct']:>8.1f}% {row['max_drawdown_pct']:>7.1f}% "
                 f"{row['sharpe']:>8.3f} {row['sortino']:>8.3f} "
                 f"{row['trades']:>7d} {row['win_rate']:>5.0f}%"
             )
-        print("=" * 90)
-        print(f"\n  Completed: {done - errors}/{total}  ({errors} errors)")
-        print("  Results saved to: results/full_backtests/")
-        print("=" * 90 + "\n")
+
+        summary_text = "\n".join([
+            "=" * 92,
+            "  FULL BACKTEST SUMMARY",
+            "=" * 92,
+            header_line,
+            separator,
+            *data_lines,
+            "=" * 92,
+            f"  Completed: {done - errors}/{total}  ({errors} errors)",
+            f"  Results saved to: {RESULTS_DIR}",
+            "=" * 92,
+        ])
+
+        print("\n" + summary_text + "\n")
+
+        # Save FULL_SUMMARY.txt
+        summary_path = RESULTS_DIR / "FULL_SUMMARY.txt"
+        summary_path.write_text(summary_text + "\n")
+        logger.info("Summary saved to: %s", summary_path)
     else:
         logger.warning("No results generated. Check that data has been downloaded.")
 
