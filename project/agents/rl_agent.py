@@ -13,11 +13,13 @@ try:
     import torch.nn as nn
     import torch.optim as optim
     _TORCH_AVAILABLE = True
+    _NNModule = nn.Module   # real PyTorch base class
 except ImportError:
     torch = None        # type: ignore[assignment]
     nn = None           # type: ignore[assignment]
     optim = None        # type: ignore[assignment]
     _TORCH_AVAILABLE = False
+    _NNModule = object  # placeholder so class definitions below don't fail
 
 from agents.trader_agent import TraderAgent
 from agents.ma_strategy import MAStrategy
@@ -27,7 +29,7 @@ from agents.ma_strategy import MAStrategy
 # Noisy linear layer (NoisyNet)
 # ---------------------------------------------------------------------------
 
-class NoisyLinear(nn.Module):
+class NoisyLinear(_NNModule):
     """
     Linear layer with parametric noise on weights and biases.
 
@@ -90,7 +92,7 @@ class NoisyLinear(nn.Module):
 # C51 Distributional Value Network  V(s)
 # ---------------------------------------------------------------------------
 
-class ValueNetwork(nn.Module):
+class ValueNetwork(_NNModule):
     """
     C51 distributional state-value network.
 
@@ -134,7 +136,7 @@ class ValueNetwork(nn.Module):
 # Gaussian Actor Network
 # ---------------------------------------------------------------------------
 
-class ActorNetwork(nn.Module):
+class ActorNetwork(_NNModule):
     """
     Stochastic Gaussian actor for continuous multi-asset portfolio exposure.
 
