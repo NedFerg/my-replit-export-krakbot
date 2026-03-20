@@ -23,6 +23,7 @@ Prerequisites
     Run fetch_historical_data.py first to download BTC/USD 1h data.
 """
 
+import json
 import logging
 import sys
 from pathlib import Path
@@ -228,21 +229,66 @@ def main() -> None:
     bull_dir.mkdir(parents=True, exist_ok=True)
     bear_dir.mkdir(parents=True, exist_ok=True)
 
+    closes = full_df["close"].values
+    rsi_all = _rsi(closes)
+    base_symbol = SYMBOL.split("/")[0]
+
+    summary: dict = {"bull": [], "bear": []}
+
     for i, win_df in enumerate(bull_windows, 1):
-        start_dt = win_df["timestamp"].iloc[0].strftime("%Y%m%d_%H%M")
-        end_dt = win_df["timestamp"].iloc[-1].strftime("%Y%m%d_%H%M")
+        start_ts = win_df["timestamp"].iloc[0]
+        end_ts = win_df["timestamp"].iloc[-1]
+        start_dt = start_ts.strftime("%Y%m%d_%H%M")
+        end_dt = end_ts.strftime("%Y%m%d_%H%M")
         pct = (win_df["close"].iloc[-1] - win_df["close"].iloc[0]) / win_df["close"].iloc[0] * 100
+        # Find global index to get RSI at window start
+        global_idx = full_df.index[full_df["timestamp"] == start_ts].tolist()
+        rsi_val = float(rsi_all[global_idx[0]]) if global_idx and not np.isnan(rsi_all[global_idx[0]]) else None
+        score = score_window(win_df)
         fname = bull_dir / f"bull_{i:02d}_{start_dt}_{pct:+.1f}pct.csv"
         win_df.to_csv(fname, index=False)
         logger.info("  [bull %02d] %s → %s  (%+.1f%%)", i, start_dt, end_dt, pct)
+        summary["bull"].append({
+            "window": f"window_{i:03d}",
+            "file": fname.name,
+            "symbol": base_symbol,
+            "start": start_ts.strftime("%Y-%m-%d %H:%M"),
+            "end": end_ts.strftime("%Y-%m-%d %H:%M"),
+            "pct_change": round(pct, 2),
+            "rsi": round(rsi_val, 1) if rsi_val is not None else None,
+            "slope": round(score["slope"], 6),
+            "volatility": round(score["volatility"], 6),
+        })
 
     for i, win_df in enumerate(bear_windows, 1):
-        start_dt = win_df["timestamp"].iloc[0].strftime("%Y%m%d_%H%M")
-        end_dt = win_df["timestamp"].iloc[-1].strftime("%Y%m%d_%H%M")
+        start_ts = win_df["timestamp"].iloc[0]
+        end_ts = win_df["timestamp"].iloc[-1]
+        start_dt = start_ts.strftime("%Y%m%d_%H%M")
+        end_dt = end_ts.strftime("%Y%m%d_%H%M")
         pct = (win_df["close"].iloc[-1] - win_df["close"].iloc[0]) / win_df["close"].iloc[0] * 100
+        global_idx = full_df.index[full_df["timestamp"] == start_ts].tolist()
+        rsi_val = float(rsi_all[global_idx[0]]) if global_idx and not np.isnan(rsi_all[global_idx[0]]) else None
+        score = score_window(win_df)
         fname = bear_dir / f"bear_{i:02d}_{start_dt}_{pct:+.1f}pct.csv"
         win_df.to_csv(fname, index=False)
         logger.info("  [bear %02d] %s → %s  (%+.1f%%)", i, start_dt, end_dt, pct)
+        summary["bear"].append({
+            "window": f"window_{i:03d}",
+            "file": fname.name,
+            "symbol": base_symbol,
+            "start": start_ts.strftime("%Y-%m-%d %H:%M"),
+            "end": end_ts.strftime("%Y-%m-%d %H:%M"),
+            "pct_change": round(pct, 2),
+            "rsi": round(rsi_val, 1) if rsi_val is not None else None,
+            "slope": round(score["slope"], 6),
+            "volatility": round(score["volatility"], 6),
+        })
+
+    # Write summary JSON
+    summary_path = TEST_WINDOWS_DIR / "windows_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    logger.info("Summary written to: %s", summary_path)
 
     logger.info("=" * 60)
     logger.info("Windows saved to: %s", TEST_WINDOWS_DIR)

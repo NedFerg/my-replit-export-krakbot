@@ -57,4 +57,7 @@ __pycache__/
 data/historical/*.csv
 data/test_windows/bull/*.csv
 data/test_windows/bear/*.csv
+data/test_windows/windows_summary.json
 results/full_backtests/**/
+results/window_tests/*
+!results/window_tests/.gitkeep

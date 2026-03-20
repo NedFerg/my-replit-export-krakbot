@@ -51,7 +51,7 @@ DEFAULT_TIMEFRAME: str = "1h"
 # ---------------------------------------------------------------------------
 DATE_RANGES: list[tuple[str, str]] = [
     ("2019-01-01", "2021-12-31"),
-    ("2023-01-01", "2024-12-31"),
+    ("2024-01-01", "2025-12-31"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -60,13 +60,15 @@ DATE_RANGES: list[tuple[str, str]] = [
 ROOT_DIR = Path(__file__).resolve().parents[2]          # repo root
 DATA_DIR = ROOT_DIR / "data" / "historical"             # OHLCV CSVs
 TEST_WINDOWS_DIR = ROOT_DIR / "data" / "test_windows"   # bull/bear windows
-RESULTS_DIR = ROOT_DIR / "results" / "full_backtests"   # output results
+RESULTS_DIR = ROOT_DIR / "results" / "full_backtests"   # macro backtest output
+WINDOW_TESTS_RESULTS_DIR = ROOT_DIR / "results" / "window_tests"  # micro test output
 
 # Ensure directories exist at import time
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 (TEST_WINDOWS_DIR / "bull").mkdir(parents=True, exist_ok=True)
 (TEST_WINDOWS_DIR / "bear").mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+WINDOW_TESTS_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Portfolio / simulation parameters
