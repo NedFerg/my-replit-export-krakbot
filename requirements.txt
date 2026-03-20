@@ -1,14 +1,47 @@
 # KrakBot runtime dependencies
+# Python 3.9+ compatible
 # Install with:  pip install -r requirements.txt
-# For live RL agent (USE_RL_AGENT=true) also install:  pip install torch
+# For live RL agent (USE_RL_AGENT=true) also install:  pip install torch>=2.0
 
-# Core numerics — used by simulation and signal indicators
-numpy>=1.24
+# ---------------------------------------------------------------------------
+# Core trading — Kraken API and data manipulation
+# ---------------------------------------------------------------------------
+ccxt>=4.2.0
+pandas>=2.0.0,<3.0
+numpy>=1.24,<2.0
 
-# Charting — used by main.py for equity curve / price chart output
+# ---------------------------------------------------------------------------
+# Analysis — technical indicators and statistics
+# ---------------------------------------------------------------------------
+ta>=0.11.0
+scipy>=1.11.0
+
+# ---------------------------------------------------------------------------
+# Data & Storage
+# ---------------------------------------------------------------------------
+sqlalchemy>=2.0.0
+# sqlite3 is part of Python's standard library — no install needed
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# ---------------------------------------------------------------------------
+# Visualization — used by main.py and backtesting plotter
+# ---------------------------------------------------------------------------
 matplotlib>=3.7
 
-# PyTorch — OPTIONAL, only needed when USE_RL_AGENT=true
+# ---------------------------------------------------------------------------
+# Logging (optional but recommended)
+# ---------------------------------------------------------------------------
+colorlog>=6.7.0
+
+# ---------------------------------------------------------------------------
+# ML/RL (optional) — only needed when USE_RL_AGENT=true
 # Not required for sandbox / bull-bear-trader mode.
-# Commented out so the default install stays lightweight.
+# Uncomment to install:
+# ---------------------------------------------------------------------------
 # torch>=2.0
+# gym>=0.26.0
