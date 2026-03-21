@@ -53,6 +53,15 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Environment / secrets — NEVER commit real API keys
+.env
+
+# KrakBot runtime data — generated at run time, never commit
+project/logs/paper_trades.csv
+project/logs/eod_*.txt
+project/trades.jsonl
+project/archive/*.db
+
 # Backtesting — downloaded data and generated results (large files, gitkeep preserves dirs)
 data/historical/*.csv
 data/test_windows/bull/*.csv
