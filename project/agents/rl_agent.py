@@ -980,8 +980,14 @@ class ReinforcementLearningTrader(TraderAgent):
         if self.broker is not None:
             self.broker._last_rebalance_time = _now
 
-        # Refresh balances so deposits/fills are reflected immediately
-        if hasattr(self.broker, "fetch_live_balances"):
+        # Detect paper mode via the presence of paper_cash (PaperBroker attribute)
+        _is_paper = hasattr(self.broker, "paper_cash")
+
+        # Refresh balances so deposits/fills are reflected immediately.
+        # Skip for PaperBroker — it tracks balances internally and has no
+        # Kraken credentials, so calling fetch_live_balances() would trigger
+        # the kill switch with "Missing Kraken API credentials".
+        if not _is_paper and hasattr(self.broker, "fetch_live_balances"):
             self.broker.fetch_live_balances()
 
         live_balances = getattr(self.broker, "live_balances", {})
@@ -1005,16 +1011,26 @@ class ReinforcementLearningTrader(TraderAgent):
             print("  [ORDER] No equity available — skipping order conversion")
             return
 
-        # Free cash available for buys; sells capped by actual holdings
-        remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
+        # Free cash available for buys; sells capped by actual holdings.
+        # In paper mode use paper_cash directly; in live mode read from the
+        # authenticated Kraken balance snapshot.
+        if _is_paper:
+            remaining_usd = float(self.broker.paper_cash)
+        else:
+            remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
-        # Sync spot positions from broker/live balances
-        spot_positions = getattr(self.broker, "spot_positions", {})
-        if hasattr(self.broker, "kraken_balance_keys"):
-            for asset, bal_key in self.broker.kraken_balance_keys.items():
-                qty = float(live_balances.get(bal_key, 0.0) or 0.0)
-                if qty > 0:
-                    spot_positions[asset] = qty
+        # Sync spot positions from broker/live balances.
+        # In paper mode read paper_positions (coin qty keyed by asset name);
+        # in live mode fall back to the live_balances snapshot.
+        if _is_paper:
+            spot_positions = dict(self.broker.paper_positions)
+        else:
+            spot_positions = getattr(self.broker, "spot_positions", {})
+            if hasattr(self.broker, "kraken_balance_keys"):
+                for asset, bal_key in self.broker.kraken_balance_keys.items():
+                    qty = float(live_balances.get(bal_key, 0.0) or 0.0)
+                    if qty > 0:
+                        spot_positions[asset] = qty
 
         # ----------------------------------------------------------------
         # Build candidate order list, SELLs first (frees cash for BUYs)
