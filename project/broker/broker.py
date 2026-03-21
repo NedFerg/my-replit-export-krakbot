@@ -636,7 +636,6 @@ class LiveBroker(SimulatedBroker):
         # Map internal asset names → Kraken ticker symbols used for the
         # public /0/public/Ticker price-feed batch request.
         # Crypto spot pairs use Kraken's X-prefixed legacy names.
-        # ETF/ETP tickers on Kraken use bare ticker symbols (no currency suffix).
         self.kraken_pairs = {
             "BTC":  "XBTUSD",
             "ETH":  "ETHUSD",
@@ -646,14 +645,6 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
-            # ETF hedging instruments (spot-traded, Kraken Spot) — bare ticker symbols
-            # Long ETFs
-            "ETHU": "ETHU",      # ETH 2× Long ETP
-            "SLON": "SLON",      # SOL 2× Long ETP
-            "XXRP": "XXRP",      # XRP 2× Long ETP
-            # Short ETFs (only these two are short)
-            "ETHD": "ETHD",      # ETH 2× Short ETP
-            "SETH": "SETH",      # ETH 1× Short ETP
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
@@ -670,8 +661,7 @@ class LiveBroker(SimulatedBroker):
         }
 
         # Kraken balance-dict keys for each tracked asset
-        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names;
-        # ETP tickers use their plain ticker as the balance key)
+        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names)
         self.kraken_balance_keys = {
             "BTC":  "XXBT",
             "ETH":  "XETH",
@@ -681,11 +671,6 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBAR",
             "XRP":  "XXRP",
             "XLM":  "XXLM",
-            "ETHU": "ETHU",
-            "SLON": "SLON",
-            "XXRP": "XXRP",
-            "ETHD": "ETHD",
-            "SETH": "SETH",
         }
 
         # --- ETF hedging layer -------------------------------------------
@@ -1063,8 +1048,7 @@ class LiveBroker(SimulatedBroker):
             # ---- Log every fetched price so the feed is fully auditable ----
             price_line = "  ".join(
                 f"{a}=${result[a]:,.2f}"
-                for a in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM",
-                           "ETHD", "SETH"]
+                for a in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM", "AVAX"]
                 if a in result
             )
             print(f"[PRICE FEED] {price_line}")
