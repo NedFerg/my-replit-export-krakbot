@@ -645,8 +645,12 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
+            # --- Leveraged ETPs (spot, Kraken) ---
             "ETHD": "ETHDUSD",   # ETH 2× Short ETP — Kraken stock/ETP platform
             "SETH": "SETHUSD",   # ETH 1× Short ETP — Kraken stock/ETP platform
+            "XXRP": "XXRPUSD",   # XRP 3× Long ETP — Kraken stock/ETP platform
+            "SLON": "SLONUSD",   # SOL 3× Long ETP — Kraken stock/ETP platform
+            "ETHU": "ETHUUSD",   # ETH 3× Long ETP — Kraken stock/ETP platform
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
