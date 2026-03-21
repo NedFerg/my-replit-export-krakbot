@@ -1,153 +1,183 @@
 """
 project/utils/market_hours.py
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-US equity / ETF market hours detection with ET timezone support.
+------------------------------
+Market hours detection and order-type enforcement for ETF hedging.
 
-Kraken Spot ETFs (SETH, ETHD, XXRP, SLON, ETHU) trade during US market
-hours only.  This module classifies the current time into one of three
-periods and returns the appropriate Kraken order type:
+US equity / ETF markets trade on the following schedule (all times Eastern):
+  Pre-market   : 04:00 – 09:29  → limit orders only
+  Regular hours: 09:30 – 15:59  → market orders permitted
+  After-hours  : 16:00 – 19:59  → limit orders only
+  Closed       : 20:00 – 03:59  → no ETF orders
 
-    Premarket    (04:00–09:30 ET)  → limit orders only
-    Regular      (09:30–16:00 ET)  → market orders allowed
-    After-hours  (16:00–20:00 ET)  → limit orders only
-    Closed       (20:00–04:00 ET)  → no ETF trading
+Crypto spot markets trade 24/7 and are completely unaffected by this module.
 
-Environment variables (all optional – defaults shown):
-    TRADING_TIMEZONE   America/New_York
-    MARKET_HOURS_START 09:30
-    MARKET_HOURS_END   16:00
-    PREMARKET_START    04:00
-    AFTERHOURS_END     20:00
+Usage
+-----
+    from utils.market_hours import MarketHours
+
+    mh = MarketHours()
+    if mh.etf_trading_allowed():
+        order_type = mh.required_order_type()   # "market" or "limit"
 """
 
-from __future__ import annotations
-
+import datetime
 import os
-from datetime import datetime, time as dt_time
-from enum import Enum
-from zoneinfo import ZoneInfo          # stdlib ≥ 3.9
-
+import zoneinfo
 
 # ---------------------------------------------------------------------------
-# Market period enumeration
+# Configurable via environment variables
 # ---------------------------------------------------------------------------
 
-class MarketPeriod(Enum):
+_TZ_NAME = os.getenv("TRADING_TIMEZONE", "America/New_York")
+_ALLOW_PREMARKET    = os.getenv("ALLOW_PREMARKET",    "true").lower() not in ("false", "0", "no")
+_ALLOW_AFTER_HOURS  = os.getenv("ALLOW_AFTER_HOURS",  "true").lower() not in ("false", "0", "no")
+
+# After-hours session ends at 20:00 ET by default (configurable)
+_AFTER_HOURS_END_HOUR = int(os.getenv("AFTER_HOURS_END_HOUR", "20"))
+
+try:
+    _EASTERN = zoneinfo.ZoneInfo(_TZ_NAME)
+except zoneinfo.ZoneInfoNotFoundError:
+    # Fallback: use UTC offset for US Eastern time (no DST awareness)
+    _EASTERN = datetime.timezone(datetime.timedelta(hours=-5))
+
+
+class MarketSession:
+    """Named constants for the current market session."""
     CLOSED      = "closed"
     PREMARKET   = "premarket"
     REGULAR     = "regular"
     AFTER_HOURS = "after_hours"
 
 
-# ---------------------------------------------------------------------------
-# Order-type constant returned to callers
-# ---------------------------------------------------------------------------
-
-ORDER_TYPE_MARKET = "mkt"
-ORDER_TYPE_LIMIT  = "limit"
-
-
-# ---------------------------------------------------------------------------
-# Time boundary helpers
-# ---------------------------------------------------------------------------
-
-def _parse_hhmm(value: str, default: dt_time) -> dt_time:
-    """Parse 'HH:MM' string to datetime.time, returning *default* on error."""
-    try:
-        parts = value.strip().split(":")
-        return dt_time(int(parts[0]), int(parts[1]))
-    except Exception:
-        return default
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def get_market_period(now: datetime | None = None) -> MarketPeriod:
+class MarketHours:
     """
-    Classify *now* into a MarketPeriod.
+    Stateless helper that queries the current wall-clock time (Eastern) and
+    returns the active session and the required order type for ETF trades.
 
-    Parameters
-    ----------
-    now : datetime | None
-        UTC-aware datetime to evaluate.  Defaults to the current UTC time
-        when None is passed — making the function zero-argument in production.
-
-    Returns
-    -------
-    MarketPeriod enum value.
-
-    Notes
-    -----
-    - Weekends (Saturday, Sunday) always return MarketPeriod.CLOSED.
-    - Time boundaries are configurable via environment variables so the same
-      module works for premarket-only or extended-hours testing without a
-      code change.
+    All public methods accept an optional `now` parameter (datetime) so they
+    can be unit-tested without mocking time.  In production, `now` defaults
+    to the current time in the configured timezone.
     """
-    tz_name = os.getenv("TRADING_TIMEZONE", "America/New_York")
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("America/New_York")
 
-    if now is None:
-        now = datetime.now(ZoneInfo("UTC"))
+    # Session boundaries (hour, minute) in Eastern time
+    PREMARKET_START    = (4,  0)
+    REGULAR_START      = (9, 30)
+    AFTER_HOURS_START  = (16, 0)
+    AFTER_HOURS_END    = (_AFTER_HOURS_END_HOUR, 0)
 
-    # Convert to ET for comparison
-    local = now.astimezone(tz)
+    def _now_eastern(self) -> datetime.datetime:
+        """Return the current time localised to the Eastern timezone."""
+        return datetime.datetime.now(tz=_EASTERN)
 
-    # Weekends: markets closed
-    if local.weekday() >= 5:   # 5 = Saturday, 6 = Sunday
-        return MarketPeriod.CLOSED
+    def _to_eastern(self, dt: datetime.datetime) -> datetime.datetime:
+        """Attach Eastern timezone to a naïve datetime, or convert an aware one."""
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=_EASTERN)
+        return dt.astimezone(_EASTERN)
 
-    current = local.time().replace(second=0, microsecond=0)
+    def get_session(self, now: datetime.datetime | None = None) -> str:
+        """
+        Return the current MarketSession constant for the given moment.
 
-    premarket_start = _parse_hhmm(os.getenv("PREMARKET_START",    "04:00"), dt_time(4,  0))
-    market_open     = _parse_hhmm(os.getenv("MARKET_HOURS_START", "09:30"), dt_time(9,  30))
-    market_close    = _parse_hhmm(os.getenv("MARKET_HOURS_END",   "16:00"), dt_time(16, 0))
-    afterhours_end  = _parse_hhmm(os.getenv("AFTERHOURS_END",     "20:00"), dt_time(20, 0))
+        Parameters
+        ----------
+        now : datetime to evaluate.  Defaults to current Eastern time.
 
-    if premarket_start <= current < market_open:
-        return MarketPeriod.PREMARKET
-    if market_open <= current < market_close:
-        return MarketPeriod.REGULAR
-    if market_close <= current < afterhours_end:
-        return MarketPeriod.AFTER_HOURS
-    return MarketPeriod.CLOSED
+        Returns
+        -------
+        One of MarketSession.{CLOSED, PREMARKET, REGULAR, AFTER_HOURS}.
+        """
+        et = self._to_eastern(now) if now is not None else self._now_eastern()
+
+        # Weekends: markets closed
+        if et.weekday() >= 5:   # 5 = Saturday, 6 = Sunday
+            return MarketSession.CLOSED
+
+        hm = (et.hour, et.minute)
+
+        if hm < self.PREMARKET_START:
+            return MarketSession.CLOSED
+        if hm < self.REGULAR_START:
+            return MarketSession.PREMARKET
+        if hm < self.AFTER_HOURS_START:
+            return MarketSession.REGULAR
+        if hm < self.AFTER_HOURS_END:
+            return MarketSession.AFTER_HOURS
+        return MarketSession.CLOSED
+
+    def etf_trading_allowed(self, now: datetime.datetime | None = None) -> bool:
+        """
+        Return True if ETF orders are permitted at the given moment.
+
+        Pre-market and after-hours sessions are enabled/disabled via the
+        ALLOW_PREMARKET and ALLOW_AFTER_HOURS environment variables.
+        Regular hours are always permitted.
+        Closed (overnight / weekends) is always blocked.
+
+        Parameters
+        ----------
+        now : datetime to evaluate.  Defaults to current Eastern time.
+        """
+        session = self.get_session(now)
+        if session == MarketSession.REGULAR:
+            return True
+        if session == MarketSession.PREMARKET:
+            return _ALLOW_PREMARKET
+        if session == MarketSession.AFTER_HOURS:
+            return _ALLOW_AFTER_HOURS
+        # CLOSED
+        return False
+
+    def required_order_type(self, now: datetime.datetime | None = None) -> str:
+        """
+        Return the Kraken order-type string appropriate for the current session.
+
+        Regular hours → "market"  (fastest execution; allowed by exchange)
+        Extended hours → "limit"   (market orders rejected outside regular hours)
+
+        Parameters
+        ----------
+        now : datetime to evaluate.  Defaults to current Eastern time.
+
+        Returns
+        -------
+        "market" or "limit"
+        """
+        session = self.get_session(now)
+        if session == MarketSession.REGULAR:
+            return "market"
+        return "limit"
+
+    def status_line(self, now: datetime.datetime | None = None) -> str:
+        """Return a compact human-readable status string for logging."""
+        et      = self._to_eastern(now) if now is not None else self._now_eastern()
+        session = self.get_session(now)
+        allowed = self.etf_trading_allowed(now)
+        otype   = self.required_order_type(now) if allowed else "n/a"
+        return (
+            f"[MarketHours] {et.strftime('%Y-%m-%d %H:%M:%S %Z')}  "
+            f"session={session}  etf_allowed={allowed}  order_type={otype}"
+        )
 
 
-def is_etf_tradeable(now: datetime | None = None) -> bool:
-    """
-    Return True if ETF trading is currently permitted (any non-CLOSED period).
+# ---------------------------------------------------------------------------
+# Module-level singleton (convenience)
+# ---------------------------------------------------------------------------
 
-    Crypto spot positions trade 24/7 regardless of this flag.
-    """
-    return get_market_period(now) != MarketPeriod.CLOSED
+_market_hours = MarketHours()
 
 
-def get_etf_order_type(now: datetime | None = None) -> str:
-    """
-    Return the Kraken order-type string appropriate for the current period.
-
-    Regular hours → ``"mkt"``   (ORDER_TYPE_MARKET)
-    Pre/after-hours → ``"limit"``  (ORDER_TYPE_LIMIT)
-    Closed → ``"limit"`` (caller should skip the order entirely via
-    ``is_etf_tradeable()`` but this provides a safe fallback).
-    """
-    period = get_market_period(now)
-    if period == MarketPeriod.REGULAR:
-        return ORDER_TYPE_MARKET
-    return ORDER_TYPE_LIMIT
+def get_session(now: datetime.datetime | None = None) -> str:
+    """Module-level convenience wrapper for MarketHours.get_session()."""
+    return _market_hours.get_session(now)
 
 
-def describe_market_period(now: datetime | None = None) -> str:
-    """Human-readable summary of the current market period and order type."""
-    period     = get_market_period(now)
-    order_type = get_etf_order_type(now)
-    tradeable  = period != MarketPeriod.CLOSED
-    return (
-        f"period={period.value}  "
-        f"tradeable={tradeable}  "
-        f"order_type={order_type}"
-    )
+def etf_trading_allowed(now: datetime.datetime | None = None) -> bool:
+    """Module-level convenience wrapper for MarketHours.etf_trading_allowed()."""
+    return _market_hours.etf_trading_allowed(now)
+
+
+def required_order_type(now: datetime.datetime | None = None) -> str:
+    """Module-level convenience wrapper for MarketHours.required_order_type()."""
+    return _market_hours.required_order_type(now)

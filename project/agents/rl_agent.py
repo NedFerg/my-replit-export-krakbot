@@ -200,6 +200,10 @@ class ReinforcementLearningTrader(TraderAgent):
     # all 8 have continuous exposure targets in [-1, +1].
     PORTFOLIO_ASSETS = ["SOL", "XRP", "LINK", "ETH", "BTC", "XLM", "HBAR", "AVAX"]
 
+    # ETF assets managed by the ETF hedging layer (separate from PORTFOLIO_ASSETS).
+    # These are tracked via broker.etf_positions, not the main spot portfolio.
+    ETF_ASSETS = ["ETHD", "SETH"]
+
     # Reward shaping coefficients — class-level for easy tuning
     INVENTORY_PENALTY_COEF = 0.1  # penalty per unit of mean abs portfolio exposure
 
@@ -258,6 +262,10 @@ class ReinforcementLearningTrader(TraderAgent):
         self.positions        = {a: 0.0 for a in self.assets}
         self.target_exposures = {a: 0.0 for a in self.assets}
 
+        # ETF hedging layer exposure targets — separate from spot targets.
+        # ETHD target ≥ 0 (long), SETH target ≥ 0 (short exposure via holding SETH).
+        self.etf_target_exposures = {a: 0.0 for a in self.ETF_ASSETS}
+
         # Legacy single-asset compatibility (SOL):
         self.target_exposure = 0.0   # kept in sync with target_exposures["SOL"]
 
@@ -284,6 +292,14 @@ class ReinforcementLearningTrader(TraderAgent):
             "HBAR": -0.3,
             "AVAX": -0.4,
         }
+
+        # ETF per-asset caps (informational / future RL use).
+        # The ETF hedger enforces a combined 30% cap at the portfolio level via
+        # MAX_ETF_ALLOCATION.  These per-asset limits are exposed here so that
+        # any future RL-driven ETF target generation (analogous to max_long /
+        # max_short for the crypto spot layer) has a consistent reference point.
+        self.max_etf_long  = {"ETHD": 0.30}   # max fraction of equity in long ETF
+        self.max_etf_short = {"SETH": 0.30}   # max fraction of equity in short ETF
 
         # ---------------------------------------------------------------
         # Per-ETF exposure caps — ETF positions are managed by the broker's
@@ -1111,11 +1127,12 @@ class ReinforcementLearningTrader(TraderAgent):
             self.broker.run_futures_overlay(self, live_prices)
 
         # ----------------------------------------------------------------
-        # ETF overlay — regime-aware hedging/amplification layer
+        # ETF hedging overlay (replaces futures for US users)
+        # Always runs after spot crypto orders; gated by MarketHours inside
+        # run_etf_overlay() so no additional check is needed here.
         # ----------------------------------------------------------------
         if hasattr(self.broker, "run_etf_overlay"):
-            regime = self._build_etf_regime(live_prices)
-            self.broker.run_etf_overlay(regime=regime)
+            self.broker.run_etf_overlay(self, live_prices)
 
     # ------------------------------------------------------------------
     # Order entry
@@ -1194,8 +1211,9 @@ class ReinforcementLearningTrader(TraderAgent):
         Network weights, replay buffer, and actor persist across episodes.
         """
         super().reset_for_new_episode()
-        self.positions        = {a: 0.0 for a in self.assets}
-        self.target_exposures = {a: 0.0 for a in self.assets}
+        self.positions            = {a: 0.0 for a in self.assets}
+        self.target_exposures     = {a: 0.0 for a in self.assets}
+        self.etf_target_exposures = {a: 0.0 for a in self.ETF_ASSETS}
         self.target_exposure  = 0.0
         self.last_mid_price   = None
         self.prev_state       = None
