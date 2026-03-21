@@ -682,6 +682,12 @@ class LiveBroker(SimulatedBroker):
         self.live_prices           = {}   # asset → latest float price
         self.last_price_timestamp  = 0    # Unix timestamp of last successful fetch
 
+        # Consecutive price-fetch failure counter.
+        # The kill switch only fires after PRICE_FAIL_THRESHOLD consecutive
+        # failures so a brief API blip does not permanently halt the bot.
+        self._price_fail_count      = 0
+        self.PRICE_FAIL_THRESHOLD   = int(os.getenv("PRICE_FAIL_THRESHOLD", "5"))
+
         # Live account state (read-only in dry-run)
         self.live_balances  = {}   # raw Kraken balance dict
         self.live_positions = {}   # raw Kraken open-positions dict
@@ -855,6 +861,20 @@ class LiveBroker(SimulatedBroker):
         self.last_api_error = reason
         print(f"[KILL SWITCH] Triggered: {reason}")
 
+    def reset_kill_switch(self):
+        """
+        Re-arm the broker after a transient network failure has been resolved.
+
+        Safe to call only when you are certain the underlying problem (stale
+        prices, temporary connectivity loss) has been corrected.  The live
+        trading loop calls this automatically after a successful price fetch
+        so that a brief API outage does not permanently stop the bot.
+        """
+        if self.kill_switch:
+            print("[KILL SWITCH] Reset — broker re-armed after successful recovery.")
+        self.kill_switch    = False
+        self.last_api_error = None
+
     def validate_credentials(self) -> bool:
         """
         Confirm that KRAKEN_API_KEY and KRAKEN_API_SECRET are valid by calling
@@ -899,23 +919,35 @@ class LiveBroker(SimulatedBroker):
         """
         Call a public (unauthenticated) Kraken REST endpoint.
 
-        Scaffolding only — not yet wired into price feeds or the main loop.
-        Any network error triggers the kill switch to keep the system safe.
+        Retries up to 3 times with exponential back-off (2 s, 4 s, 8 s) before
+        giving up.  The kill switch is only triggered after all retries are
+        exhausted so a brief network hiccup does not permanently halt the bot.
         """
         url    = self.kraken_base_url + path
         params = params or {}
-        try:
-            t0 = time.time()
-            resp = self.kraken_session.get(url, params=params, timeout=5)
-            self.last_latency_sec = time.time() - t0
-            data = resp.json()
-            if data.get("error"):
-                self.last_api_error = data["error"]
-                print(f"[KRAKEN PUBLIC ERROR] {data['error']}")
-            return data
-        except Exception as e:
-            self.trigger_kill_switch(f"Kraken public request failed: {e}")
-            return None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                t0 = time.time()
+                resp = self.kraken_session.get(url, params=params, timeout=8)
+                self.last_latency_sec = time.time() - t0
+                data = resp.json()
+                if data.get("error"):
+                    self.last_api_error = data["error"]
+                    print(f"[KRAKEN PUBLIC ERROR] {data['error']}")
+                return data
+            except Exception as e:
+                last_exc = e
+                wait = 2 ** (attempt + 1)   # 2 s, 4 s, 8 s
+                print(
+                    f"[KRAKEN PUBLIC] Attempt {attempt + 1}/3 failed: {e}"
+                    + (f" — retrying in {wait} s" if attempt < 2 else " — no more retries")
+                )
+                if attempt < 2:
+                    time.sleep(wait)
+
+        self.trigger_kill_switch(f"Kraken public request failed after 3 attempts: {last_exc}")
+        return None
 
     def _kraken_private(self, path: str, data: dict | None = None):
         """
@@ -1034,6 +1066,15 @@ class LiveBroker(SimulatedBroker):
             self.live_prices          = result
             self.last_price_timestamp = time.time()
 
+            # ---- Reset the consecutive-failure counter on success ----------
+            if self._price_fail_count > 0:
+                print(f"[PRICE FEED] Recovered after {self._price_fail_count} consecutive failure(s).")
+                # Re-arm the kill switch if it was tripped by a transient price outage
+                # (i.e. no trading-safety reason caused it, just network).
+                if self.kill_switch and "price" in (self.last_api_error or "").lower():
+                    self.reset_kill_switch()
+            self._price_fail_count = 0
+
             # ---- Log every fetched price so the feed is fully auditable ----
             price_line = "  ".join(
                 f"{a}=${result[a]:,.2f}"
@@ -1060,6 +1101,13 @@ class LiveBroker(SimulatedBroker):
             if missing:
                 print(f"[PRICE FEED] Missing prices for: {missing}")
 
+        else:
+            self._price_fail_count += 1
+            print(
+                f"[PRICE FEED] Empty result — consecutive failures: "
+                f"{self._price_fail_count}/{self.PRICE_FAIL_THRESHOLD}"
+            )
+
         return result
 
     def prices_are_fresh(self, max_age_sec: float = 10.0) -> bool:
@@ -1076,15 +1124,26 @@ class LiveBroker(SimulatedBroker):
     def update_prices_if_needed(self):
         """
         Call before each portfolio step when running in live mode.
-        Refreshes the price cache if stale; triggers the kill switch if the
-        refresh still fails — so the system never acts on bad data.
+        Refreshes the price cache if stale.  Only triggers the kill switch
+        after PRICE_FAIL_THRESHOLD consecutive failures so a brief network
+        blip does not permanently halt the bot.
         """
         if not self.prices_are_fresh():
             print("[PRICE FEED] Refreshing live prices...")
             self.fetch_live_prices()
 
         if not self.prices_are_fresh():
-            self.trigger_kill_switch("Stale or missing live prices — halting order flow")
+            self._price_fail_count += 1
+            if self._price_fail_count >= self.PRICE_FAIL_THRESHOLD:
+                self.trigger_kill_switch(
+                    f"Stale/missing prices after {self._price_fail_count} "
+                    "consecutive failures — halting order flow"
+                )
+            else:
+                print(
+                    f"[PRICE FEED] Stale prices — failure {self._price_fail_count}/"
+                    f"{self.PRICE_FAIL_THRESHOLD} (kill switch arms at threshold)"
+                )
 
     def fetch_live_balances(self):
         """

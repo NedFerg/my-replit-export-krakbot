@@ -61,3 +61,10 @@ project/logs/paper_trades.csv
 project/logs/eod_*.txt
 project/trades.jsonl
 project/archive/*.db
+
+# Sandbox runtime artefacts — never commit these
+project/logs/*.csv
+project/logs/*.db
+project/logs/*.txt
+*.db
+trades.jsonl

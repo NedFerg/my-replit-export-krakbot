@@ -503,16 +503,22 @@ class ReinforcementLearningTrader(TraderAgent):
         # Sanity-check architecture compatibility
         saved_assets   = payload.get("assets", [])
         saved_feat_dim = payload.get("feature_dim", -1)
+        saved_steps    = payload.get("replay_steps", 0)
         if saved_assets != self.assets:
             print(
                 f"[CHECKPOINT] Asset mismatch — checkpoint has {saved_assets},\n"
-                f"             agent expects {self.assets}. Ignoring."
+                f"             agent expects {self.assets}. Ignoring.\n"
+                f"             checkpoint keys: {list(payload.keys())}\n"
+                f"             checkpoint replay_steps: {saved_steps}"
             )
             return False
         if saved_feat_dim != self.feature_dim:
             print(
                 f"[CHECKPOINT] Feature-dim mismatch — checkpoint={saved_feat_dim}, "
-                f"agent={self.feature_dim}. Ignoring."
+                f"agent={self.feature_dim}. Ignoring.\n"
+                f"             checkpoint keys: {list(payload.keys())}\n"
+                f"             checkpoint assets: {saved_assets}\n"
+                f"             checkpoint replay_steps: {saved_steps}"
             )
             return False
 
@@ -522,7 +528,12 @@ class ReinforcementLearningTrader(TraderAgent):
             self.target_value_net.load_state_dict(payload["value_net_state_dict"])
             self.replay_steps = payload.get("replay_steps", 0)
         except Exception as exc:
-            print(f"[CHECKPOINT] Weight-load error: {exc}")
+            print(
+                f"[CHECKPOINT] Weight-load error: {exc}\n"
+                f"             checkpoint keys available: {list(payload.keys())}\n"
+                f"             actor expects input_dim={self.feature_dim}, "
+                f"num_assets={self.num_assets}"
+            )
             return False
 
         self._checkpoint_loaded = True
@@ -622,16 +633,240 @@ class ReinforcementLearningTrader(TraderAgent):
     # Live state construction helpers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Validation helpers
+    # ------------------------------------------------------------------
+
+    def _validate_state_vector(self, state_vec: list) -> bool:
+        """
+        Check that the state vector has the correct length and contains
+        no NaN or Inf values.
+
+        Returns True if the vector is valid, False otherwise.
+        Logs a warning with details on the first detected problem.
+        """
+        if len(state_vec) != self.FEATURE_DIM:
+            print(
+                f"[VALIDATE] State vector length mismatch: "
+                f"got {len(state_vec)}, expected {self.FEATURE_DIM}"
+            )
+            return False
+        for i, v in enumerate(state_vec):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                print(f"[VALIDATE] Non-numeric value at feature index {i}: {v!r}")
+                return False
+            if fv != fv:  # NaN check (NaN != NaN)
+                print(f"[VALIDATE] NaN detected at feature index {i}")
+                return False
+            if fv == float("inf") or fv == float("-inf"):
+                print(f"[VALIDATE] Inf detected at feature index {i}: {fv}")
+                return False
+        return True
+
+    def _validate_actions(self, action_list: list) -> bool:
+        """
+        Check that actor output contains no NaN/Inf and that every action
+        is within the expected tanh range [-1, +1].
+
+        Returns True if all actions are valid, False otherwise.
+        """
+        if len(action_list) != self.num_assets:
+            print(
+                f"[VALIDATE] Action list length mismatch: "
+                f"got {len(action_list)}, expected {self.num_assets}"
+            )
+            return False
+        for i, v in enumerate(action_list):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                print(f"[VALIDATE] Non-numeric action at index {i}: {v!r}")
+                return False
+            if fv != fv:
+                print(f"[VALIDATE] NaN in actor output at index {i} "
+                      f"(asset={self.assets[i]})")
+                return False
+            if fv == float("inf") or fv == float("-inf"):
+                print(f"[VALIDATE] Inf in actor output at index {i} "
+                      f"(asset={self.assets[i]}): {fv}")
+                return False
+        return True
+
+    def _validate_price_history(self) -> bool:
+        """
+        Inspect the current price history for obviously stale or unreasonable
+        data (e.g., negative prices, extreme outliers).
+
+        Returns True if history looks healthy, False if anomalies are found.
+        Intended for use in diagnostics and periodic health-checks.
+        """
+        hist = getattr(self, "_price_history", {})
+        if not hist:
+            return True
+        ok = True
+        for asset, prices in hist.items():
+            if not prices:
+                continue
+            for p in prices:
+                if p <= 0:
+                    print(f"[VALIDATE] Non-positive price in history for {asset}: {p}")
+                    ok = False
+                    break
+            if len(prices) >= 2:
+                # Detect extreme single-bar move (> 50 %) as a potential feed gap
+                last, prev = prices[-1], prices[-2]
+                if prev > 0 and abs(last - prev) / prev > 0.5:
+                    print(
+                        f"[VALIDATE] Suspicious price jump for {asset}: "
+                        f"{prev:.4f} → {last:.4f} ({((last-prev)/prev)*100:+.1f}%)"
+                    )
+                    ok = False
+        return ok
+
+    # ------------------------------------------------------------------
+    # Diagnostics helpers
+    # ------------------------------------------------------------------
+
+    def _diagnose_checkpoint_state(self) -> dict:
+        """
+        Return a diagnostic summary of the current checkpoint state.
+
+        Keys in the returned dict:
+          - checkpoint_loaded  : bool
+          - checkpoint_path    : str
+          - replay_steps       : int
+          - actor_param_count  : int
+          - value_param_count  : int
+          - assets             : list
+          - feature_dim        : int
+        """
+        actor_params = sum(p.numel() for p in self.actor.parameters())
+        value_params = sum(p.numel() for p in self.value_net.parameters())
+        info = {
+            "checkpoint_loaded": self._checkpoint_loaded,
+            "checkpoint_path":   self.CHECKPOINT_PATH,
+            "replay_steps":      self.replay_steps,
+            "actor_param_count": actor_params,
+            "value_param_count": value_params,
+            "assets":            list(self.assets),
+            "feature_dim":       self.feature_dim,
+        }
+        print("[DIAG] Checkpoint state:")
+        for k, v in info.items():
+            print(f"  {k}: {v}")
+        return info
+
+    def _diagnose_live_prices(self, live_prices: dict | None = None) -> dict:
+        """
+        Validate the live price feed and return a summary dict.
+
+        Parameters
+        ----------
+        live_prices : optional dict.  If None, reads from self.broker.
+
+        Keys in the returned dict per asset:
+          - price          : current price (0 if missing)
+          - history_len    : number of bars in rolling history
+          - last_momentum5 : 5-bar momentum
+          - valid          : bool — price > 0
+        """
+        if live_prices is None:
+            live_prices = getattr(self.broker, "live_prices", {}) if self.broker else {}
+
+        hist = getattr(self, "_price_history", {})
+        summary = {}
+        print("[DIAG] Live price feed:")
+        for a in self.assets:
+            price  = live_prices.get(a, 0.0)
+            hlen   = len(hist.get(a, []))
+            mom5   = self._momentum(a, 5)
+            valid  = price > 0
+            summary[a] = {
+                "price":           price,
+                "history_len":     hlen,
+                "last_momentum5":  mom5,
+                "valid":           valid,
+            }
+            status = "OK" if valid else "MISSING"
+            print(f"  {a:<6}  price={price:>12.4f}  hist={hlen:>3} bars  "
+                  f"mom5={mom5:>+7.4f}  [{status}]")
+        return summary
+
+    def _diagnose_order_history(self, filename: str = "trades.jsonl",
+                                last_n: int = 10) -> list:
+        """
+        Read and summarise the last *last_n* entries from the trade journal.
+
+        Returns a list of dicts (most recent first).  Prints a formatted
+        table to stdout for quick console inspection.
+        """
+        records = []
+        try:
+            with open(filename) as f:
+                lines = f.readlines()
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+                if len(records) >= last_n:
+                    break
+        except FileNotFoundError:
+            print(f"[DIAG] Trade journal not found: {filename}")
+            return []
+        except Exception as exc:
+            print(f"[DIAG] Could not read trade journal: {exc}")
+            return []
+
+        print(f"[DIAG] Last {len(records)} trade(s) from {filename}:")
+        for r in records:
+            ts  = r.get("timestamp", 0.0)
+            sym = r.get("symbol", "?")
+            side = r.get("side", "?")
+            size = r.get("size", 0.0)
+            stat = r.get("status", "?")
+            print(f"  {ts:.0f}  {side.upper():<4} {size:>10.6f} {sym:<6}  [{stat}]")
+        return records
+
+    # ------------------------------------------------------------------
+    # Price history (with validation)
+    # ------------------------------------------------------------------
+
     def _update_price_history(self, live_prices: dict):
-        """Maintain a rolling 50-bar price history for each asset."""
+        """
+        Maintain a rolling 50-bar price history for each asset.
+
+        Only appends prices that are strictly positive and finite.
+        Logs a warning (rate-gated to once per 60 s) when a price is
+        rejected so feed gaps are visible in the console without noise.
+        """
         if not hasattr(self, "_price_history"):
             self._price_history = {a: [] for a in self.assets}
+        if not hasattr(self, "_bad_price_log_ts"):
+            self._bad_price_log_ts: dict = {}
+
+        now = time.time()
         for a in self.assets:
             p = live_prices.get(a, 0.0)
-            if p > 0:
-                self._price_history[a].append(p)
-                if len(self._price_history[a]) > 50:
-                    self._price_history[a].pop(0)
+            try:
+                pf = float(p)
+            except (TypeError, ValueError):
+                pf = 0.0
+            # Reject non-positive or non-finite prices
+            if not (pf > 0 and pf == pf and pf != float("inf")):
+                last_warn = self._bad_price_log_ts.get(a, 0.0)
+                if now - last_warn >= 60.0:
+                    print(f"[PRICE HISTORY] Rejected invalid price for {a}: {p!r}")
+                    self._bad_price_log_ts[a] = now
+                continue
+            self._price_history[a].append(pf)
+            if len(self._price_history[a]) > 50:
+                self._price_history[a].pop(0)
 
     def _momentum(self, asset: str, n: int) -> float:
         """n-bar price momentum, clipped to ±0.2."""
@@ -641,65 +876,92 @@ class ReinforcementLearningTrader(TraderAgent):
         ret = (hist[-1] - hist[-(n + 1)]) / max(hist[-(n + 1)], 1e-6)
         return max(min(ret, 0.2), -0.2)
 
-    def _build_live_state_vector(self, live_prices: dict) -> list:
+    def _build_live_state_vector(self, live_prices: dict) -> tuple:
         """
         Build the 88-dimensional feature vector from live broker prices.
+
         Missing simulation features (vol, drift, order flow) are zeroed —
         the network was designed to handle sparse inputs gracefully.
+
+        Returns
+        -------
+        (features, is_valid) where:
+          features  : list of float — the FEATURE_DIM-length state vector.
+                      Falls back to an all-zeros neutral vector on error.
+          is_valid  : bool — False when the vector contains NaN/Inf or has
+                      the wrong length (caller should skip the inference step).
         """
-        sol_price = live_prices.get("SOL", 0.0)
-        hist_sol  = getattr(self, "_price_history", {}).get("SOL", [])
-        if len(hist_sol) >= 2 and hist_sol[-2] > 0:
-            price_change = (sol_price - hist_sol[-2]) / hist_sol[-2]
-        else:
-            price_change = 0.0
+        try:
+            sol_price = live_prices.get("SOL", 0.0)
+            try:
+                sol_price = float(sol_price)
+            except (TypeError, ValueError):
+                sol_price = 0.0
 
-        # SOL-specific features (16)
-        features = [
-            round(price_change, 3),   # price_bucket
-            0.0,                      # vol_bucket (simulation-only)
-            0.0,                      # drift_bucket (simulation-only)
-            float(self.target_exposures.get("SOL", 0.0)),  # inv_bucket
-            0.0,                      # regime (0 = neutral/unknown)
-            0.0, 0.0, 0.0,           # m1, m3, imbalance
-            0.0, 0.0,                 # short_vol, long_vol
-            self._momentum("SOL",  5),
-            self._momentum("SOL", 20),
-            self._momentum("SOL", 50),
-            0.0, 0.0, 0.0,           # rolling_vol, vol_imbalance, pressure
-        ]
+            hist_sol  = getattr(self, "_price_history", {}).get("SOL", [])
+            if len(hist_sol) >= 2 and hist_sol[-2] > 0:
+                price_change = (sol_price - hist_sol[-2]) / hist_sol[-2]
+            else:
+                price_change = 0.0
 
-        # Cross-asset features (64 = 8 × 8)
-        #
-        # Per-asset price normalisers map each asset's typical live price to
-        # the [0, 1] range so the neural network receives bounded inputs.
-        # Using a universal 1/1000 was wrong: BTC at $85k → 85.0, XRP → 0.0005.
-        _PRICE_NORM: dict = {
-            "BTC":  100_000.0,   # ~$85k, cap at $100k
-            "ETH":   10_000.0,   # ~$3k,  cap at $10k
-            "SOL":    1_000.0,   # ~$130, cap at $1k
-            "AVAX":   1_000.0,   # ~$30,  cap at $1k
-            "LINK":     100.0,   # ~$14,  cap at $100
-            "XRP":       10.0,   # ~$2,   cap at $10
-            "XLM":        5.0,   # ~$0.3, cap at $5
-            "HBAR":       2.0,   # ~$0.2, cap at $2
-        }
-        for a in self.assets:
-            p    = live_prices.get(a, 0.0)
-            norm = _PRICE_NORM.get(a, 1_000.0)
-            features.extend([
-                min(p / norm, 2.0),       # normalized price (capped at 2× for safety)
-                0.0,                      # vol
-                self._momentum(a,  5) / 100.0,
-                self._momentum(a, 20) / 100.0,
-                self._momentum(a, 50) / 100.0,
+            # SOL-specific features (16)
+            features = [
+                round(price_change, 3),   # price_bucket
+                0.0,                      # vol_bucket (simulation-only)
+                0.0,                      # drift_bucket (simulation-only)
+                float(self.target_exposures.get("SOL", 0.0)),  # inv_bucket
+                0.0,                      # regime (0 = neutral/unknown)
+                0.0, 0.0, 0.0,           # m1, m3, imbalance
+                0.0, 0.0,                 # short_vol, long_vol
+                self._momentum("SOL",  5),
+                self._momentum("SOL", 20),
+                self._momentum("SOL", 50),
                 0.0, 0.0, 0.0,           # rolling_vol, vol_imbalance, pressure
-            ])
+            ]
 
-        # Crypto-regime features (7) + macro_regime (1)
-        features.extend([0.0] * 8)
+            # Cross-asset features (64 = 8 × 8)
+            #
+            # Per-asset price normalisers map each asset's typical live price to
+            # the [0, 1] range so the neural network receives bounded inputs.
+            # Using a universal 1/1000 was wrong: BTC at $85k → 85.0, XRP → 0.0005.
+            _PRICE_NORM: dict = {
+                "BTC":  100_000.0,   # ~$85k, cap at $100k
+                "ETH":   10_000.0,   # ~$3k,  cap at $10k
+                "SOL":    1_000.0,   # ~$130, cap at $1k
+                "AVAX":   1_000.0,   # ~$30,  cap at $1k
+                "LINK":     100.0,   # ~$14,  cap at $100
+                "XRP":       10.0,   # ~$2,   cap at $10
+                "XLM":        5.0,   # ~$0.3, cap at $5
+                "HBAR":       2.0,   # ~$0.2, cap at $2
+            }
+            for a in self.assets:
+                p    = live_prices.get(a, 0.0)
+                try:
+                    p = float(p)
+                except (TypeError, ValueError):
+                    p = 0.0
+                norm = _PRICE_NORM.get(a, 1_000.0)
+                features.extend([
+                    min(p / norm, 2.0) if norm > 0 else 0.0,  # normalized price (capped at 2×)
+                    0.0,                      # vol
+                    self._momentum(a,  5) / 100.0,
+                    self._momentum(a, 20) / 100.0,
+                    self._momentum(a, 50) / 100.0,
+                    0.0, 0.0, 0.0,           # rolling_vol, vol_imbalance, pressure
+                ])
 
-        return features
+            # Crypto-regime features (7) + macro_regime (1)
+            features.extend([0.0] * 8)
+
+        except Exception as exc:
+            print(f"[STATE VECTOR] Construction error: {exc}")
+            return [0.0] * self.FEATURE_DIM, False
+
+        is_valid = self._validate_state_vector(features)
+        if not is_valid:
+            print("[STATE VECTOR] Falling back to neutral all-zero vector")
+            return [0.0] * self.FEATURE_DIM, False
+        return features, True
 
     def _build_etf_regime(self, live_prices: dict) -> dict:
         """
@@ -810,24 +1072,38 @@ class ReinforcementLearningTrader(TraderAgent):
         self._update_price_history(live_prices)
 
         # Build 88-dim state vector and run actor network
-        state_vec = self._build_live_state_vector(live_prices)
-        x = torch.tensor(state_vec, dtype=torch.float32,
-                          device=self.device).unsqueeze(0)   # [1, feature_dim]
+        state_vec, state_valid = self._build_live_state_vector(live_prices)
+        if not state_valid:
+            print("[STEP] Invalid state vector — skipping inference this tick")
+            return
 
-        self.actor.eval()
-        with torch.no_grad():
-            mu, log_std = self.actor.forward(x)              # [1, num_assets] each
-            std = log_std.exp()
+        try:
+            x = torch.tensor(state_vec, dtype=torch.float32,
+                              device=self.device).unsqueeze(0)   # [1, feature_dim]
 
-        mu_list  = mu.squeeze(0).tolist()
-        std_list = std.squeeze(0).tolist()
+            self.actor.eval()
+            with torch.no_grad():
+                mu, log_std = self.actor.forward(x)              # [1, num_assets] each
+                std = log_std.exp()
 
-        # Sample action for target exposures (with grad for training later)
-        self.actor.train()
-        action, log_prob = self.actor.sample(x)
-        self.last_log_prob = log_prob
+            mu_list  = mu.squeeze(0).tolist()
+            std_list = std.squeeze(0).tolist()
 
-        action_list = action.detach().squeeze(0).tolist()
+            # Sample action for target exposures (with grad for training later)
+            self.actor.train()
+            action, log_prob = self.actor.sample(x)
+            self.last_log_prob = log_prob
+
+            action_list = action.detach().squeeze(0).tolist()
+        except Exception as exc:
+            print(f"[STEP] Actor inference error: {exc} — skipping this tick")
+            return
+
+        # Validate actor output before applying to target exposures
+        if not self._validate_actions(action_list):
+            print("[STEP] Actor produced invalid actions — skipping this tick")
+            return
+
         for i, a in enumerate(self.assets):
             self.target_exposures[a] = float(action_list[i])
         self.target_exposure = self.target_exposures["SOL"]
@@ -1093,8 +1369,15 @@ class ReinforcementLearningTrader(TraderAgent):
                   f"  (target={target_frac:.3f}  current={current_frac:.3f}"
                   f"  cash_left={remaining_usd:.2f})")
 
-            self.place_order(a, side, delta_units)
-            orders_placed += 1
+            try:
+                order_result = self.place_order(a, side, delta_units)
+                orders_placed += 1
+                if order_result and isinstance(order_result, dict):
+                    status = order_result.get("status", "unknown")
+                    print(f"  [ORDER CONFIRM] {a} {side.upper()} → status={status}")
+            except Exception as exc:
+                print(f"  [ORDER ERROR] {a} {side.upper()} failed: {exc}")
+                continue
 
             if hasattr(self.broker, "cumulative_fees_usd"):
                 self.broker.cumulative_fees_usd += est_fee_usd
@@ -1103,6 +1386,12 @@ class ReinforcementLearningTrader(TraderAgent):
                 remaining_usd -= notional_usd * (1.0 + TAKER_FEE)
             else:
                 remaining_usd += notional_usd * (1.0 - TAKER_FEE)
+
+        if orders_placed:
+            print(f"  [EXECUTE] Round complete — {orders_placed} order(s) placed"
+                  f"  cash_remaining=${remaining_usd:.2f}")
+        else:
+            print("  [EXECUTE] No orders placed this round")
 
         # ----------------------------------------------------------------
         # Futures overlay (disabled when ENABLE_FUTURES=False)
@@ -1135,27 +1424,57 @@ class ReinforcementLearningTrader(TraderAgent):
         symbol : str   e.g. "SOL", "ETH"
         side   : str   "buy" or "sell"
         size   : float position size in base-asset units
+
+        Returns
+        -------
+        dict with at minimum: status, symbol, side, size, timestamp.
         """
+        ts = time.time()
+
         if self.dry_run or self.broker is None:
-            print(f"[DRY RUN] Would place order: {side} {size} {symbol}")
+            print(f"[DRY RUN] Would place order: {side.upper()} {size:.6f} {symbol}")
             record = {
                 "status":    "dry_run",
                 "symbol":    symbol,
                 "side":      side,
                 "size":      size,
-                "timestamp": time.time(),
+                "timestamp": ts,
             }
             self.log_trade(record)
             return record
 
-        result = self.broker.execute_trade(symbol, side, size)
+        try:
+            result = self.broker.execute_trade(symbol, side, size)
+        except Exception as exc:
+            print(f"[ORDER ERROR] execute_trade({symbol}, {side}, {size:.6f}) raised: {exc}")
+            record = {
+                "status":    "error",
+                "symbol":    symbol,
+                "side":      side,
+                "size":      size,
+                "error":     str(exc),
+                "timestamp": ts,
+            }
+            self.log_trade(record)
+            return record
+
+        # Log execution result details
+        if result and isinstance(result, dict):
+            order_id = result.get("txid") or result.get("id") or result.get("order_id", "?")
+            filled   = result.get("filled", result.get("vol_exec", "?"))
+            avg_px   = result.get("avg_price", result.get("price", "?"))
+            print(
+                f"[ORDER CONFIRM] {side.upper()} {size:.6f} {symbol}  "
+                f"order_id={order_id}  filled={filled}  avg_price={avg_px}"
+            )
+
         record = {
             "status":    "live",
             "symbol":    symbol,
             "side":      side,
             "size":      size,
             "result":    result,
-            "timestamp": time.time(),
+            "timestamp": ts,
         }
         self.log_trade(record)
         return result
@@ -1340,6 +1659,17 @@ class ReinforcementLearningTrader(TraderAgent):
         # Lets the network learn different behaviour under different
         # macro stances without re-training from scratch each time.
         features.append(float(getattr(market_state, "macro_regime", 0)))
+
+        # Sanity-check: feature count must match FEATURE_DIM.
+        # A mismatch here means featurize_state() and FEATURE_DIM are out of
+        # sync — catch it early during simulation rather than silently feeding
+        # the wrong-shaped tensor to the network.
+        if len(features) != self.FEATURE_DIM:
+            print(
+                f"[FEATURE DIM] featurize_state() produced {len(features)} features "
+                f"but FEATURE_DIM={self.FEATURE_DIM}. "
+                "Update FEATURE_DIM or fix featurize_state()."
+            )
 
         return tuple(features)
 

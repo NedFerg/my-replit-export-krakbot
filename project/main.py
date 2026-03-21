@@ -1,10 +1,6 @@
 import os
 import sys
 import time
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for file output
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
 from simulation.simulation import Simulation
 from agents.trader_agent import ValueTrader, MomentumTrader, RandomTrader
@@ -55,6 +51,8 @@ def shade_regimes(ax, regime_history):
 
 
 def plot_price_chart(price_history, regime_history):
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     fig, ax = plt.subplots(figsize=(12, 5))
     shade_regimes(ax, regime_history)
     ax.plot(price_history, color="black", linewidth=1.2, label="Price")
@@ -75,6 +73,7 @@ def plot_price_chart(price_history, regime_history):
 
 
 def plot_equity_curves(agents):
+    import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(12, 5))
     colors = ["steelblue", "darkorange", "seagreen", "crimson"]
     for agent, color in zip(agents, colors):
@@ -94,6 +93,7 @@ def plot_equity_curves(agents):
 
 
 def plot_drawdowns(agents):
+    import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(12, 5))
     colors = ["steelblue", "darkorange", "seagreen", "crimson"]
     for agent, color in zip(agents, colors):
@@ -117,6 +117,7 @@ def plot_drawdowns(agents):
 
 
 def plot_rl_qtable_growth(qtable_sizes):
+    import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(range(1, len(qtable_sizes) + 1), qtable_sizes,
             marker="o", color="crimson", linewidth=1.5)
@@ -427,6 +428,10 @@ def main():
     if MODE == "live":
         run_live()
         return
+
+    # Set matplotlib backend before any pyplot import (simulation path only)
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend for file output
 
     # Create agents once — RLTrader's Q-table accumulates across episodes
     agents = [
