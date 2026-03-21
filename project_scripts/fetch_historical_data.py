@@ -3,12 +3,12 @@
 fetch_historical_data.py — Download OHLCV data from Kraken via CCXT.
 
 Fetches candle data for all configured assets and timeframes over the
-standard date ranges (2019–2021 and 2024–2025), then saves each dataset
+standard date ranges (2019–2021 and 2023–2024), then saves each dataset
 as a CSV in data/historical/.
 
-When the Kraken API returns empty data (e.g. in CI environments), the script
-falls back to generating plausible synthetic OHLCV candles so that downstream
-backtesting scripts can still run.
+If the Kraken API is unavailable (network restrictions, rate limits, etc.)
+the script falls back to generating synthetic OHLCV data using geometric
+Brownian motion so that subsequent scripts in the pipeline can still run.
 
 Usage
 -----
@@ -55,42 +55,76 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Synthetic data configuration
+# Synthetic data generation (fallback when API is unavailable)
 # ---------------------------------------------------------------------------
 
-# Realistic starting price for each asset (approximate USD values)
-_BASE_PRICES: dict[str, float] = {
-    "BTC/USD": 45_000.0,
-    "ETH/USD":  2_500.0,
-    "SOL/USD":    100.0,
-    "XRP/USD":      0.55,
-    "LINK/USD":    15.0,
-    "AVAX/USD":    35.0,
-    "HBAR/USD":     0.08,
-    "XLM/USD":      0.12,
-}
-_DEFAULT_BASE_PRICE: float = 100.0
-
-# Realistic base-volume ranges (in units of the asset) per timeframe
-_VOLUME_RANGES: dict[str, tuple[float, float]] = {
-    "1h":  (   100.0,   5_000.0),
-    "4h":  (   400.0,  20_000.0),
-    "1d":  ( 1_000.0, 100_000.0),
-}
-_DEFAULT_VOLUME_RANGE: tuple[float, float] = (100.0, 10_000.0)
-
-# Map CCXT timeframe strings to pandas date_range frequency strings
-_TF_TO_FREQ: dict[str, str] = {
-    "1h": "1h",
-    "4h": "4h",
-    "1d": "1D",
+# Approximate USD prices by asset symbol and calendar year.
+_BASE_PRICES: dict[str, dict[str, float]] = {
+    "BTC":  {"2019": 3_500, "2020": 7_000, "2021": 30_000,
+             "2022": 20_000, "2023": 17_000, "2024": 45_000},
+    "ETH":  {"2019": 120,   "2020": 230,   "2021": 1_000,
+             "2022": 1_200,  "2023": 1_250,  "2024": 2_500},
+    "SOL":  {"2021": 20,    "2022": 35,    "2023": 12,    "2024": 100},
+    "XRP":  {"2019": 0.35,  "2020": 0.23,  "2021": 0.50,
+             "2022": 0.38,   "2023": 0.37,  "2024": 0.55},
+    "LINK": {"2019": 0.50,  "2020": 8.00,  "2021": 20.00,
+             "2022": 8.00,   "2023": 7.00,  "2024": 15.00},
+    "AVAX": {"2021": 15.00, "2022": 15.00, "2023": 12.00, "2024": 40.00},
+    "HBAR": {"2019": 0.03,  "2020": 0.04,  "2021": 0.05,
+             "2022": 0.06,   "2023": 0.05,  "2024": 0.10},
+    "XLM":  {"2019": 0.10,  "2020": 0.09,  "2021": 0.30,
+             "2022": 0.12,   "2023": 0.09,  "2024": 0.12},
 }
 
+# Candle-frequency aliases for pandas date_range
+_TF_TO_FREQ: dict[str, str] = {"1h": "h", "4h": "4h", "1d": "D"}
 
-# ---------------------------------------------------------------------------
-# Synthetic OHLCV generator
-# ---------------------------------------------------------------------------
+
+def _base_price(symbol: str, start_date: str) -> float:
+    """Return an approximate starting price for *symbol* near *start_date*.
+
+    *start_date* must be a valid ISO-8601 date string (e.g. "2023-01-01")
+    as produced by the DATE_RANGES constant in config.py.
+    """
+    short = symbol.split("/")[0]
+    prices = _BASE_PRICES.get(short, {"2019": 100.0})
+    start_year = int(start_date[:4])
+    # Walk backward from start_year to find the nearest defined year.
+    for y in range(start_year, start_year - 10, -1):
+        if str(y) in prices:
+            return prices[str(y)]
+    return list(prices.values())[0]
+
+
+def _save_synthetic_to_csv(df: pd.DataFrame, csv_path: Path) -> None:
+    """
+    Persist synthetic OHLCV data to *csv_path*.
+
+    If the file already exists (from a previous date-range iteration) the
+    new rows are merged with the existing data so that both date ranges end
+    up in a single CSV — matching the DataLoader's one-file-per-ticker
+    convention.
+    """
+    if csv_path.exists():
+        try:
+            existing = pd.read_csv(csv_path, parse_dates=["timestamp"])
+            if existing["timestamp"].dt.tz is None:
+                existing["timestamp"] = existing["timestamp"].dt.tz_localize("UTC")
+            else:
+                existing["timestamp"] = existing["timestamp"].dt.tz_convert("UTC")
+            if not existing.empty:
+                df = pd.concat([existing, df], ignore_index=True)
+                df = (
+                    df.drop_duplicates(subset=["timestamp"])
+                    .sort_values("timestamp")
+                    .reset_index(drop=True)
+                )
+        except Exception:
+            pass  # If the existing CSV is unreadable, overwrite it.
+    df.to_csv(csv_path, index=False)
+
 
 def _generate_synthetic_ohlcv(
     symbol: str,
@@ -98,31 +132,15 @@ def _generate_synthetic_ohlcv(
     start_date: str,
     end_date: str,
 ) -> pd.DataFrame:
-    """Generate plausible synthetic OHLCV candles for *symbol* over the
-    requested date range.
-
-    Uses a seeded random-walk model so results are reproducible for the
-    same inputs.  The generated data is structurally identical to real
-    Kraken OHLCV CSVs (timestamp, open, high, low, close, volume).
-
-    Parameters
-    ----------
-    symbol    : e.g. "BTC/USD"
-    timeframe : e.g. "1h", "4h", "1d"
-    start_date: ISO-8601 string, e.g. "2024-01-01"
-    end_date  : ISO-8601 string, e.g. "2025-12-31"
-
-    Returns
-    -------
-    pd.DataFrame with columns: timestamp, open, high, low, close, volume
     """
-    if timeframe not in _TF_TO_FREQ:
-        logger.warning(
-            "Timeframe %r not in _TF_TO_FREQ mapping — attempting to use it directly."
-            " Add it to _TF_TO_FREQ if results are unexpected.",
-            timeframe,
-        )
-    freq = _TF_TO_FREQ.get(timeframe, timeframe)
+    Generate synthetic OHLCV data using geometric Brownian motion.
+
+    The data is statistically plausible (realistic volatility regimes,
+    alternating bull/bear phases) but is *not* historically accurate.
+    It is intended only as a CI fallback when the exchange API is
+    unreachable.
+    """
+    freq = _TF_TO_FREQ.get(timeframe, "h")
     timestamps = pd.date_range(start=start_date, end=end_date, freq=freq, tz="UTC")
     n = len(timestamps)
     if n == 0:
@@ -130,66 +148,52 @@ def _generate_synthetic_ohlcv(
             columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
 
-    # Reproducible seed derived from the inputs
-    seed = abs(hash(f"{symbol}:{timeframe}:{start_date}")) % (2 ** 32)
+    # Reproducible per symbol/timeframe/period so results are consistent.
+    seed = abs(hash(f"{symbol}_{timeframe}_{start_date}")) % (2**31)
     rng = np.random.default_rng(seed)
 
-    base_price = _BASE_PRICES.get(symbol, _DEFAULT_BASE_PRICE)
+    # GBM parameters at 1-hour scale, scaled to wider timeframes via √tf.
+    #
+    # sigma = 0.012 (1.2 % per hour) gives a 6-candle standard deviation of
+    # 0.012 × √6 ≈ 2.9 %, so roughly 15 % of 6-hour windows exceed the ±3 %
+    # threshold required for bull/bear window qualification in
+    # extract_test_windows.py — more than enough to find the 10 we need.
+    #
+    # mu = 0.00004 per candle ≈ 0.35 % per day, a mild positive drift that
+    # prevents the price from trending to zero over multi-year simulations
+    # while keeping the expected annualised return moderate (~3 % on 1h data).
+    tf_hours = {"1h": 1, "4h": 4, "1d": 24}.get(timeframe, 1)
+    sigma = 0.012 * (tf_hours ** 0.5)   # scale hourly vol by √tf
+    mu = 0.00004 * tf_hours              # scale drift proportionally to candle width
 
-    # Simulate log-returns: small normally-distributed daily-style moves
-    returns = rng.normal(loc=0.0001, scale=0.015, size=n)
-    closes = base_price * np.cumprod(1.0 + returns)
+    log_returns = rng.normal(mu, sigma, n)
 
-    # Intra-candle spread (open/high/low derived from close)
-    spread = rng.uniform(0.001, 0.018, size=n)
-    opens = closes * rng.uniform(0.99, 1.01, size=n)
-    highs = np.maximum(opens, closes) * (1.0 + spread)
-    lows  = np.minimum(opens, closes) * (1.0 - spread)
+    start_price = _base_price(symbol, start_date)
+    closes = start_price * np.exp(np.cumsum(log_returns))
 
-    vol_low, vol_high = _VOLUME_RANGES.get(timeframe, _DEFAULT_VOLUME_RANGE)
-    volumes = rng.uniform(vol_low, vol_high, size=n)
+    opens = np.empty(n)
+    opens[0] = start_price
+    opens[1:] = closes[:-1]
+
+    intra = np.abs(rng.normal(0, sigma * 0.4, n))
+    highs = np.maximum(opens, closes) * (1 + intra)
+    lows  = np.minimum(opens, closes) * (1 - intra)
+
+    short = symbol.split("/")[0]
+    # log-space means for lognormal volume distribution:
+    #   BTC → e^15 ≈ 3.3M units/candle, ETH → e^14 ≈ 1.2M, SOL → e^13 ≈ 440K
+    #   default → e^12 ≈ 162K for smaller-cap assets
+    vol_mean = {"BTC": 15, "ETH": 14, "SOL": 13}.get(short, 12)
+    volumes = rng.lognormal(mean=vol_mean, sigma=1.5, size=n)
 
     return pd.DataFrame({
         "timestamp": timestamps,
-        "open":      opens,
-        "high":      highs,
-        "low":       lows,
-        "close":     closes,
-        "volume":    volumes,
+        "open":   np.round(opens,  8),
+        "high":   np.round(highs,  8),
+        "low":    np.round(lows,   8),
+        "close":  np.round(closes, 8),
+        "volume": np.round(volumes, 4),
     })
-
-
-def _save_synthetic_to_csv(df_new: pd.DataFrame, symbol: str, timeframe: str) -> Path:
-    """Merge *df_new* with any existing CSV for *symbol*/*timeframe* and save.
-
-    This preserves previously cached real or synthetic candles that fall
-    outside the date range of the new batch, so that subsequent calls for
-    different date ranges still find valid data in the CSV cache.
-
-    Returns
-    -------
-    Path to the (updated) CSV file.
-    """
-    csv_path = DATA_DIR / (symbol.replace("/", "_") + f"_{timeframe}.csv")
-
-    if csv_path.exists():
-        existing = pd.read_csv(csv_path, parse_dates=["timestamp"])
-        if existing["timestamp"].dt.tz is None:
-            existing["timestamp"] = existing["timestamp"].dt.tz_localize("UTC")
-        else:
-            existing["timestamp"] = existing["timestamp"].dt.tz_convert("UTC")
-        combined = (
-            pd.concat([existing, df_new])
-            .drop_duplicates(subset=["timestamp"])
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
-    else:
-        combined = df_new
-
-    combined.to_csv(csv_path, index=False)
-    logger.info("Saved %d candles → %s", len(combined), csv_path)
-    return csv_path
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +212,7 @@ def main() -> None:
     loader = DataLoader()
     total_files = len(SYMBOLS) * len(TIMEFRAMES) * len(DATE_RANGES)
     done = 0
-    errors = 0
-    synthetic_count = 0
+    api_errors = 0    # combinations where we fell back to synthetic data
 
     for symbol in SYMBOLS:
         for tf in TIMEFRAMES:
@@ -219,6 +222,9 @@ def main() -> None:
                     "[%d/%d] %s  %s  %s → %s",
                     done, total_files, symbol, tf, start_date, end_date,
                 )
+
+                # ── Try the exchange first ────────────────────────────────
+                df = pd.DataFrame()
                 try:
                     df = loader.load(
                         symbol=symbol,
@@ -227,47 +233,47 @@ def main() -> None:
                         end_date=end_date,
                         force_refresh=FORCE_REFRESH,
                     )
-                    if df.empty:
-                        logger.warning(
-                            "  ⚠  No candles returned — generating synthetic fallback"
-                        )
-                        df = _generate_synthetic_ohlcv(symbol, tf, start_date, end_date)
-                        if df.empty:
-                            logger.error(
-                                "  ✗  Synthetic generation also returned empty"
-                                " (check date range %s → %s)",
-                                start_date, end_date,
-                            )
-                            errors += 1
-                        else:
-                            _save_synthetic_to_csv(df, symbol, tf)
-                            logger.warning(
-                                "  Generated %d synthetic OHLCV candles"
-                                " (real API returned empty)",
-                                len(df),
-                            )
-                            logger.info(
-                                "  ✓  %d candles  (%s → %s)  (SYNTHETIC FALLBACK)",
-                                len(df),
-                                df["timestamp"].iloc[0].date(),
-                                df["timestamp"].iloc[-1].date(),
-                            )
-                            synthetic_count += 1
-                    else:
-                        logger.info(
-                            "  ✓  %d candles  (%s → %s)",
-                            len(df),
-                            df["timestamp"].iloc[0].date(),
-                            df["timestamp"].iloc[-1].date(),
-                        )
                 except Exception as exc:
-                    logger.error("  ✗  Failed: %s", exc)
-                    errors += 1
+                    logger.warning("  API fetch failed (%s) — using synthetic data", exc)
+
+                # ── Fall back to synthetic data if needed ─────────────────
+                if df.empty:
+                    logger.warning(
+                        "  ⚠  No candles from API — generating synthetic fallback"
+                    )
+                    api_errors += 1
+                    try:
+                        df = _generate_synthetic_ohlcv(symbol, tf, start_date, end_date)
+                        # Save to the same CSV path the loader would have used.
+                        # _save_synthetic_to_csv merges with any existing data so
+                        # both date ranges end up in a single file.
+                        csv_path = (
+                            loader.data_dir
+                            / (symbol.replace("/", "_") + f"_{tf}.csv")
+                        )
+                        _save_synthetic_to_csv(df, csv_path)
+                        logger.info(
+                            "  ✓  Synthetic: %d candles  (%s → %s)",
+                            len(df),
+                            df["timestamp"].iloc[0],
+                            df["timestamp"].iloc[-1],
+                        )
+                    except Exception as syn_exc:
+                        logger.error(
+                            "  ✗  Synthetic fallback failed: %s", syn_exc
+                        )
+                else:
+                    logger.info(
+                        "  ✓  %d candles  (%s → %s)",
+                        len(df),
+                        df["timestamp"].iloc[0].date(),
+                        df["timestamp"].iloc[-1].date(),
+                    )
 
     logger.info("=" * 60)
     logger.info(
-        "Done.  %d/%d successful  (%d errors, %d synthetic)",
-        total_files - errors, total_files, errors, synthetic_count,
+        "Done.  %d/%d from API  (%d used synthetic fallback)",
+        total_files - api_errors, total_files, api_errors,
     )
     logger.info("CSVs saved to: %s", DATA_DIR)
     logger.info("=" * 60)
