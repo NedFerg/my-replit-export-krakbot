@@ -40,7 +40,9 @@ Usage (called from broker.run_etf_overlay())
     # orders is a list of dicts with keys: asset, side, units, order_type, price
 """
 
+import enum
 import os
+from typing import NamedTuple
 
 from utils.market_hours import MarketHours, MarketSession
 
@@ -49,6 +51,43 @@ from utils.market_hours import MarketHours, MarketSession
 # ---------------------------------------------------------------------------
 
 ETF_ASSETS = ("ETHD", "SETH")
+
+# Alias used by broker.py for ETF position initialisation.
+ALL_ETFS = ETF_ASSETS
+
+# Default Kraken trading pairs for each ETF ticker.
+ETF_KRAKEN_PAIRS: dict = {
+    "ETHD": "ETHDEUR",
+    "SETH": "SETHEUR",
+}
+
+
+class ETFMode(str, enum.Enum):
+    """Operating mode for the ETF hedging layer."""
+    DISABLED = "disabled"
+    HEDGE    = "hedge"
+    AMPLIFY  = "amplify"
+
+
+class ETFOrder(NamedTuple):
+    """
+    Typed container for a single ETF order produced by ETFHedger.
+
+    Fields
+    ------
+    asset      : ticker symbol, e.g. "ETHD" or "SETH"
+    side       : "buy" or "sell"
+    units      : unsigned coin quantity to trade
+    order_type : "market" or "limit"
+    price      : limit price in the quote currency; 0.0 for market orders
+    notional   : estimated order value in the quote currency (|units × price|)
+    """
+    asset:      str
+    side:       str
+    units:      float
+    order_type: str
+    price:      float
+    notional:   float
 
 # Default allocation cap — overridden by MAX_ETF_ALLOCATION env var or the
 # max_etf_allocation constructor parameter.
@@ -272,3 +311,10 @@ class ETFHedger:
     ) -> bool:
         """Return True if the current ETF allocation exceeds the 30 % cap."""
         return self.etf_portfolio_fraction(equity, etf_positions, etf_prices) > self.max_etf_allocation
+
+
+# ---------------------------------------------------------------------------
+# Alias — broker.py imports ETFHedgingLayer; ETFHedger is the implementation.
+# ---------------------------------------------------------------------------
+
+ETFHedgingLayer = ETFHedger

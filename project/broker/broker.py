@@ -11,7 +11,7 @@ from exchange.exchange import Exchange
 from utils.market_hours import MarketHours, MarketSession
 from broker.etf_hedging import ETFHedger, ETF_ASSETS
 
-from utils.market_hours import (
+from utils.constants import (
     is_etf_tradeable,
     get_etf_order_type,
     MarketPeriod,
