@@ -286,6 +286,33 @@ class ReinforcementLearningTrader(TraderAgent):
         }
 
         # ---------------------------------------------------------------
+        # Per-ETF exposure caps — ETF positions are managed by the broker's
+        # ETFHedgingLayer, not by the RL actor directly.  These caps are
+        # referenced by run_etf_overlay() for budget allocation and are
+        # defined here so the agent remains the single source of risk limits.
+        #
+        # Short ETFs (SETH, ETHD): bearish hedge — max 15 % of equity each.
+        # Long ETFs (XXRP, SLON, ETHU): bullish amplifier — max 10 % each.
+        # All ETFs combined: never exceed 30 % of portfolio (ETF_TOTAL_CAP).
+        # ---------------------------------------------------------------
+        self.etf_max_long = {
+            "SETH": 0.15,   # held long on Kraken; tracks 3× short ETH
+            "ETHD": 0.15,   # held long on Kraken; tracks 3× short ETH
+            "XXRP": 0.10,   # 3× long XRP
+            "SLON": 0.10,   # 3× long SOL
+            "ETHU": 0.10,   # 3× long ETH
+        }
+        self.etf_max_short = {
+            # Short ETFs are purchased (not shorted) so max_short is 0 —
+            # downside exposure is already embedded in the 3× short factor.
+            "SETH": 0.0,
+            "ETHD": 0.0,
+            "XXRP": 0.0,
+            "SLON": 0.0,
+            "ETHU": 0.0,
+        }
+
+        # ---------------------------------------------------------------
         # C51 distributional RL hyper-parameters
         # ---------------------------------------------------------------
         self.num_atoms = 51
@@ -674,6 +701,71 @@ class ReinforcementLearningTrader(TraderAgent):
 
         return features
 
+    def _build_etf_regime(self, live_prices: dict) -> dict:
+        """
+        Derive ETF regime signals from the current price history and RL state.
+
+        Returns a dict consumed by ETFHedgingLayer.determine_mode():
+
+        bullish_confidence  float [0, 1]  — mean |positive| target exposure across assets.
+        panic_risk          int   {0,1,2} — 0 = calm, 1 = elevated, 2 = panic.
+        bearish_drift       bool          — True when ETH 20-bar momentum is negative.
+        macro_regime        float {-1,0,+1} — +1 bull, 0 neutral, -1 bear.
+
+        The ETF layer uses these to decide:
+            bullish_confidence > 0.6 OR macro_regime >= 0.5  → AMPLIFY  (long ETFs)
+            panic_risk >= 1 OR bearish_drift OR macro_regime <= -0.5 → HEDGE  (short ETFs)
+            otherwise → FLAT
+        """
+        # --- Bullish confidence: mean positive exposure across crypto assets ---
+        positive_exposures = [
+            max(0.0, self.target_exposures.get(a, 0.0))
+            for a in self.assets
+        ]
+        bullish_confidence = sum(positive_exposures) / max(len(self.assets), 1)
+
+        # --- ETH and BTC momentum as macro indicators ---
+        eth_mom_20 = self._momentum("ETH", 20)
+        btc_mom_20 = self._momentum("BTC", 20)
+        macro_mom  = (eth_mom_20 + btc_mom_20) / 2.0
+
+        # macro_regime: +1 = strong bull (mom > 3%), -1 = strong bear (mom < -3%)
+        if macro_mom > 0.03:
+            macro_regime = 1.0
+        elif macro_mom < -0.03:
+            macro_regime = -1.0
+        else:
+            macro_regime = 0.0
+
+        # --- Bearish drift: ETH 20-bar momentum negative ---
+        bearish_drift = eth_mom_20 < -0.01
+
+        # --- Panic risk: multi-bar sell-off across anchors ---
+        eth_mom_5 = self._momentum("ETH", 5)
+        btc_mom_5 = self._momentum("BTC", 5)
+        panic_mom = min(eth_mom_5, btc_mom_5)
+
+        if panic_mom < -0.08:
+            panic_risk = 2   # severe sell-off
+        elif panic_mom < -0.03:
+            panic_risk = 1   # moderate decline
+        else:
+            panic_risk = 0
+
+        regime = {
+            "bullish_confidence": round(bullish_confidence, 4),
+            "panic_risk":         panic_risk,
+            "bearish_drift":      bearish_drift,
+            "macro_regime":       macro_regime,
+        }
+        print(
+            f"  [ETF REGIME] conf={bullish_confidence:.3f}  "
+            f"panic={panic_risk}  bearish_drift={bearish_drift}  "
+            f"macro={macro_regime:+.1f}  "
+            f"(eth_mom20={eth_mom_20:+.4f}  btc_mom20={btc_mom_20:+.4f})"
+        )
+        return regime
+
     def step(self):
         """
         Live-trading entry point called by run_live_trading_loop().
@@ -1017,6 +1109,13 @@ class ReinforcementLearningTrader(TraderAgent):
         # ----------------------------------------------------------------
         if hasattr(self.broker, "run_futures_overlay"):
             self.broker.run_futures_overlay(self, live_prices)
+
+        # ----------------------------------------------------------------
+        # ETF overlay — regime-aware hedging/amplification layer
+        # ----------------------------------------------------------------
+        if hasattr(self.broker, "run_etf_overlay"):
+            regime = self._build_etf_regime(live_prices)
+            self.broker.run_etf_overlay(regime=regime)
 
     # ------------------------------------------------------------------
     # Order entry
