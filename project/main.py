@@ -1,4 +1,6 @@
 import os
+import sys
+import time
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for file output
 import matplotlib.pyplot as plt
@@ -14,6 +16,7 @@ from exchange.exchange import Exchange
 from risk.risk_manager import RiskManager
 from config.config import INITIAL_BALANCE, MARKET_START_PRICE
 from archive.trade_archive import TradeArchive
+from strategies.bull_bear_trader import BullBearRotationalTrader
 
 # ---------------------------------------------------------------------------
 # Mode switch — "sim" runs the local simulation; "live" starts the Kraken
@@ -173,10 +176,26 @@ def run_live():
     │  USE_PAPER_BROKER=false + KRAKEN_SANDBOX=false                   │
     │  → LiveBroker full live: real orders, real fills                 │
     └──────────────────────────────────────────────────────────────────┘
+
+    Strategy selection (set in Replit Secrets):
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  USE_BULL_BEAR_TRADER=true                                       │
+    │  → BullBearRotationalTrader: phase-driven bull/bear cycle bot   │
+    │                                                                  │
+    │  USE_BULL_BEAR_TRADER=false (default)                            │
+    │  → ReinforcementLearningTrader / MA crossover (original)         │
+    └──────────────────────────────────────────────────────────────────┘
     """
     import os as _os
+    import datetime as _datetime
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _ET = _ZoneInfo("America/New_York")
+
     use_paper = _os.environ.get("USE_PAPER_BROKER", "true").strip().lower() \
                 not in ("false", "0", "no")
+
+    use_bull_bear = _os.environ.get("USE_BULL_BEAR_TRADER", "false").strip().lower() \
+                    in ("true", "1", "yes")
 
     print("[MAIN] Starting live trading loop...")
 
@@ -184,6 +203,7 @@ def run_live():
         archive = TradeArchive()
         broker = PaperBroker(initial_cash=INITIAL_BALANCE, trade_archive=archive)
     else:
+        archive = TradeArchive()   # persist phase/rotation events even in live mode
         broker = LiveBroker(dry_run=False)
 
     print(f"[MAIN] Broker mode: {_broker_mode_label(broker)}")
@@ -195,6 +215,175 @@ def run_live():
         print("[MAIN] Futures overlay: LIVE mode — fetching real collateral from futures.kraken.com.")
     broker.fetch_futures_wallet()
 
+    # ---------------------------------------------------------------
+    # Strategy selection
+    # ---------------------------------------------------------------
+    if use_bull_bear:
+        print("[MAIN] Strategy: BullBearRotationalTrader (phase-driven bull/bear cycle)")
+        bull_bear_trader = BullBearRotationalTrader(
+            broker=broker,
+            archive=archive,
+            initial_phase="accumulation",
+        )
+
+        # Tag paper fills with the strategy name so the archive and CSV log
+        # attribute trades to "BullBearTrader" instead of an empty string.
+        if isinstance(broker, PaperBroker):
+            broker.set_strategy_name("BullBearTrader")
+
+        # Sync fee tier if using live broker
+        if isinstance(broker, LiveBroker) and not isinstance(broker, PaperBroker):
+            broker.sync_fee_tier_from_kraken()
+
+        # Initial account sync
+        state = broker.sync_live_account_state()
+        if state is None:
+            print("[MAIN] Failed initial account sync — aborting")
+            if isinstance(broker, PaperBroker):
+                broker.close()
+            return
+
+        balances, positions = state
+        print(f"[MAIN] Initial balances: {balances}")
+        print(
+            "[MAIN] Commands: 'S' + Enter = paper summary  |  'P' = phase status  |  Ctrl-C = stop"
+        )
+
+        SUMMARY_INTERVAL_SEC = 900   # 15 minutes
+        _last_summary_ts     = time.time()
+        _tick                = 0
+
+        import queue, threading
+
+        _cmd_queue: queue.Queue = queue.Queue()
+
+        def _stdin_reader():
+            try:
+                for raw_line in iter(sys.stdin.readline, ""):
+                    cmd = raw_line.strip().upper()
+                    if cmd:
+                        _cmd_queue.put(cmd)
+            except Exception:
+                pass
+
+        _stdin_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
+        _stdin_thread.start()
+
+        try:
+            while True:
+                if broker.kill_switch:
+                    print("[MAIN] Kill switch active — exiting loop")
+                    break
+
+                # Optional auto-shutdown at 4:30 PM ET.
+                # Disabled by default so the bot runs 24/7 (crypto never closes).
+                # Enable with: AUTO_SHUTDOWN_ET=true ./run_sandbox.sh
+                _auto_shutdown = _os.environ.get(
+                    "AUTO_SHUTDOWN_ET", "false").strip().lower() in ("true", "1", "yes")
+                if _auto_shutdown:
+                    _now_et = _datetime.datetime.now(_ET)
+                    if (_now_et.weekday() < 5 and
+                            _now_et >= _now_et.replace(
+                                hour=16, minute=30, second=0, microsecond=0)):
+                        print(
+                            "[MAIN] 16:30 ET reached — end-of-day auto-shutdown.\n"
+                            "[MAIN] All trades recorded. EOD report will be saved now."
+                        )
+                        break
+
+                # Keyboard commands
+                try:
+                    cmd = _cmd_queue.get_nowait()
+                    if cmd == "S":
+                        if isinstance(broker, PaperBroker):
+                            broker.print_summary()
+                        else:
+                            print("[MAIN] Summary only available in PAPER mode.")
+                    elif cmd == "P":
+                        bull_bear_trader.print_status()
+                    else:
+                        print(f"[MAIN] Unknown command: {cmd!r}  (known: S, P)")
+                except queue.Empty:
+                    pass
+
+                # Auto summary every 15 minutes
+                _now = time.time()
+                if _now - _last_summary_ts >= SUMMARY_INTERVAL_SEC:
+                    print("[MAIN] 15-minute auto-summary:")
+                    if isinstance(broker, PaperBroker):
+                        broker.print_summary()
+                    bull_bear_trader.print_status()
+                    _last_summary_ts = _now
+
+                # Fetch live prices from Kraken public API
+                broker.fetch_live_prices()
+                prices = dict(broker.live_prices)
+
+                if prices:
+                    bull_bear_trader.step(prices)
+
+                    # ---- Live performance display --------------------------------
+                    status = bull_bear_trader.status_summary()
+                    _tick += 1
+
+                    # Build equity/P&L string for paper mode
+                    if isinstance(broker, PaperBroker):
+                        equity  = broker.compute_total_equity()
+                        rpnl    = broker.paper_realized_pnl
+                        upnl    = broker.get_unrealized_pnl()
+                        n_fills = len(broker.paper_trade_history)
+                        pnl_str = (
+                            f"  equity=${equity:.2f}"
+                            f"  rpnl=${rpnl:+.2f}"
+                            f"  upnl=${upnl:+.2f}"
+                            f"  fills={n_fills}"
+                        )
+                    else:
+                        pnl_str = ""
+
+                    btc_price = prices.get("BTC", 0.0)
+                    print(
+                        f"[MAIN #{_tick:04d}] "
+                        f"BTC=${btc_price:,.0f}  "
+                        f"phase={status['phase']}  "
+                        f"conf={status['btc_confidence']:.2f}  "
+                        f"top={status['market_topping']}  "
+                        f"rec={status['recovering']}"
+                        f"{pnl_str}"
+                    )
+
+                    # Show open positions (condensed, only when non-empty)
+                    if status["positions"]:
+                        pos_str = "  ".join(
+                            f"{a}={v*100:.1f}%"
+                            for a, v in status["positions"].items()
+                        )
+                        print(f"         positions: {pos_str}")
+
+                broker.heartbeat()
+                broker.record_health_metrics()
+                broker.daily_rollover()
+                broker.alerting_loop()
+
+                time.sleep(1.0)
+
+        except KeyboardInterrupt:
+            print("[MAIN] KeyboardInterrupt — shutting down cleanly")
+            if isinstance(broker, PaperBroker):
+                broker.print_summary()
+            bull_bear_trader.print_status()
+        except Exception as e:
+            print(f"[MAIN] Unhandled exception: {e}")
+            broker.trigger_kill_switch(f"Main loop exception: {e}")
+        finally:
+            if isinstance(broker, PaperBroker):
+                broker.close()
+
+        return  # end of bull_bear path
+
+    # ---------------------------------------------------------------
+    # Original RL / MA strategy path
+    # ---------------------------------------------------------------
     agent = ReinforcementLearningTrader(
         "RLTrader", INITIAL_BALANCE, broker=broker, dry_run=False
     )
