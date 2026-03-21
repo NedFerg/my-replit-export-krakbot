@@ -1,0 +1,49 @@
+name: Backtest Bot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install ccxt pandas numpy matplotlib
+      
+      - name: Debug - List files
+        run: ls -la && pwd
+      
+      - name: Debug - Check scripts exist
+        run: ls -la project_scripts/
+      
+      - name: Fetch historical data
+        run: python project_scripts/fetch_historical_data.py || echo "Script failed"
+      
+      - name: Extract test windows
+        run: python project_scripts/extract_test_windows.py || echo "Script failed"
+      
+      - name: Run window tests
+        run: python project_scripts/run_window_tests.py || echo "Script failed"
+      
+      - name: Debug - Check for results
+        run: find . -name "*.csv" -o -name "*.txt" || echo "No results found"
+      
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: |
+            results/
+            *.csv
+            *.txt
+          if-no-files-found: warn

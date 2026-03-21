@@ -9,6 +9,21 @@ import requests
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 
+from utils.market_hours import (
+    is_etf_tradeable,
+    get_etf_order_type,
+    MarketPeriod,
+    ORDER_TYPE_MARKET,
+    ORDER_TYPE_LIMIT,
+)
+from broker.etf_hedging import (
+    ETFHedgingLayer,
+    ETFOrder,
+    ALL_ETFS,
+    ETF_KRAKEN_PAIRS,
+    ETFMode,
+)
+
 
 # ===========================================================================
 # ASSET ALLOWLIST — only these tickers may ever be traded by this bot.
@@ -676,6 +691,16 @@ class LiveBroker(SimulatedBroker):
         # Live account state (read-only in dry-run)
         self.live_balances  = {}   # raw Kraken balance dict
         self.live_positions = {}   # raw Kraken open-positions dict
+
+        # --- ETF position tracking (separate from crypto spot positions) -----
+        # etf_positions stores coin quantities for leveraged ETF holdings.
+        # These are spot orders on Kraken but managed separately so the 30%
+        # cap can be enforced independently of crypto spot positions.
+        self.etf_positions: dict = {etf: 0.0 for etf in ALL_ETFS}
+
+        # ETF hedging/amplification layer — handles regime logic, order
+        # sizing, market-hours awareness, and the 30% portfolio cap.
+        self.etf_layer = ETFHedgingLayer()
 
         # --- Automatic safety limits (first-night harness) ---------------
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
@@ -1546,11 +1571,17 @@ class LiveBroker(SimulatedBroker):
     def _build_spot_order(self, asset: str, price: float,
                           coin_units: float, side: str) -> dict | None:
         """
-        Format a Kraken spot LIMIT-order payload.
+        Format a Kraken spot order payload.
+
+        For crypto spot assets (24/7) this always uses a LIMIT order.
+        For ETF assets the order type is determined by market hours:
+            Regular hours (9:30–16:00 ET) → market order
+            Premarket / after-hours       → limit order
+            Closed                        → returns None (no order)
 
         Parameters
         ----------
-        asset      : internal asset name (e.g. "SOL")
+        asset      : internal asset name (e.g. "SOL", "SETH")
         price      : current mid-price in USD
         coin_units : unsigned quantity in BASE-ASSET UNITS (e.g. 0.5 SOL).
                      Must already be converted from fractional exposure via
@@ -1589,19 +1620,33 @@ class LiveBroker(SimulatedBroker):
             self.trigger_kill_switch(f"Invalid side for spot order: {side!r}")
             return None
 
+        # --- Market hours gate for ETF assets --------------------------------
+        # ETF assets only trade during US market hours.  Crypto spot assets
+        # (BTC, ETH, SOL, …) trade 24/7 and bypass this check.
+        is_etf = asset in ALL_ETFS
+        if is_etf:
+            if not is_etf_tradeable():
+                print(f"[MARKET HOURS] ETF market closed — skipping {side} {asset}")
+                return None
+            kraken_order_type = get_etf_order_type()
+        else:
+            kraken_order_type = ORDER_TYPE_LIMIT   # crypto spot always uses limit
+
         tol = self.limit_order_tolerance
         if side == "buy":
             limit_price = round(price * (1.0 + tol), 8)
         else:
             limit_price = round(price * (1.0 - tol), 8)
 
-        return {
+        order = {
             "pair":      self.kraken_pairs[asset],
             "type":      side,
-            "ordertype": "limit",
-            "price":     f"{limit_price:.8f}",
+            "ordertype": kraken_order_type,
             "volume":    f"{coin_units:.8f}",
         }
+        if kraken_order_type == ORDER_TYPE_LIMIT:
+            order["price"] = f"{limit_price:.8f}"
+        return order
 
     def _build_futures_order(self, asset, price, delta_exposure):
         """
@@ -1686,8 +1731,10 @@ class LiveBroker(SimulatedBroker):
 
     def compute_total_equity(self) -> float:
         """
-        True portfolio value = ZUSD cash + all crypto holdings at live prices.
-        Avoids treating buy orders as losses in the daily-loss check.
+        True portfolio value = ZUSD cash + all crypto holdings + ETF holdings
+        at live prices.  Avoids treating buy orders as losses in the daily-loss
+        check.  ETF positions are tracked in ``self.etf_positions`` (coin units)
+        and included here so daily loss caps scale correctly.
         """
         balances = self.live_balances or {}
         equity   = float(balances.get("ZUSD", 0.0))
@@ -1695,6 +1742,10 @@ class LiveBroker(SimulatedBroker):
             qty   = float(balances.get(bal_key, 0.0))
             price = self.live_prices.get(asset, 0.0)
             equity += qty * price
+        # Add ETF notional (separate dict, not in kraken_balance_keys)
+        for etf, qty in self.etf_positions.items():
+            price = self.live_prices.get(etf, 0.0)
+            equity += abs(qty) * price   # abs: short-ETFs are held long on Kraken
         return equity
 
     def _check_daily_loss(self) -> bool:
@@ -2389,10 +2440,154 @@ class LiveBroker(SimulatedBroker):
             else:
                 print(f"  [{asset_tag}] {a}: delta={delta_fut:+.5f}  (below 1% — skip)")
 
+    # ------------------------------------------------------------------
+    # ETF overlay — spot-traded leveraged ETFs with market hours awareness
+    # ------------------------------------------------------------------
 
-# ======================================================================
-# Module-level helper — outside LiveBroker class
-# ======================================================================
+    def run_etf_overlay(self, regime: dict | None = None) -> None:
+        """
+        Execute the ETF hedging / amplification overlay for one trading cycle.
+
+        This method is the bridge between the ETFHedgingLayer strategy object
+        and the live Kraken execution path.  It:
+
+        1. Determines the current ETF mode (hedge/amplify/flat) from *regime*.
+        2. Builds ETF orders via ``self.etf_layer.build_orders()``, which
+           already enforces market hours and the 30 % portfolio cap.
+        3. Submits each order through the existing ``_submit_spot_order`` path,
+           which handles sandbox/live toggling, dry-run, and kill-switch checks.
+        4. Records fills in ``self.etf_positions`` (separate from crypto spot).
+
+        Parameters
+        ----------
+        regime : dict with regime signals — forwarded to ETFHedgingLayer.
+                 Keys used: bullish_confidence, panic_risk, bearish_drift,
+                            macro_regime.
+                 Defaults to neutral (flat ETF layer) when None or empty.
+
+        Notes
+        -----
+        - Crypto spot positions in ``self.spot_positions`` are never modified.
+        - ETF notional is included in daily loss caps via ``compute_total_equity``.
+        - The 30 % total cap is enforced by ``etf_layer.build_orders``; an
+          additional ``check_etf_cap`` gate runs before order submission.
+        """
+        if not self.check_health():
+            return
+
+        if not self.etf_layer.enabled:
+            return
+
+        regime = regime or {}
+
+        # 1. Determine mode
+        mode = self.etf_layer.determine_mode(regime)
+
+        # 2. Get current equity and ETF prices
+        equity = self.compute_total_equity()
+        if equity <= 0:
+            print("[ETF OVERLAY] No equity available — skipping")
+            return
+
+        # Prices for ETF assets are fetched as part of the main price batch
+        # only if Kraken lists them in the ticker endpoint.  Missing prices
+        # cause the ETF layer to skip those assets gracefully.
+        etf_prices = {
+            etf: self.live_prices.get(etf, 0.0)
+            for etf in ALL_ETFS
+        }
+
+        # 3. Pre-execution cap check (independent safety gate)
+        if not self.etf_layer.check_etf_cap(etf_prices, equity):
+            print("[ETF OVERLAY] Portfolio cap already breached — no new orders")
+            return
+
+        # 4. Build orders (market hours, sizing, and cap handled inside)
+        orders = self.etf_layer.build_orders(mode, equity, etf_prices)
+
+        if not orders:
+            print(f"[ETF OVERLAY] No orders to submit (mode={mode})")
+            return
+
+        label = "PAPER ETF" if self.dry_run else "LIVE ETF"
+        summary = self.etf_layer.summary(etf_prices, equity)
+        print(
+            f"[ETF OVERLAY] mode={mode}  equity=${equity:.2f}  "
+            f"current_notional={summary['current_notional']:.2%}  "
+            f"orders={len(orders)}"
+        )
+
+        # 5. Submit each order
+        for etf_order in orders:
+            price = etf_prices.get(etf_order.asset, 0.0)
+            if price <= 0:
+                print(f"[ETF OVERLAY] No price for {etf_order.asset} — skipping")
+                continue
+
+            notional_usd = etf_order.coin_units * price
+
+            # Pre-trade safety harness (rate limit, daily loss, notional cap)
+            if not self._pre_trade_safety(etf_order.asset, price, notional_usd):
+                print(f"[ETF OVERLAY BLOCKED] {etf_order.asset}  "
+                      f"{etf_order.reason}")
+                continue
+
+            # Build Kraken payload using _build_spot_order so sandbox/validate
+            # mode is respected automatically.  ETF assets are already in
+            # kraken_pairs so the market-hours gate inside _build_spot_order
+            # also applies here as a double-check.
+            kraken_order = self._build_spot_order(
+                etf_order.asset,
+                price,
+                etf_order.coin_units,
+                etf_order.side,
+            )
+            if kraken_order is None:
+                print(f"[ETF OVERLAY] Order builder returned None for "
+                      f"{etf_order.asset} — skipping")
+                continue
+
+            if self.dry_run:
+                print(f"[{label} DRY-RUN] {etf_order.side.upper()} "
+                      f"{etf_order.coin_units:.6f} {etf_order.asset}"
+                      f"  notional=${notional_usd:.2f}  reason={etf_order.reason}"
+                      f"  order={kraken_order}")
+                # Update internal ETF positions even in dry-run for realistic
+                # state tracking across cycles.
+                self.etf_positions[etf_order.asset] = (
+                    self.etf_positions.get(etf_order.asset, 0.0)
+                    + (etf_order.coin_units if etf_order.side == "buy"
+                       else -etf_order.coin_units)
+                )
+                self.etf_layer.record_fill(
+                    etf_order.asset, etf_order.side, etf_order.coin_units
+                )
+                continue
+
+            result = self._submit_spot_order(kraken_order)
+            if result is not None:
+                signed_units = (etf_order.coin_units
+                                if etf_order.side == "buy"
+                                else -etf_order.coin_units)
+                self.etf_positions[etf_order.asset] = (
+                    self.etf_positions.get(etf_order.asset, 0.0) + signed_units
+                )
+                self.etf_layer.record_fill(
+                    etf_order.asset, etf_order.side, etf_order.coin_units
+                )
+                fee_usd = notional_usd * self.taker_fee
+                self.cumulative_fees_usd += fee_usd
+                print(
+                    f"[{label} FILLED] {etf_order.side.upper()} "
+                    f"{etf_order.coin_units:.6f} {etf_order.asset}"
+                    f"  @ ${price:.4f}  notional=${notional_usd:.2f}"
+                    f"  fee≈${fee_usd:.4f}"
+                )
+            else:
+                print(f"[ETF OVERLAY FAILED] {etf_order.asset}  "
+                      f"order={kraken_order}")
+
+
 
 # ---------------------------------------------------------------------------
 # PaperBroker — full synthetic execution layer for Krakbot sandbox mode
