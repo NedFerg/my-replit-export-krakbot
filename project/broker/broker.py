@@ -11,6 +11,55 @@ from exchange.exchange import Exchange
 from utils.market_hours import MarketHours, MarketSession
 from broker.etf_hedging import ETFHedger, ETF_ASSETS
 
+from utils.market_hours import (
+    is_etf_tradeable,
+    get_etf_order_type,
+    MarketPeriod,
+    ORDER_TYPE_MARKET,
+    ORDER_TYPE_LIMIT,
+)
+from broker.etf_hedging import (
+    ETFHedgingLayer,
+    ETFOrder,
+    ALL_ETFS,
+    ETF_KRAKEN_PAIRS,
+    ETFMode,
+)
+
+
+# ===========================================================================
+# ASSET ALLOWLIST — only these tickers may ever be traded by this bot.
+#
+# Even if the Kraken API key has "Allow trading of stocks and ETFs" enabled
+# in the account security settings, the bot will NEVER submit an order for
+# a stock or non-crypto instrument.  Any asset name not in this set is
+# rejected before reaching the order-builder or Kraken API, with a clear
+# log message explaining the rejection.
+#
+# To add a new asset: extend this set AND add it to self.kraken_pairs in
+# LiveBroker.__init__ so price feeds and order routing also know about it.
+# DO NOT add stock tickers here — this bot is crypto-only.
+# ===========================================================================
+APPROVED_ASSETS: frozenset[str] = frozenset({
+    # --- Spot crypto (the universe the bot watches and trades) -----------
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP",
+    "LINK",
+    "HBAR",
+    "XLM",
+    "AVAX",
+    # --- Kraken crypto ETP / leveraged tokens ----------------------------
+    # These are crypto-underlying products listed on Kraken's ETP platform.
+    # They are NOT stocks — they are crypto-collateralised structured tokens.
+    "ETHU",   # ETH 2× Long ETP
+    "ETHD",   # ETH 2× Short ETP
+    "SLON",   # SOL 2× Long ETP
+    "XXRP",   # XRP 2× Long ETP
+    "SETH",   # ETH 1× Short ETP
+})
+
 
 # --- Per-asset beta categories ----------------------------------------
 # High-beta alts get more futures overlay (tactical/reactive).
@@ -584,7 +633,11 @@ class LiveBroker(SimulatedBroker):
             print("[FUTURES] DISABLED — ENABLE_FUTURES=False. "
                   "All futures code paths are fully suppressed.")
 
-        # Map internal asset names → Kraken ticker symbols
+        # Map internal asset names → Kraken ticker symbols used for the
+        # public /0/public/Ticker price-feed batch request.
+        # Crypto spot pairs use Kraken's X-prefixed legacy names.
+        # ETHD (2× Short ETH ETP) and SETH (1× Short ETH ETP) are available
+        # on Kraken's ETP/stock trading platform and use plain USD pairs.
         self.kraken_pairs = {
             "BTC":  "XBTUSD",
             "ETH":  "ETHUSD",
@@ -613,7 +666,8 @@ class LiveBroker(SimulatedBroker):
         }
 
         # Kraken balance-dict keys for each tracked asset
-        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names)
+        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names;
+        # ETP tickers ETHD/SETH use their plain ticker as the balance key)
         self.kraken_balance_keys = {
             "BTC":  "XXBT",
             "ETH":  "XETH",
@@ -623,6 +677,8 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBAR",
             "XRP":  "XXRP",
             "XLM":  "XXLM",
+            "ETHD": "ETHD",
+            "SETH": "SETH",
         }
 
         # --- ETF hedging layer -------------------------------------------
@@ -648,6 +704,16 @@ class LiveBroker(SimulatedBroker):
         # Live account state (read-only in dry-run)
         self.live_balances  = {}   # raw Kraken balance dict
         self.live_positions = {}   # raw Kraken open-positions dict
+
+        # --- ETF position tracking (separate from crypto spot positions) -----
+        # etf_positions stores coin quantities for leveraged ETF holdings.
+        # These are spot orders on Kraken but managed separately so the 30%
+        # cap can be enforced independently of crypto spot positions.
+        self.etf_positions: dict = {etf: 0.0 for etf in ALL_ETFS}
+
+        # ETF hedging/amplification layer — handles regime logic, order
+        # sizing, market-hours awareness, and the 30% portfolio cap.
+        self.etf_layer = ETFHedgingLayer()
 
         # --- Automatic safety limits (first-night harness) ---------------
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
@@ -720,6 +786,46 @@ class LiveBroker(SimulatedBroker):
         else:
             return 0.0012
 
+    def sync_fee_tier_from_kraken(self) -> float:
+        """
+        Fetch the user's current 30-day trading volume directly from Kraken and
+        update self.taker_fee / self.maker_fee to match the live tier.
+
+        Calls the private /0/private/TradeVolume endpoint, which returns the
+        authenticated user's 30-day USD volume.  Falls back to the current
+        self.taker_fee value on any error (credentials missing, network issue).
+
+        Returns
+        -------
+        float — the taker fee rate now in effect (e.g. 0.004 for 0.40 %).
+        """
+        result = self._kraken_private("/0/private/TradeVolume", {"fee-info": "true"})
+        if not result or "result" not in result:
+            print("[LiveBroker] sync_fee_tier_from_kraken: API call failed — keeping current tier")
+            return self.taker_fee
+
+        volume_usd = 0.0
+        try:
+            volume_usd = float(result["result"].get("volume", 0.0))
+        except (KeyError, ValueError, TypeError):
+            print("[LiveBroker] sync_fee_tier_from_kraken: unexpected response format")
+            return self.taker_fee
+
+        new_taker = self.get_kraken_taker_fee(volume_usd)
+        # Maker fee is typically 60 % of taker for Kraken spot (0.40 % → 0.16 %)
+        new_maker = round(new_taker * 0.40, 6)
+
+        if new_taker != self.taker_fee:
+            print(
+                f"[LiveBroker] Fee tier updated: "
+                f"taker {self.taker_fee*100:.3f}% → {new_taker*100:.3f}%  "
+                f"(30d volume: ${volume_usd:,.0f})"
+            )
+
+        self.taker_fee = new_taker
+        self.maker_fee = new_maker
+        return self.taker_fee
+
     # ------------------------------------------------------------------
     # Portfolio exposure — live override
     # ------------------------------------------------------------------
@@ -767,6 +873,42 @@ class LiveBroker(SimulatedBroker):
         self.kill_switch    = True
         self.last_api_error = reason
         print(f"[KILL SWITCH] Triggered: {reason}")
+
+    def validate_credentials(self) -> bool:
+        """
+        Confirm that KRAKEN_API_KEY and KRAKEN_API_SECRET are valid by calling
+        the authenticated ``/0/private/Balance`` endpoint.
+
+        Returns True on success (credentials accepted by Kraken) or False if
+        the credentials are missing, malformed, or rejected.  On failure the
+        kill switch is **not** triggered here — the caller decides whether to
+        abort or fall back to paper mode.
+
+        Intended to be called once at startup from ``go_live.sh`` / main.py
+        before enabling live order submission.
+        """
+        if not self.kraken_api_key or not self.kraken_api_secret:
+            print("[LiveBroker] validate_credentials: no API credentials configured.")
+            return False
+
+        print("[LiveBroker] Validating API credentials against Kraken…")
+        result = self._kraken_private("/0/private/Balance")
+        if result is None:
+            print("[LiveBroker] validate_credentials: request failed (network error).")
+            return False
+
+        errors = result.get("error", [])
+        if errors:
+            print(f"[LiveBroker] validate_credentials: Kraken rejected credentials — {errors}")
+            return False
+
+        # Success — log the USD balance so the operator can confirm the right account
+        usd_balance = float(result.get("result", {}).get("ZUSD", 0.0))
+        print(
+            f"[LiveBroker] ✅  Credentials valid — Kraken account balance: "
+            f"${usd_balance:,.2f} USD"
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Kraken REST client (scaffolding — not yet wired into the main loop)
@@ -846,13 +988,33 @@ class LiveBroker(SimulatedBroker):
         Fetch the latest last-trade price for all tracked assets via Kraken's
         public Ticker endpoint in a SINGLE batched HTTP request.
 
-        Previous implementation made 8 separate calls (one per asset).  Kraken
-        accepts a comma-separated pair list, returning all tickers in one
-        response — 8× fewer API calls, much lower rate-limit risk.
-
         'c' field = last trade closed: [price, lot_volume].
         Returns the result dict and updates self.live_prices on success.
+        Logs all fetched prices and warns loudly if any deviate from
+        PRICE_SANITY_RANGES (configurable, defaults to known good ranges).
         """
+        # Known-good reference ranges:  (min, max) USD per asset.
+        # Override any entry via env vars: e.g. BTC_PRICE_MIN=60000
+        # These are generous ±50 % bounds around typical market prices so the
+        # check flags impossible values (wrong pair, wrong currency, stale cache)
+        # without triggering on normal market moves.
+        PRICE_SANITY_RANGES: dict[str, tuple[float, float]] = {
+            "BTC":  (float(os.getenv("BTC_PRICE_MIN",  "30000")),
+                     float(os.getenv("BTC_PRICE_MAX",  "200000"))),
+            "ETH":  (float(os.getenv("ETH_PRICE_MIN",  "500")),
+                     float(os.getenv("ETH_PRICE_MAX",  "10000"))),
+            "SOL":  (float(os.getenv("SOL_PRICE_MIN",  "10")),
+                     float(os.getenv("SOL_PRICE_MAX",  "1000"))),
+            "XRP":  (float(os.getenv("XRP_PRICE_MIN",  "0.10")),
+                     float(os.getenv("XRP_PRICE_MAX",  "20"))),
+            "LINK": (float(os.getenv("LINK_PRICE_MIN", "1")),
+                     float(os.getenv("LINK_PRICE_MAX", "100"))),
+            "HBAR": (float(os.getenv("HBAR_PRICE_MIN", "0.01")),
+                     float(os.getenv("HBAR_PRICE_MAX", "1"))),
+            "XLM":  (float(os.getenv("XLM_PRICE_MIN",  "0.01")),
+                     float(os.getenv("XLM_PRICE_MAX",  "5"))),
+        }
+
         # Build comma-separated pair string once
         pairs_str = ",".join(self.kraken_pairs.values())
         data = self._kraken_public("/0/public/Ticker", {"pair": pairs_str})
@@ -867,9 +1029,6 @@ class LiveBroker(SimulatedBroker):
         # Build a reverse map: Kraken-normalised-pair → internal asset name.
         # Kraken normalises many pairs on the way out (e.g. XBTUSD → XXBTZUSD,
         # ETHUSD → XETHZUSD, XRPUSD → XXRPZUSD, XLMUSD → XXLMZUSD).
-        # We pre-populate the reverse map with both the "sent" form we requested
-        # AND the known Kraken-normalised form so both match without an HTTP
-        # round-trip to discover the canonical name.
         _KRAKEN_ALIASES: dict = {
             "XXBTZUSD": "BTC",   # Kraken normalises XBTUSD  → XXBTZUSD
             "XETHZUSD": "ETH",   # Kraken normalises ETHUSD  → XETHZUSD
@@ -893,6 +1052,29 @@ class LiveBroker(SimulatedBroker):
         if result:
             self.live_prices          = result
             self.last_price_timestamp = time.time()
+
+            # ---- Log every fetched price so the feed is fully auditable ----
+            price_line = "  ".join(
+                f"{a}=${result[a]:,.2f}"
+                for a in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM",
+                           "ETHD", "SETH"]
+                if a in result
+            )
+            print(f"[PRICE FEED] {price_line}")
+
+            # ---- Sanity check — flag prices outside known-good ranges ------
+            bad = []
+            for asset, (lo, hi) in PRICE_SANITY_RANGES.items():
+                price = result.get(asset)
+                if price is not None and not (lo <= price <= hi):
+                    bad.append(f"{asset}=${price:,.2f} (expected ${lo:,.0f}–${hi:,.0f})")
+            if bad:
+                print(
+                    f"[PRICE FEED ⚠️  SANITY FAIL] The following prices are outside "
+                    f"expected ranges — verify your Kraken connection is returning "
+                    f"real spot USD prices:\n  " + "\n  ".join(bad)
+                )
+
             missing = [a for a in self.kraken_pairs if a not in result]
             if missing:
                 print(f"[PRICE FEED] Missing prices for: {missing}")
@@ -1165,7 +1347,7 @@ class LiveBroker(SimulatedBroker):
             if self.kill_switch:
                 print("[HEARTBEAT] Kill switch active — heartbeat suppressed")
             else:
-                print(f"[HEARTBEAT] alive at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"[HEARTBEAT] alive at {time.strftime('%Y-%m-%d %H:%M:%S')} local  |  {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC")
                 self.emit_health_check()
             self._last_heartbeat = now
 
@@ -1510,8 +1692,10 @@ class LiveBroker(SimulatedBroker):
 
     def compute_total_equity(self) -> float:
         """
-        True portfolio value = ZUSD cash + all crypto holdings at live prices.
-        Avoids treating buy orders as losses in the daily-loss check.
+        True portfolio value = ZUSD cash + all crypto holdings + ETF holdings
+        at live prices.  Avoids treating buy orders as losses in the daily-loss
+        check.  ETF positions are tracked in ``self.etf_positions`` (coin units)
+        and included here so daily loss caps scale correctly.
         """
         balances = self.live_balances or {}
         equity   = float(balances.get("ZUSD", 0.0))
@@ -1519,6 +1703,10 @@ class LiveBroker(SimulatedBroker):
             qty   = float(balances.get(bal_key, 0.0))
             price = self.live_prices.get(asset, 0.0)
             equity += qty * price
+        # Add ETF notional (separate dict, not in kraken_balance_keys)
+        for etf, qty in self.etf_positions.items():
+            price = self.live_prices.get(etf, 0.0)
+            equity += abs(qty) * price   # abs: short-ETFs are held long on Kraken
         return equity
 
     def _check_daily_loss(self) -> bool:
@@ -1564,6 +1752,15 @@ class LiveBroker(SimulatedBroker):
         Returns False (and triggers the kill switch where appropriate) if any
         check fails.  Called at the top of every live execution path.
 
+        Checks (in order)
+        -----------------
+        1. Kill-switch / health               — halt if system is unhealthy
+        2. Asset allowlist (APPROVED_ASSETS)  — reject non-crypto immediately
+        3. Trade rate limiter                 — enforce order-per-hour cap
+        4. Per-asset notional cap             — skip oversized single orders
+        5. Total portfolio notional cap       — skip when book is full
+        6. Daily loss cap                     — halt if drawdown limit hit
+
         Parameters
         ----------
         asset        : internal asset name ("SOL", "BTC", …)
@@ -1574,6 +1771,22 @@ class LiveBroker(SimulatedBroker):
                          _execute_spot_trade → abs(delta_frac) × equity
         """
         if not self.check_health():
+            return False
+
+        # ----------------------------------------------------------------
+        # ASSET ALLOWLIST — block anything not in the approved crypto set.
+        # This fires before every other check so a rejected asset never
+        # reaches the order-builder or Kraken API, regardless of what
+        # permissions are enabled on the API key (including stock trading).
+        # ----------------------------------------------------------------
+        if asset not in APPROVED_ASSETS:
+            print(
+                f"[SAFETY] Order BLOCKED — '{asset}' is not in the approved "
+                f"crypto asset list.  This bot trades only: "
+                f"{sorted(APPROVED_ASSETS)}.  "
+                f"No stock or non-crypto instrument will ever be submitted, "
+                f"even if the API key has stock-trading permission enabled."
+            )
             return False
 
         if not self._check_trade_rate():
@@ -2307,9 +2520,6 @@ class LiveBroker(SimulatedBroker):
             )
 
 
-# ======================================================================
-# Module-level helper — outside LiveBroker class
-# ======================================================================
 
 # ---------------------------------------------------------------------------
 # PaperBroker — full synthetic execution layer for Krakbot sandbox mode
@@ -2376,6 +2586,7 @@ class PaperBroker(LiveBroker):
         self.paper_slippage = slippage
 
         # --- Paper account state ------------------------------------------
+        self._initial_cash         = float(initial_cash)  # preserved for EOD report
         self.paper_cash            = float(initial_cash)
         self.paper_positions: dict = {}    # asset → coin quantity (float)
         self.paper_cost_basis: dict = {}   # asset → weighted avg cost (USD/coin)
@@ -2401,12 +2612,23 @@ class PaperBroker(LiveBroker):
         ])
         self._csv_file.flush()
 
+        # --- Scale safety caps to paper account size ----------------------
+        # LiveBroker's first-night harness defaults ($50/trade, $200 total)
+        # are sized for small real-money accounts, not a paper simulation.
+        # Scale to realistic multiples of the paper starting cash so that
+        # BullBearRotationalTrader can take normal-sized positions (e.g.
+        # 10-20% of $10,000 = $1,000-$2,000 per order).
+        self.max_notional_per_asset = initial_cash * 0.35   # 35% max per single order
+        self.max_total_notional     = initial_cash * 2.0    # 2× equity max total exposure
+
         print(
             f"[PaperBroker] INITIALIZED\n"
-            f"  starting_cash = ${initial_cash:.2f}\n"
-            f"  slippage      = {self.paper_slippage:.4%}\n"
-            f"  trade_log     = {log_path}\n"
-            f"  archive       = {'enabled (' + self._trade_archive.db_path + ')' if self._trade_archive else 'disabled'}\n"
+            f"  starting_cash          = ${initial_cash:.2f}\n"
+            f"  slippage               = {self.paper_slippage:.4%}\n"
+            f"  max_notional_per_asset = ${self.max_notional_per_asset:.2f}\n"
+            f"  max_total_notional     = ${self.max_total_notional:.2f}\n"
+            f"  trade_log              = {log_path}\n"
+            f"  archive                = {'enabled (' + self._trade_archive.db_path + ')' if self._trade_archive else 'disabled'}\n"
             f"  All fills are synthetic — no real orders sent to Kraken."
         )
 
@@ -2808,9 +3030,100 @@ class PaperBroker(LiveBroker):
                       f"exposure={d['exposure']:.2%}")
         print()
 
+    def save_eod_report(self) -> str:
+        """Write a dated end-of-day analysis report to project/logs/eod_YYYYMMDD.txt.
+
+        The file contains:
+          • Session summary (starting capital, final equity, PnL, fees, win rate)
+          • Open positions at close
+          • Full trade-by-trade log (timestamp, asset, side, size, price, notional, fee, rPnL)
+          • Paths to the CSV and SQLite logs for deeper analysis
+
+        Returns the absolute path of the file written.
+        """
+        import datetime as _dt
+
+        now       = _dt.datetime.now()
+        date_str  = now.strftime("%Y%m%d")
+        ts_str    = now.strftime("%Y-%m-%d %H:%M:%S")
+        log_dir   = os.path.dirname(os.path.abspath(self.LOG_PATH))
+        report_path = os.path.join(log_dir, f"eod_{date_str}.txt")
+
+        s = self.summary()
+
+        lines = [
+            f"KrakBot — End-of-Day Sandbox Report  ({ts_str})",
+            "=" * 60,
+            f"  Starting capital:  ${self._initial_cash:>10,.2f}",
+            f"  Final equity:      ${s['equity']:>10.2f}",
+            f"  Cash remaining:    ${self.paper_cash:>10.2f}",
+            f"  Realized PnL:      ${s['realized_pnl_usd']:>+10.2f}",
+            f"  Unrealized PnL:    ${s['unrealized_pnl_usd']:>+10.2f}",
+            f"  Total fees:        ${s['total_fees_usd']:>10.4f}",
+            f"  Net return:        ${(s['equity'] - self._initial_cash):>+10.2f}"
+            f"  ({(s['equity'] / self._initial_cash - 1) * 100:>+.2f}%)",
+            f"  Total trades:      {s['total_trades']}"
+            f"  ({s['total_buys']} buys, {s['total_sells']} sells)",
+            f"  Win rate:          {s['win_rate']:.1f}%",
+            f"  Average win:       ${s['average_win']:>+10.4f}",
+            f"  Average loss:      ${s['average_loss']:>+10.4f}",
+            f"  Largest win:       ${s['largest_win']:>+10.4f}",
+            f"  Largest loss:      ${s['largest_loss']:>+10.4f}",
+            "",
+            "  Open Positions at Close:",
+        ]
+
+        if s["current_positions"]:
+            for asset, qty in sorted(s["current_positions"].items()):
+                price = self.live_prices.get(asset, 0.0)
+                value = qty * price
+                lines.append(
+                    f"    {asset:<6}  {qty:.6f} coins"
+                    f"  @ ${price:>10.2f}  ≈ ${value:>8.2f}"
+                )
+        else:
+            lines.append("    (none)")
+
+        # Trade-by-trade log
+        lines += [
+            "",
+            "  Trade Log:",
+            (
+                f"  {'#':>4}  {'Timestamp':19}  {'Asset':6}  {'Side':4}"
+                f"  {'Size (coins)':>12}  {'Fill $':>10}  {'Notional':>10}"
+                f"  {'Fee':>8}  {'rPnL':>10}"
+            ),
+            "  " + "-" * 90,
+        ]
+        for i, t in enumerate(self.paper_trade_history, 1):
+            lines.append(
+                f"  {i:>4}  {t['timestamp']:19}  {t['asset']:<6}  {t['side']:<4}"
+                f"  {t['size_coins']:>12.6f}  {t['fill_price']:>10.4f}"
+                f"  {t['notional_usd']:>10.2f}  {t['fee_usd']:>8.4f}"
+                f"  {t['realized_pnl_usd']:>+10.4f}"
+            )
+        if not self.paper_trade_history:
+            lines.append("    (no trades executed this session)")
+
+        lines += [
+            "",
+            "  Log files:",
+            f"    CSV trades : {os.path.abspath(self.LOG_PATH)}",
+            f"    SQLite DB  : {self._trade_archive.db_path if self._trade_archive else 'N/A'}",
+            f"    EOD report : {report_path}",
+            "=" * 60,
+        ]
+
+        with open(report_path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+        print(f"[PaperBroker] EOD report saved: {report_path}")
+        return report_path
+
     def close(self):
         """Flush and close the CSV trade log file and SQLite archive.  Call at session end."""
         self.print_session_summary()
+        self.save_eod_report()
         try:
             self._csv_file.flush()
             self._csv_file.close()
