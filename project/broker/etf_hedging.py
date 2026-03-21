@@ -4,12 +4,18 @@ project/broker/etf_hedging.py
 ETF hedging strategy and order builder.
 
 This module replaces the disabled futures hedging layer for US users by
-using Kraken Spot positions in crypto ETFs:
+using Kraken Spot positions in crypto ETPs (bare ticker symbols, no suffix):
 
-  ETHD  — 3× long  Ethereum ETF  (ticker: ETHDEUR / ETHDUSDT on Kraken)
-  SETH  — 3× short Ethereum ETF  (ticker: SETHEUR  / SETHUSDT on Kraken)
+  Long ETPs:
+    ETHU  — ETH 2× Long ETP
+    SLON  — SOL 2× Long ETP
+    XXRP  — XRP 2× Long ETP
 
-Because Ethereum leads the altcoin market, shorting SETH acts as a broad
+  Short ETPs (only these two are short):
+    ETHD  — ETH 2× Short ETP
+    SETH  — ETH 1× Short ETP
+
+Because Ethereum leads the altcoin market, shorting SETH/ETHD acts as a broad
 crypto hedge during bearish trends — the same role futures hedging played.
 
 Design
@@ -50,15 +56,19 @@ from utils.market_hours import MarketHours, MarketSession
 # Constants
 # ---------------------------------------------------------------------------
 
-ETF_ASSETS = ("ETHD", "SETH")
+ETF_ASSETS = ("ETHU", "SLON", "XXRP", "ETHD", "SETH")
 
 # Alias used by broker.py for ETF position initialisation.
 ALL_ETFS = ETF_ASSETS
 
 # Default Kraken trading pairs for each ETF ticker.
+# ETFs/ETPs on Kraken use bare ticker symbols (no currency suffix).
 ETF_KRAKEN_PAIRS: dict = {
-    "ETHD": "ETHDEUR",
-    "SETH": "SETHEUR",
+    "ETHU": "ETHU",      # ETH 2× Long ETP
+    "SLON": "SLON",      # SOL 2× Long ETP
+    "XXRP": "XXRP",      # XRP 2× Long ETP
+    "ETHD": "ETHD",      # ETH 2× Short ETP
+    "SETH": "SETH",      # ETH 1× Short ETP
 }
 
 
