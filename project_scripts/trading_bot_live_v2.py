@@ -52,10 +52,81 @@ class EnhancedTradeBot:
         mode = "PAPER" if paper_trading else "LIVE"
         logger.info(f"[{mode}] {asset_name} bot initialized | Existing: {existing_amount:.8f}")
     
+    def _macd_strength(self, macd: dict) -> float:
+        """
+        Return a 0-1 score representing how strong/decisive the MACD histogram
+        is relative to the MACD line magnitude.  Clamped to [0, 1].
+        """
+        _EPSILON = 1e-9
+        hist = macd.get('histogram', 0)
+        denominator = max(abs(macd.get('macd', 0)), _EPSILON)
+        return min(abs(hist) / denominator, 1.0)
+
+    def _bullish_confidence(self, rsi, macd, fast_ma, slow_ma, sr, price):
+        """
+        Score BUY signal quality 0-100.
+
+        Scoring breakdown (each component adds up to its cap):
+          - RSI depth below oversold threshold   → up to 40 pts
+          - MACD histogram magnitude             → up to 30 pts
+          - Price proximity to support           → up to 30 pts
+        """
+        score = 0
+
+        # RSI component: deeper oversold → higher score
+        rsi_headroom = max(self.rsi_oversold - rsi, 0)
+        score += min(rsi_headroom / self.rsi_oversold * 40, 40)
+
+        # MACD component: larger histogram → more momentum
+        if macd.get('histogram', 0) > 0:
+            score += self._macd_strength(macd) * 30
+
+        # Price-to-support proximity
+        if sr.get('support', 0) > 0 and price > 0:
+            proximity = max(1 - (price - sr['support']) / price, 0)
+            score += min(proximity * 30, 30)
+
+        # MA alignment bonus
+        if fast_ma > slow_ma:
+            score = min(score * 1.1, 100)
+
+        return round(score, 1)
+
+    def _bearish_confidence(self, rsi, macd, fast_ma, slow_ma, sr, price):
+        """
+        Score SELL signal quality 0-100.
+
+        Scoring breakdown:
+          - RSI height above overbought threshold → up to 40 pts
+          - MACD histogram depth below zero       → up to 30 pts
+          - Price proximity to resistance          → up to 30 pts
+        """
+        score = 0
+
+        # RSI component: deeper overbought → higher score
+        rsi_excess = max(rsi - self.rsi_overbought, 0)
+        rsi_range = 100 - self.rsi_overbought
+        score += min(rsi_excess / rsi_range * 40, 40)
+
+        # MACD component: more negative histogram → stronger downtrend
+        if macd.get('histogram', 0) < 0:
+            score += self._macd_strength(macd) * 30
+
+        # Price-to-resistance proximity
+        if sr.get('resistance', 0) > 0 and price > 0:
+            proximity = max(1 - (sr['resistance'] - price) / price, 0)
+            score += min(proximity * 30, 30)
+
+        # MA alignment bonus
+        if fast_ma < slow_ma:
+            score = min(score * 1.1, 100)
+
+        return round(score, 1)
+
     def calculate_signals(self, df):
         """Calculate all trading signals"""
         if len(df) < 50:
-            return {"status": "WAIT", "reason": "Insufficient data"}
+            return {"signal": "WAIT", "reason": "Insufficient data"}
         
         # Calculate technical indicators
         rsi = TechnicalIndicators.calculate_rsi(df, period=14)
@@ -71,29 +142,46 @@ class EnhancedTradeBot:
         self.last_rsi = rsi
         self.last_macd = macd
         
-        # BUY Signal: Oversold + Uptrend
+        # BUY Signal: Oversold + Uptrend + MACD positive
         if rsi < self.rsi_oversold and fast_ma > slow_ma and macd['histogram'] > 0:
+            confidence = self._bullish_confidence(rsi, macd, fast_ma, slow_ma, sr, current_price)
             return {
                 "signal": "BUY",
-                "reason": f"OVERSOLD: RSI={rsi:.1f}, Price near support ${sr['support']:.4f}",
+                "reason": (
+                    f"OVERSOLD: RSI={rsi:.1f}, Price near support "
+                    f"${sr['support']:.4f}, confidence={confidence:.0f}/100"
+                ),
+                "confidence": confidence,
                 "rsi": rsi,
                 "macd": macd,
                 "sr": sr,
                 "atr": atr,
-                "price": current_price
+                "price": current_price,
+                "fast_ma": fast_ma,
+                "slow_ma": slow_ma,
+                "trend": "UP",
             }
         
-        # SELL Signal: Overbought + Downtrend
+        # SELL Signal: Overbought + Downtrend + MACD negative
         current_position = self.position_manager.get_total_size()
         if current_position > 0 and rsi > self.rsi_overbought and fast_ma < slow_ma and macd['histogram'] < 0:
+            confidence = self._bearish_confidence(rsi, macd, fast_ma, slow_ma, sr, current_price)
             return {
                 "signal": "SELL",
-                "reason": f"OVERBOUGHT: RSI={rsi:.1f}, Price near resistance ${sr['resistance']:.4f}",
+                "reason": (
+                    f"OVERBOUGHT: RSI={rsi:.1f}, Price near resistance "
+                    f"${sr['resistance']:.4f}, confidence={confidence:.0f}/100"
+                ),
+                "confidence": confidence,
                 "rsi": rsi,
                 "macd": macd,
                 "sr": sr,
                 "atr": atr,
-                "price": current_price
+                "price": current_price,
+                "fast_ma": fast_ma,
+                "slow_ma": slow_ma,
+                "trend": "DOWN",
+                "position_size": current_position,
             }
         
         # HOLD signal
@@ -103,13 +191,24 @@ class EnhancedTradeBot:
             "rsi": rsi,
             "macd": macd,
             "sr": sr,
-            "price": current_price
+            "price": current_price,
+            "fast_ma": fast_ma,
+            "slow_ma": slow_ma,
+            "trend": "UP" if fast_ma > slow_ma else "DOWN",
         }
     
     def process_signal(self, signal_data, capital):
-        """Execute trade based on signal"""
+        """
+        Execute trade based on signal.
+
+        Returns
+        -------
+        (executed: bool, realized_pnl: float)
+            executed     – True when an order was placed.
+            realized_pnl – Realized PnL in USD for SELL orders (0 for BUY/HOLD).
+        """
         if self.paper_trading:
-            return False
+            return False, 0.0
         
         signal = signal_data.get('signal')
         price = signal_data.get('price')
@@ -117,19 +216,31 @@ class EnhancedTradeBot:
         
         if signal == "BUY":
             # Calculate position size
-            pos_size = min(capital / price, self.max_position_size)
+            if not price:
+                logger.warning(f"[{self.asset}] BUY signal ignored: price is zero or missing")
+                return False, 0.0
+            pos_size = min(capital / price, self.max_position_size) if price else 0
+            if pos_size <= 0:
+                return False, 0.0
             self.position_manager.open_position(price, pos_size)
+            self.last_signal = "BUY"
             logger.info(f"[{self.asset}] BUY: {pos_size:.8f} @ ${price:.4f} - {reason}")
-            return True
+            return True, 0.0
         
         elif signal == "SELL":
-            # Sell entire position
+            # Sell entire position and capture realized PnL
             current_size = self.position_manager.get_total_size()
+            if current_size <= 0:
+                return False, 0.0
             pnl = self.position_manager.close_position(price, current_size)
-            logger.info(f"[{self.asset}] SELL: {current_size:.8f} @ ${price:.4f} - PnL=${pnl:.2f} - {reason}")
-            return True
+            self.last_signal = "SELL"
+            logger.info(
+                f"[{self.asset}] SELL: {current_size:.8f} @ ${price:.4f} "
+                f"- PnL=${pnl:.2f} - {reason}"
+            )
+            return True, pnl
         
-        return False
+        return False, 0.0
     
     def get_summary(self):
         """Get position summary"""

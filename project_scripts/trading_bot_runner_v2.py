@@ -3,9 +3,18 @@
 Trading Bot Runner v2 - Enhanced Signal System
 RSI + MACD + Support/Resistance
 Manages existing positions + new bot trades
+
+Environment variables consumed here:
+  TOTAL_TRADING_CAPITAL            – starting capital in USD (default: 50)
+  RISK_MAX_POSITION_SIZE_PCT       – max position as fraction of account (default: 0.15)
+  RISK_MAX_NOTIONAL_USD            – max USD per position (default: 100)
+  RISK_MAX_DAILY_DRAWDOWN_PCT      – max daily loss fraction (default: 0.10)
+  REINVESTMENT_PROFIT_THRESHOLD_PCT– profit % that triggers reinvest (default: 0.25)
+  ENABLE_LIVE_TRADING              – "true" / "false" override (default: from config)
 """
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -26,6 +35,8 @@ from project.config.ma_strategy_config import (
 from project.data_feed.kraken_live_feed import KrakenLiveFeed
 from project_scripts.trading_bot_live import KrakenAPI
 from project_scripts.trading_bot_live_v2 import EnhancedTradeBot
+from project_scripts.risk_manager import RiskManager
+from project_scripts.portfolio_manager import PortfolioManager
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -33,6 +44,31 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _load_total_capital(kraken_api) -> float:
+    """
+    Determine total trading capital in USD.
+
+    Priority:
+      1. TOTAL_TRADING_CAPITAL environment variable
+      2. Live Kraken account balance (if API is enabled)
+      3. Hard-coded fallback of $50
+    """
+    env_capital = os.environ.get("TOTAL_TRADING_CAPITAL")
+    if env_capital:
+        capital = float(env_capital)
+        logger.info("Capital loaded from env TOTAL_TRADING_CAPITAL: $%.2f", capital)
+        return capital
+
+    if kraken_api.enabled:
+        capital = kraken_api.get_account_balance() or 50.0
+        logger.info("Capital loaded from Kraken balance: $%.2f", capital)
+        return capital
+
+    logger.info("Capital using default fallback: $50.00")
+    return 50.0
+
 
 class TradingBotRunnerV2:
     def __init__(self, paper_trading=True):
@@ -43,14 +79,15 @@ class TradingBotRunnerV2:
         kraken_api = KrakenAPI()
         self.kraken_api = kraken_api
         
-        available_balance = 0
-        if kraken_api.enabled:
-            available_balance = kraken_api.get_account_balance() or 51.01
-        else:
-            available_balance = 51.01
+        # ── Capital (env-first, then Kraken, then fallback) ──────────────────
+        self.available_balance = _load_total_capital(kraken_api)
         
-        self.available_balance = available_balance
-        
+        # ── Portfolio manager (tracks PnL, drives reinvestment) ───────────────
+        self.portfolio = PortfolioManager(base_capital=self.available_balance)
+
+        # ── Risk manager (enforces limits before every order) ─────────────────
+        self.risk = RiskManager(total_capital=self.available_balance)
+
         # Get all holdings
         self.all_balances = {}
         if kraken_api.enabled:
@@ -116,7 +153,7 @@ class TradingBotRunnerV2:
                 if result.get('result'):
                     ticker = list(result['result'].values())[0]
                     prices[pair] = float(ticker['c'][0])
-            except:
+            except Exception:
                 pass
         return prices
     
@@ -127,7 +164,14 @@ class TradingBotRunnerV2:
         logger.info("[PORTFOLIO INITIALIZATION - ENHANCED BOT v2]")
         logger.info("=" * 80)
         logger.info(f"Mode: {self.mode}")
-        logger.info(f"Available Cash (USD): ${self.available_balance:.2f}")
+        logger.info(f"Total Trading Capital: ${self.available_balance:.2f}")
+        logger.info(f"Capital Per Trade:     ${self.portfolio.capital_per_trade:.2f}")
+        logger.info("")
+        logger.info("[RISK LIMITS]")
+        rs = self.risk.status()
+        logger.info(f"  Max position size: {rs['max_position_pct']*100:.0f}% of capital")
+        logger.info(f"  Max notional:      ${rs['max_notional_usd']:.2f}")
+        logger.info(f"  Max daily loss:    {rs['max_daily_drawdown_pct']*100:.0f}% of capital")
         logger.info("")
         logger.info("[TRADING BOTS] (with position tracking)")
         
@@ -140,10 +184,18 @@ class TradingBotRunnerV2:
         
         logger.info("")
         logger.info(f"Total Existing Holdings Value: ${total_existing_value:.2f}")
-        logger.info(f"Trading Capital Available: ${self.available_balance:.2f}")
+        logger.info(f"Trading Capital Available:     ${self.available_balance:.2f}")
         logger.info("=" * 80)
         logger.info("")
     
+    def _compute_capital_per_trade(self) -> float:
+        """
+        Return the capital to deploy per position, sourced from the portfolio
+        manager (which auto-scales with profits).  Clamped by risk manager.
+        """
+        raw = self.portfolio.capital_per_trade
+        return self.risk.clamp_notional(raw)
+
     def run(self):
         """Main trading loop"""
         iteration = 0
@@ -163,31 +215,61 @@ class TradingBotRunnerV2:
                 # Update prices and process signals
                 logger.info("")
                 logger.info("[SIGNAL ANALYSIS]")
+
+                total_unrealized = 0.0
+                total_realized = 0.0
+
                 for asset_name, bot in sorted(self.bots.items()):
                     kraken_pair = bot.pair
                     
-                    if kraken_pair in feed_data:
-                        df = feed_data[kraken_pair]
-                        if len(df) > 0:
-                            # Calculate signals
-                            signal_data = bot.calculate_signals(df)
-                            signal = signal_data['signal']
-                            reason = signal_data['reason']
-                            
-                            # Log signal
-                            logger.info(f"  [{asset_name:6s}] {signal:5s} | {reason}")
-                            
-                            # Process signal
-                            bot.process_signal(signal_data, self.available_balance * 0.1)
-                
-                # Portfolio summary
+                    if kraken_pair not in feed_data:
+                        continue
+
+                    df = feed_data[kraken_pair]
+                    if len(df) == 0:
+                        continue
+
+                    # Calculate signals
+                    signal_data = bot.calculate_signals(df)
+                    signal = signal_data.get('signal', 'HOLD')
+                    reason = signal_data.get('reason', '')
+                    confidence = signal_data.get('confidence', 0)
+
+                    # Log signal
+                    conf_str = f" [conf={confidence:.0f}]" if confidence else ""
+                    logger.info(f"  [{asset_name:6s}] {signal:5s}{conf_str} | {reason}")
+
+                    # ── Risk gate before BUY ─────────────────────────────────
+                    if signal == "BUY":
+                        capital_to_use = self._compute_capital_per_trade()
+                        allowed, block_reason = self.risk.check_buy(
+                            capital_to_use, asset=asset_name
+                        )
+                        if not allowed:
+                            logger.warning(f"  [{asset_name:6s}] Trade skipped: {block_reason}")
+                            continue
+                        signal_data['_capital_override'] = capital_to_use
+
+                    # Process signal; capture realized PnL from SELL orders
+                    capital = signal_data.pop('_capital_override', self._compute_capital_per_trade())
+                    executed, realized_pnl = bot.process_signal(signal_data, capital)
+
+                    # ── Post-trade accounting ────────────────────────────────
+                    if executed and signal == "SELL" and realized_pnl != 0:
+                        self.portfolio.record_trade_profit(realized_pnl, asset=asset_name)
+                        # Update risk manager's capital reference
+                        if realized_pnl < 0:
+                            self.risk.record_loss(abs(realized_pnl))
+                        self.risk.update_capital(self.portfolio.total_equity())
+                        # Sync bot's capital_per_trade with portfolio
+                        for b in self.bots.values():
+                            b.capital_per_trade = self.portfolio.capital_per_trade
+
+                # ── Portfolio summary ─────────────────────────────────────────
                 logger.info("")
                 logger.info("=" * 80)
                 logger.info("[PORTFOLIO STATUS]")
                 logger.info("=" * 80)
-                
-                total_unrealized = 0
-                total_realized = 0
                 
                 for asset_name, bot in sorted(self.bots.items()):
                     summary = bot.get_summary()
@@ -200,11 +282,24 @@ class TradingBotRunnerV2:
                         logger.info(f"    Realized PnL:   ${summary['realized_pnl']:+.2f}")
                         total_unrealized += summary['unrealized_pnl']
                         total_realized += summary['realized_pnl']
-                
+
+                # Update portfolio manager with latest unrealized PnL
+                self.portfolio.update_unrealized(total_unrealized)
+
                 logger.info("")
                 logger.info(f"Total Unrealized PnL: ${total_unrealized:+.2f}")
                 logger.info(f"Total Realized PnL:   ${total_realized:+.2f}")
                 logger.info(f"Available Cash:       ${self.available_balance:+.2f}")
+
+                # Log full portfolio snapshot every iteration
+                self.portfolio.log_snapshot()
+
+                # Risk status
+                rs = self.risk.status()
+                logger.info(
+                    "[RiskManager] Daily loss budget remaining: $%.2f",
+                    rs['daily_loss_budget_remaining'],
+                )
                 logger.info("=" * 80)
                 
                 # Wait for next cycle
@@ -222,13 +317,22 @@ class TradingBotRunnerV2:
                 time.sleep(60)
 
 if __name__ == '__main__':
+    # Allow env override of live-trading flag
+    env_live = os.environ.get("ENABLE_LIVE_TRADING", "").lower()
+    if env_live == "true":
+        live_mode = True
+    elif env_live == "false":
+        live_mode = False
+    else:
+        live_mode = ENABLE_LIVE_TRADING
+
     logger.info("")
     logger.info("=" * 80)
     logger.info("[ENHANCED TRADING BOT v2] STARTED")
-    logger.info(f"Mode: {'PAPER TRADING' if ENABLE_PAPER_TRADING else 'LIVE TRADING'}")
-    logger.info("Signals: RSI + MACD + Support/Resistance")
+    logger.info(f"Mode: {'LIVE TRADING' if live_mode else 'PAPER TRADING'}")
+    logger.info("Signals: RSI + MACD + Support/Resistance (BUY + SELL)")
+    logger.info(f"Capital: ${os.environ.get('TOTAL_TRADING_CAPITAL', '(from Kraken/default)')}")
     logger.info("=" * 80)
     
-    runner = TradingBotRunnerV2(paper_trading=not ENABLE_LIVE_TRADING)
+    runner = TradingBotRunnerV2(paper_trading=not live_mode)
     runner.run()
-
