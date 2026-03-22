@@ -3,9 +3,19 @@
 Trading Bot Runner v2 - Enhanced Signal System
 RSI + MACD + Support/Resistance
 Manages existing positions + new bot trades
+
+Features
+--------
+* Dynamic capital scaling — works at ANY amount (no minimums)
+* Risk manager enforces position size / drawdown limits before every order
+* Portfolio manager tracks growth and drives profit reinvestment
+* Full bearish signal logic: SELL spot + optional SETH/ETHD rotation
+* SETH/ETHD guarded behind market-hours check AND ENABLE_SHORT_ETF_TRADING flag
+* Spot ETH trading continues 24/7 regardless of ETF toggle state
 """
 
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,8 +34,10 @@ from project.config.ma_strategy_config import (
     POSITION_SIZE_PCT,
 )
 from project.data_feed.kraken_live_feed import KrakenLiveFeed
+from project.utils.market_hours import MarketHours, MarketSession
 from project_scripts.trading_bot_live import KrakenAPI
 from project_scripts.trading_bot_live_v2 import EnhancedTradeBot
+from project_scripts.portfolio_manager import PortfolioManager
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -34,201 +46,420 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Environment configuration — NO hardcoded minimums
+# ---------------------------------------------------------------------------
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (ValueError, TypeError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name, "true" if default else "false").lower()
+    return val not in ("false", "0", "no")
+
+
+# Capital the bot is allowed to deploy. Works at $1, $10, $100, $10k, $50k …
+TOTAL_TRADING_CAPITAL: float = _env_float("TOTAL_TRADING_CAPITAL", 50.0)
+
+# Risk parameters
+RISK_MAX_POSITION_SIZE_PCT: float = _env_float("RISK_MAX_POSITION_SIZE_PCT", 0.15)
+RISK_MAX_DAILY_DRAWDOWN_PCT: float = _env_float("RISK_MAX_DAILY_DRAWDOWN_PCT", 0.10)
+REINVESTMENT_PROFIT_THRESHOLD_PCT: float = _env_float(
+    "REINVESTMENT_PROFIT_THRESHOLD_PCT", 0.25
+)
+
+# Short ETF trading toggle (default ON; disable via env to keep spot-only mode)
+ENABLE_SHORT_ETF_TRADING: bool = _env_bool("ENABLE_SHORT_ETF_TRADING", True)
+
+# Use live trading if requested via env (overrides config file)
+_LIVE_TRADING: bool = _env_bool("ENABLE_LIVE_TRADING", ENABLE_LIVE_TRADING)
+
+_market_hours = MarketHours()
+
+
+class LiveRiskManager:
+    """
+    Lightweight risk gate for the live trading runner.
+
+    Checks each proposed trade against:
+    1. Max position size (% of current portfolio capital)
+    2. Max notional per trade (absolute USD cap)
+    3. Daily drawdown limit (delegated to PortfolioManager)
+
+    All limits scale proportionally with capital — no hardcoded thresholds.
+    """
+
+    def __init__(self, portfolio: PortfolioManager):
+        self.portfolio = portfolio
+        self.violations: list[dict] = []
+
+    def approve(self, asset: str, proposed_usd: float) -> tuple[bool, str]:
+        """
+        Return (approved, reason).
+
+        Parameters
+        ----------
+        asset        : human-readable asset name for logging
+        proposed_usd : USD notional of the proposed trade
+        """
+        allowed, reason = self.portfolio.check_trade_allowed(proposed_usd)
+        if not allowed:
+            self.violations.append(
+                {
+                    "asset": asset,
+                    "proposed_usd": proposed_usd,
+                    "reason": reason,
+                    "time": datetime.utcnow().isoformat(),
+                }
+            )
+            logger.warning(
+                "[RiskManager] BLOCKED %s $%.2f — %s",
+                asset, proposed_usd, reason,
+            )
+        return allowed, reason
+
+    def log_summary(self) -> None:
+        if self.violations:
+            logger.info(
+                "[RiskManager] Total violations this session: %d", len(self.violations)
+            )
+
+
 class TradingBotRunnerV2:
-    def __init__(self, paper_trading=True):
+    def __init__(self, paper_trading: bool = True):
         self.paper_trading = paper_trading
         self.mode = "PAPER" if paper_trading else "LIVE"
-        
-        # Get real balances from Kraken
+
+        # ----------------------------------------------------------------
+        # Kraken API + balance
+        # ----------------------------------------------------------------
         kraken_api = KrakenAPI()
         self.kraken_api = kraken_api
-        
-        available_balance = 0
+
+        # Use TOTAL_TRADING_CAPITAL from env; fall back to live balance query
         if kraken_api.enabled:
-            available_balance = kraken_api.get_account_balance() or 51.01
+            live_balance = kraken_api.get_account_balance() or TOTAL_TRADING_CAPITAL
         else:
-            available_balance = 51.01
-        
-        self.available_balance = available_balance
-        
-        # Get all holdings
-        self.all_balances = {}
+            live_balance = TOTAL_TRADING_CAPITAL
+
+        # TOTAL_TRADING_CAPITAL env var wins if explicitly set; otherwise use
+        # live balance so the bot automatically adjusts to account growth.
+        env_capital_set = "TOTAL_TRADING_CAPITAL" in os.environ
+        self.available_balance: float = (
+            TOTAL_TRADING_CAPITAL if env_capital_set else live_balance
+        )
+
+        self.all_balances: dict = {}
         if kraken_api.enabled:
             self.all_balances = kraken_api.get_all_balances()
-        
-        # Mapping: Kraken internal code -> display name -> pair
+
+        # ----------------------------------------------------------------
+        # Portfolio manager (scales position sizes from any capital level)
+        # ----------------------------------------------------------------
+        self.portfolio = PortfolioManager(
+            total_capital=self.available_balance,
+            risk_pct=RISK_MAX_POSITION_SIZE_PCT,
+            max_daily_drawdown_pct=RISK_MAX_DAILY_DRAWDOWN_PCT,
+            reinvestment_threshold_pct=REINVESTMENT_PROFIT_THRESHOLD_PCT,
+        )
+
+        # ----------------------------------------------------------------
+        # Risk manager
+        # ----------------------------------------------------------------
+        self.risk_manager = LiveRiskManager(self.portfolio)
+
+        # ----------------------------------------------------------------
+        # Asset map
+        # ----------------------------------------------------------------
         self.asset_map = {
-            'XXRP': {'name': 'XRP', 'pair': 'XXRPZUSD'},
-            'XXLM': {'name': 'XLM', 'pair': 'XXLMZUSD'},
-            'SOL': {'name': 'SOL', 'pair': 'SOLUSD'},
-            'AVAX': {'name': 'AVAX', 'pair': 'AVAXUSD'},
-            'HBAR': {'name': 'HBAR', 'pair': 'HBARUSD'},
-            'LINK': {'name': 'LINK', 'pair': 'LINKUSD'},
+            "XXRP":  {"name": "XRP",  "pair": "XXRPZUSD"},
+            "XXLM":  {"name": "XLM",  "pair": "XXLMZUSD"},
+            "SOL":   {"name": "SOL",  "pair": "SOLUSD"},
+            "AVAX":  {"name": "AVAX", "pair": "AVAXUSD"},
+            "HBAR":  {"name": "HBAR", "pair": "HBARUSD"},
+            "LINK":  {"name": "LINK", "pair": "LINKUSD"},
         }
-        
-        # Fetch current prices
-        self.current_prices = self._fetch_all_prices()
-        
-        # Use pairs from config
+
+        self.current_prices: dict = self._fetch_all_prices()
         self.feed = KrakenLiveFeed(pairs=TRADING_PAIRS)
-        
-        # Initialize enhanced bots with existing positions
-        self.bots = {}
+
+        # ----------------------------------------------------------------
+        # Initialise per-asset bots
+        # ----------------------------------------------------------------
+        self.bots: dict[str, EnhancedTradeBot] = {}
         for kraken_code, info in self.asset_map.items():
-            kraken_pair = info['pair']
-            asset_name = info['name']
-            
-            # Check if this pair is in trading pairs
+            kraken_pair = info["pair"]
+            asset_name = info["name"]
+
             if kraken_pair not in TRADING_PAIRS:
                 continue
-            
-            # Get existing position
+
             existing_amount = float(self.all_balances.get(kraken_code, 0))
             current_price = self.current_prices.get(kraken_pair, 0)
-            
+
             try:
                 bot = EnhancedTradeBot(
                     asset_name=asset_name,
                     kraken_pair=kraken_pair,
                     existing_amount=existing_amount,
                     current_price=current_price,
-                    paper_trading=paper_trading
+                    paper_trading=paper_trading,
                 )
                 self.bots[asset_name] = bot
-            except Exception as e:
-                logger.error(f"Failed to create bot for {asset_name}: {e}")
-        
-        # Log initialization
+            except Exception as exc:
+                logger.error("Failed to create bot for %s: %s", asset_name, exc)
+
         self._log_initialization()
-    
-    def _fetch_all_prices(self):
-        """Fetch current prices for all assets"""
-        prices = {}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_all_prices(self) -> dict:
+        """Fetch current prices for all tracked assets."""
+        prices: dict = {}
         for kraken_code, info in self.asset_map.items():
-            pair = info['pair']
+            pair = info["pair"]
             try:
-                response = requests.get(
+                resp = requests.get(
                     "https://api.kraken.com/0/public/Ticker",
-                    params={'pair': pair},
-                    timeout=5
+                    params={"pair": pair},
+                    timeout=5,
                 )
-                result = response.json()
-                if result.get('result'):
-                    ticker = list(result['result'].values())[0]
-                    prices[pair] = float(ticker['c'][0])
-            except:
+                result = resp.json()
+                if result.get("result"):
+                    ticker = list(result["result"].values())[0]
+                    prices[pair] = float(ticker["c"][0])
+            except Exception:
                 pass
         return prices
-    
-    def _log_initialization(self):
-        """Log portfolio initialization"""
+
+    def _etf_short_allowed(self) -> bool:
+        """Return True if SETH/ETHD orders are allowed right now."""
+        if not ENABLE_SHORT_ETF_TRADING:
+            return False
+        return _market_hours.get_session() == MarketSession.REGULAR
+
+    def _log_initialization(self) -> None:
         logger.info("")
         logger.info("=" * 80)
         logger.info("[PORTFOLIO INITIALIZATION - ENHANCED BOT v2]")
         logger.info("=" * 80)
-        logger.info(f"Mode: {self.mode}")
-        logger.info(f"Available Cash (USD): ${self.available_balance:.2f}")
+        logger.info("Mode: %s", self.mode)
+        logger.info("Total Capital (USD): $%.2f", self.available_balance)
+        logger.info("Capital per Trade:   $%.2f", self.portfolio.capital_per_trade())
+        logger.info(
+            "Short ETF Trading:   %s",
+            "ENABLED (SETH/ETHD, M-F 9:30-16:00 ET)"
+            if ENABLE_SHORT_ETF_TRADING
+            else "DISABLED (spot-only mode)",
+        )
         logger.info("")
         logger.info("[TRADING BOTS] (with position tracking)")
-        
-        total_existing_value = 0
+
+        total_existing_value = 0.0
         for asset_name, bot in sorted(self.bots.items()):
             summary = bot.get_summary()
             if summary:
-                logger.info(f"  {asset_name}: {summary['total_size']:.8f} @ ${summary['avg_entry_price']:.4f} (manual)")
-                total_existing_value += summary['unrealized_pnl'] + (summary['avg_entry_price'] * summary['total_size'])
-        
+                logger.info(
+                    "  %s: %.8f @ $%.4f",
+                    asset_name,
+                    summary["total_size"],
+                    summary["avg_entry_price"],
+                )
+                total_existing_value += summary["unrealized_pnl"] + (
+                    summary["avg_entry_price"] * summary["total_size"]
+                )
+
         logger.info("")
-        logger.info(f"Total Existing Holdings Value: ${total_existing_value:.2f}")
-        logger.info(f"Trading Capital Available: ${self.available_balance:.2f}")
+        logger.info("Existing Holdings Value: $%.2f", total_existing_value)
         logger.info("=" * 80)
         logger.info("")
-    
-    def run(self):
-        """Main trading loop"""
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
         iteration = 0
-        
+
         while True:
             iteration += 1
-            
+
             try:
                 logger.info("")
                 logger.info("=" * 80)
-                logger.info(f">>> ITERATION {iteration} - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                logger.info(
+                    ">>> ITERATION %d — %s UTC",
+                    iteration,
+                    datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                )
+                logger.info("Market hours: %s", _market_hours.status_line())
                 logger.info("=" * 80)
-                
-                # Fetch data for all pairs
+
+                # Check daily drawdown before processing any signals
+                if self.portfolio.daily_drawdown_breached():
+                    logger.warning(
+                        "Daily drawdown limit reached — skipping signal processing."
+                    )
+                    time.sleep(300)
+                    continue
+
                 feed_data = self.feed.fetch_all_pairs(interval=60)
-                
-                # Update prices and process signals
+                capital_per_trade = self.portfolio.capital_per_trade()
+                etf_short_now = self._etf_short_allowed()
+
                 logger.info("")
-                logger.info("[SIGNAL ANALYSIS]")
+                logger.info("[SIGNAL ANALYSIS] capital_per_trade=$%.2f", capital_per_trade)
+
+                total_unrealized = 0.0
+                total_realized = 0.0
+
                 for asset_name, bot in sorted(self.bots.items()):
                     kraken_pair = bot.pair
-                    
-                    if kraken_pair in feed_data:
-                        df = feed_data[kraken_pair]
-                        if len(df) > 0:
-                            # Calculate signals
-                            signal_data = bot.calculate_signals(df)
-                            signal = signal_data['signal']
-                            reason = signal_data['reason']
-                            
-                            # Log signal
-                            logger.info(f"  [{asset_name:6s}] {signal:5s} | {reason}")
-                            
-                            # Process signal
-                            bot.process_signal(signal_data, self.available_balance * 0.1)
-                
-                # Portfolio summary
+
+                    if kraken_pair not in feed_data:
+                        continue
+                    df = feed_data[kraken_pair]
+                    if len(df) == 0:
+                        continue
+
+                    # ---- Calculate signals ----
+                    signal_data = bot.calculate_signals(df)
+                    signal = signal_data.get("signal", "HOLD")
+                    reason = signal_data.get("reason", "")
+                    confidence = signal_data.get("confidence", 0.0)
+                    is_bearish = signal_data.get("is_bearish", False)
+
+                    logger.info(
+                        "  [%s] %s (conf=%.2f) | %s",
+                        asset_name, signal, confidence, reason,
+                    )
+
+                    # ---- Risk check ----
+                    if signal in ("BUY", "SELL"):
+                        approved, risk_reason = self.risk_manager.approve(
+                            asset_name, capital_per_trade
+                        )
+                        if not approved:
+                            logger.info(
+                                "  [%s] Trade blocked by risk manager: %s",
+                                asset_name, risk_reason,
+                            )
+                            continue
+
+                    # ---- Execute trade ----
+                    if signal == "BUY":
+                        traded = bot.process_signal(signal_data, capital_per_trade)
+                        if traded:
+                            self.portfolio.on_trade_open(capital_per_trade)
+
+                    elif signal == "SELL":
+                        # Always sell spot position if one exists
+                        traded = bot.process_signal(signal_data, capital_per_trade)
+                        if traded:
+                            # Retrieve PnL from the last closed trade
+                            summary = bot.get_summary()
+                            realized = summary.get("realized_pnl", 0.0) if summary else 0.0
+                            self.portfolio.on_trade_close(realized)
+
+                        # Optionally rotate into SETH/ETHD if market hours allow
+                        if is_bearish and etf_short_now:
+                            self._rotate_to_etf_short(asset_name, capital_per_trade)
+                        elif is_bearish and ENABLE_SHORT_ETF_TRADING and not etf_short_now:
+                            logger.info(
+                                "  [%s] Bear signal — ETF rotation deferred (outside market hours)",
+                                asset_name,
+                            )
+
+                    # Collect unrealized PnL
+                    summary = bot.get_summary()
+                    if summary:
+                        total_unrealized += summary.get("unrealized_pnl", 0.0)
+                        total_realized += summary.get("realized_pnl", 0.0)
+
+                # Update portfolio unrealized PnL
+                self.portfolio.update_unrealized(total_unrealized)
+
+                # ---- Portfolio summary ----
                 logger.info("")
                 logger.info("=" * 80)
                 logger.info("[PORTFOLIO STATUS]")
                 logger.info("=" * 80)
-                
-                total_unrealized = 0
-                total_realized = 0
-                
+
                 for asset_name, bot in sorted(self.bots.items()):
                     summary = bot.get_summary()
                     if summary:
-                        logger.info(f"  {asset_name:6s}:")
-                        logger.info(f"    Position: {summary['total_size']:.8f}")
-                        logger.info(f"    Entry:    ${summary['avg_entry_price']:.4f}")
-                        logger.info(f"    Current:  ${summary['current_price']:.4f}")
-                        logger.info(f"    Unrealized PnL: ${summary['unrealized_pnl']:+.2f} ({summary['unrealized_pnl_pct']:+.2f}%)")
-                        logger.info(f"    Realized PnL:   ${summary['realized_pnl']:+.2f}")
-                        total_unrealized += summary['unrealized_pnl']
-                        total_realized += summary['realized_pnl']
-                
+                        logger.info("  %s:", asset_name)
+                        logger.info("    Position:       %.8f", summary["total_size"])
+                        logger.info("    Entry:          $%.4f", summary["avg_entry_price"])
+                        logger.info("    Current:        $%.4f", summary["current_price"])
+                        logger.info(
+                            "    Unrealized PnL: $%+.2f (%+.2f%%)",
+                            summary["unrealized_pnl"],
+                            summary["unrealized_pnl_pct"],
+                        )
+                        logger.info("    Realized PnL:   $%+.2f", summary["realized_pnl"])
+
                 logger.info("")
-                logger.info(f"Total Unrealized PnL: ${total_unrealized:+.2f}")
-                logger.info(f"Total Realized PnL:   ${total_realized:+.2f}")
-                logger.info(f"Available Cash:       ${self.available_balance:+.2f}")
+                logger.info("Total Unrealized PnL: $%+.2f", total_unrealized)
+                logger.info("Total Realized PnL:   $%+.2f", total_realized)
+                logger.info("Available Cash:       $%.2f", self.available_balance)
+                self.portfolio.log_summary()
+                self.risk_manager.log_summary()
                 logger.info("=" * 80)
-                
+
                 # Wait for next cycle
                 interval_seconds = 300
-                logger.info(f"Next update in {interval_seconds}s...")
+                logger.info("Next update in %ds…", interval_seconds)
                 logger.info("")
                 time.sleep(interval_seconds)
-                
+
             except KeyboardInterrupt:
                 logger.info("")
                 logger.info("Bot interrupted by user")
                 break
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
+            except Exception as exc:
+                logger.error("Error in main loop: %s", exc, exc_info=True)
                 time.sleep(60)
 
-if __name__ == '__main__':
+    # ------------------------------------------------------------------
+    # ETF rotation helper
+    # ------------------------------------------------------------------
+
+    def _rotate_to_etf_short(self, asset_name: str, usd_amount: float) -> None:
+        """
+        Placeholder for SETH/ETHD rotation logic.
+
+        In production this would place a market buy order on Kraken for
+        ETHD (1× short) or SETH (2× short) using `usd_amount` USD.
+        The exact ETF chosen can be configurable.
+
+        This method is guarded by both ENABLE_SHORT_ETF_TRADING and the
+        market-hours check before it is ever called.
+        """
+        logger.info(
+            "  [%s] ETF rotation → ETHD/SETH | amount=$%.2f "
+            "(PAPER — no real order placed)",
+            asset_name,
+            usd_amount,
+        )
+        # TODO: integrate Kraken API call for ETHD/SETH here when live
+
+
+if __name__ == "__main__":
     logger.info("")
     logger.info("=" * 80)
     logger.info("[ENHANCED TRADING BOT v2] STARTED")
-    logger.info(f"Mode: {'PAPER TRADING' if ENABLE_PAPER_TRADING else 'LIVE TRADING'}")
+    logger.info("Mode:    %s", "LIVE TRADING" if _LIVE_TRADING else "PAPER TRADING")
+    logger.info("Capital: $%.2f", TOTAL_TRADING_CAPITAL)
     logger.info("Signals: RSI + MACD + Support/Resistance")
     logger.info("=" * 80)
-    
-    runner = TradingBotRunnerV2(paper_trading=not ENABLE_LIVE_TRADING)
+
+    runner = TradingBotRunnerV2(paper_trading=not _LIVE_TRADING)
     runner.run()
 
