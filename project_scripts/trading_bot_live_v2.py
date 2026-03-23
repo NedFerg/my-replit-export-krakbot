@@ -14,6 +14,7 @@ from datetime import datetime
 import pandas as pd
 
 from project.config.ma_strategy_config import STRATEGY_PARAMS, INITIAL_CAPITAL_USD
+from project.strategies.volume_climax_detector import VolumeClimaxDetector
 from project.utils.market_hours import MarketHours, MarketSession
 from project_scripts.technical_indicators import TechnicalIndicators
 from project_scripts.position_manager import PositionManager, Position
@@ -70,6 +71,12 @@ class EnhancedTradeBot:
         self.rsi_oversold = 30
         self.rsi_overbought = 70
         self.macd_signal_threshold = 0.0001
+        # Volume capitulation detector
+        self.volume_detector = VolumeClimaxDetector(
+            volume_spike_multiplier=2.5,
+            wick_ratio_threshold=0.03,
+            lookback_periods=50,
+        )
 
         # State tracking
         self.last_signal = "WAIT"
@@ -154,7 +161,7 @@ class EnhancedTradeBot:
         return round(min(score, 1.0), 3)
 
     def calculate_signals(self, df) -> dict:
-        """Calculate all trading signals and return a rich metadata dict."""
+        """Calculate all trading signals with volume capitulation priority."""
         if len(df) < 50:
             return {
                 "signal": "WAIT",
@@ -182,6 +189,60 @@ class EnhancedTradeBot:
         # Determine whether ETF short is eligible right now
         etf_short_eligible = _ENABLE_SHORT_ETF and _etf_market_open()
 
+        # ========== VOLUME CAPITULATION PRIORITY ==========
+        # Check for capitulation BUY first (institutional buyers stepping in)
+        cap_buy, cap_conf, cap_details = self.volume_detector.detect_capitulation_buy(df, rsi, current_price)
+        if cap_buy and cap_conf >= 0.60:
+            self.last_signal = "BUY"
+            return {
+                "signal": "BUY",
+                "reason": (
+                    f"[VOLUME CLIMAX] {self.asset} CAPITULATION BUY\n"
+                    f"  RSI={rsi:.1f} (deep oversold)\n"
+                    f"  Volume={cap_details.get('volume_ratio', 0):.1f}x avg (capitulation spike)\n"
+                    f"  Lower Wick={cap_details.get('lower_wick_pct', 0):.1f}% (rejection of lower prices)\n"
+                    f"  Confidence={cap_conf:.2f} ✅"
+                ),
+                "rsi": rsi,
+                "macd": macd,
+                "sr": sr,
+                "atr": atr,
+                "price": current_price,
+                "confidence": cap_conf,
+                "fast_ma": fast_ma,
+                "slow_ma": slow_ma,
+                "trend": "UP",
+                "volume_climax": True,
+                "etf_short_eligible": False,
+            }
+
+        # Check for exhaustion SELL (retail capitulation at top)
+        cap_sell, cap_sell_conf, cap_sell_details = self.volume_detector.detect_exhaustion_sell(df, rsi, current_price)
+        if cap_sell and cap_sell_conf >= 0.60:
+            self.last_signal = "SELL"
+            return {
+                "signal": "SELL",
+                "reason": (
+                    f"[VOLUME CLIMAX] {self.asset} EXHAUSTION SELL\n"
+                    f"  RSI={rsi:.1f} (deep overbought)\n"
+                    f"  Volume={cap_sell_details.get('volume_ratio', 0):.1f}x avg (exhaustion spike)\n"
+                    f"  Upper Wick={cap_sell_details.get('upper_wick_pct', 0):.1f}% (rejection of higher prices)\n"
+                    f"  Confidence={cap_sell_conf:.2f} ✅"
+                ),
+                "rsi": rsi,
+                "macd": macd,
+                "sr": sr,
+                "atr": atr,
+                "price": current_price,
+                "confidence": cap_sell_conf,
+                "fast_ma": fast_ma,
+                "slow_ma": slow_ma,
+                "trend": "DOWN",
+                "volume_climax": True,
+                "etf_short_eligible": etf_short_eligible,
+            }
+
+        # ========== FALLBACK TO MA-BASED SIGNALS ==========
         # ---- BUY Signal: oversold + uptrend --------------------------------
         if rsi < self.rsi_oversold and fast_ma > slow_ma and macd.get("histogram", 0) > 0:
             confidence = self._bull_confidence(rsi, macd, fast_ma, slow_ma, sr, current_price)
@@ -201,6 +262,7 @@ class EnhancedTradeBot:
                 "fast_ma": fast_ma,
                 "slow_ma": slow_ma,
                 "trend": "UP",
+                "volume_climax": False,
                 "etf_short_eligible": False,
             }
 
@@ -249,6 +311,7 @@ class EnhancedTradeBot:
                 "fast_ma": fast_ma,
                 "slow_ma": slow_ma,
                 "trend": "DOWN",
+                "volume_climax": False,
                 "etf_short_eligible": etf_short_eligible,
                 "is_bearish": True,
             }
@@ -269,13 +332,9 @@ class EnhancedTradeBot:
             "fast_ma": fast_ma,
             "slow_ma": slow_ma,
             "trend": trend_label,
+            "volume_climax": False,
             "etf_short_eligible": etf_short_eligible,
         }
-
-    # ------------------------------------------------------------------
-    # Trade execution
-    # ------------------------------------------------------------------
-
     def process_signal(self, signal_data: dict, capital: float) -> bool:
         """
         Execute trade based on signal.
