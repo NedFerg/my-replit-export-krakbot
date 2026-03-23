@@ -173,7 +173,7 @@ class EnhancedTradeBot:
         atr = TechnicalIndicators.calculate_atr(df, period=14)
 
         fast_ma = df["close"].tail(self.params.get("fast_ma", 5)).mean()
-        slow_ma = df["close"].tail(self.params.get("slow_ma", 100)).mean()
+        slow_ma = df["close"].tail(self.params.get("slow_ma", 50)).mean()
         current_price = float(df["close"].iloc[-1])
 
         self.last_rsi = rsi
