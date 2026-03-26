@@ -61,6 +61,92 @@ APPROVED_ASSETS: frozenset[str] = frozenset({
 })
 
 
+# ===========================================================================
+# KRAKEN ORDER PRECISION — maximum decimal places allowed per pair.
+#
+# Kraken rejects orders whose price or volume strings have more decimal
+# places than its asset-pair configuration allows.  The values below are
+# sourced from Kraken's AssetPairs endpoint (pair_decimals / lot_decimals).
+#
+# Rules of thumb (spot USD pairs as of 2025):
+#   price_decimals – controls how many dp the "price" field may contain.
+#   volume_decimals – controls how many dp the "volume" field may contain.
+#
+# To add a new pair: add entries to *both* dicts (keyed by the Kraken pair
+# symbol, e.g. "SOLUSD") so the order-builder can look them up.
+# ===========================================================================
+KRAKEN_PRICE_DECIMALS: dict[str, int] = {
+    "XBTUSD":  1,   # BTC/USD  — e.g. 70713.1
+    "ETHUSD":  2,   # ETH/USD  — e.g. 2160.06
+    "SOLUSD":  2,   # SOL/USD  — Kraken explicitly rejects > 2 dp
+    "AVAXUSD": 2,   # AVAX/USD
+    "LINKUSD": 4,   # LINK/USD
+    "HBARUSD": 5,   # HBAR/USD
+    "XRPUSD":  5,   # XRP/USD
+    "XLMUSD":  6,   # XLM/USD
+    # ETF / ETP leveraged tokens (Kraken ETP platform)
+    "ETHUUSD": 2,   # ETHU — ETH 2× Long
+    "ETHDUSD": 2,   # ETHD — ETH 2× Short
+    "SLONDEF": 2,   # SLON — SOL 2× Long (check Kraken pair symbol if different)
+    "SETHUSD": 2,   # SETH — ETH 1× Short
+    "XXRPUSD": 5,   # XXRP — XRP 2× Long
+}
+
+KRAKEN_VOLUME_DECIMALS: dict[str, int] = {
+    "XBTUSD":  8,   # BTC supports 8 dp volume
+    "ETHUSD":  8,
+    "SOLUSD":  8,
+    "AVAXUSD": 8,
+    "LINKUSD": 8,
+    "HBARUSD": 8,
+    "XRPUSD":  8,
+    "XLMUSD":  8,
+    # ETF / ETP leveraged tokens
+    "ETHUUSD": 8,
+    "ETHDUSD": 8,
+    "SLONDEF": 8,
+    "SETHUSD": 8,
+    "XXRPUSD": 8,
+}
+
+# Fallback precision when a pair is not listed in the dicts above.
+# Using conservative values avoids overly-precise strings that Kraken rejects.
+_FALLBACK_PRICE_DECIMALS:  int = 2
+_FALLBACK_VOLUME_DECIMALS: int = 8
+
+
+def _format_order_price(pair: str, price: float) -> str:
+    """
+    Round and format *price* to the number of decimal places allowed by
+    Kraken for the given *pair*.
+
+    Uses KRAKEN_PRICE_DECIMALS for the lookup; falls back to
+    _FALLBACK_PRICE_DECIMALS (2) for unknown pairs so that a missing entry
+    never silently sends an over-precise price to Kraken.
+
+    Parameters
+    ----------
+    pair  : Kraken pair symbol, e.g. "SOLUSD"
+    price : raw floating-point mid/limit price
+
+    Returns a formatted string, e.g. "91.14" for SOL/USD.
+    """
+    dp = KRAKEN_PRICE_DECIMALS.get(pair, _FALLBACK_PRICE_DECIMALS)
+    return f"{round(price, dp):.{dp}f}"
+
+
+def _format_order_volume(pair: str, volume: float) -> str:
+    """
+    Round and format *volume* to the number of decimal places allowed by
+    Kraken for the given *pair*.
+
+    Uses KRAKEN_VOLUME_DECIMALS for the lookup; falls back to
+    _FALLBACK_VOLUME_DECIMALS (8) for unknown pairs.
+    """
+    dp = KRAKEN_VOLUME_DECIMALS.get(pair, _FALLBACK_VOLUME_DECIMALS)
+    return f"{round(volume, dp):.{dp}f}"
+
+
 # --- Per-asset beta categories ----------------------------------------
 # High-beta alts get more futures overlay (tactical/reactive).
 # Low-beta majors get more spot core (stable/conviction).
@@ -1578,26 +1664,34 @@ class LiveBroker(SimulatedBroker):
             # Crypto spot: always limit orders (maker rebate + slippage protection)
             order_type = "limit"
 
+        pair = self.kraken_pairs[asset]
         tol = self.limit_order_tolerance
         if order_type == "limit":
             if side == "buy":
-                limit_price = round(price * (1.0 + tol), 8)
+                raw_limit = price * (1.0 + tol)
             else:
-                limit_price = round(price * (1.0 - tol), 8)
+                raw_limit = price * (1.0 - tol)
+            price_str  = _format_order_price(pair, raw_limit)
+            volume_str = _format_order_volume(pair, coin_units)
+            print(f"[ORDER] {side.upper()} {asset} ({pair})  "
+                  f"price={price_str}  volume={volume_str}  type=limit")
             return {
-                "pair":      self.kraken_pairs[asset],
+                "pair":      pair,
                 "type":      side,
                 "ordertype": "limit",
-                "price":     f"{limit_price:.8f}",
-                "volume":    f"{coin_units:.8f}",
+                "price":     price_str,
+                "volume":    volume_str,
             }
         else:
             # Market order (ETF, regular session only)
+            volume_str = _format_order_volume(pair, coin_units)
+            print(f"[ORDER] {side.upper()} {asset} ({pair})  "
+                  f"volume={volume_str}  type=market")
             return {
-                "pair":      self.kraken_pairs[asset],
+                "pair":      pair,
                 "type":      side,
                 "ordertype": "market",
-                "volume":    f"{coin_units:.8f}",
+                "volume":    volume_str,
             }
 
     def _build_futures_order(self, asset, price, delta_exposure):
