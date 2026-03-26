@@ -56,12 +56,12 @@ class TestFormatOrderPrice(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_btc_usd_one_dp(self):
-        result = _format_order_price("XBTUSD", 70713.1)
+        result = _format_order_price("XXBTZUSD", 70713.1)
         self.assertEqual(result, "70713.1")
         self.assertEqual(len(result.split(".")[-1]), 1)
 
     def test_btc_usd_rounds_excess(self):
-        result = _format_order_price("XBTUSD", 70713.15)
+        result = _format_order_price("XXBTZUSD", 70713.15)
         self.assertRegex(result, r"^\d+\.\d{1}$")
 
     # ------------------------------------------------------------------
@@ -69,7 +69,7 @@ class TestFormatOrderPrice(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_eth_usd_two_dp(self):
-        result = _format_order_price("ETHUSD", 2160.06)
+        result = _format_order_price("XETHZUSD", 2160.06)
         self.assertEqual(result, "2160.06")
 
     # ------------------------------------------------------------------
@@ -101,11 +101,11 @@ class TestFormatOrderPrice(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_xrp_usd_five_dp(self):
-        result = _format_order_price("XRPUSD", 1.41730)
+        result = _format_order_price("XXRPZUSD", 1.41730)
         self.assertEqual(result, "1.41730")
 
     def test_xrp_usd_rounds_excess(self):
-        result = _format_order_price("XRPUSD", 1.4173012345)
+        result = _format_order_price("XXRPZUSD", 1.4173012345)
         self.assertRegex(result, r"^\d+\.\d{5}$")
 
     # ------------------------------------------------------------------
@@ -113,7 +113,7 @@ class TestFormatOrderPrice(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_xlm_usd_six_dp(self):
-        result = _format_order_price("XLMUSD", 0.178100)
+        result = _format_order_price("XXLMZUSD", 0.178100)
         self.assertEqual(result, "0.178100")
 
     # ------------------------------------------------------------------
@@ -159,11 +159,11 @@ class TestFormatOrderVolume(unittest.TestCase):
         self.assertEqual(len(result.split(".")[-1]), 8)
 
     def test_btc_volume_eight_dp(self):
-        result = _format_order_volume("XBTUSD", 0.00019234)
+        result = _format_order_volume("XXBTZUSD", 0.00019234)
         self.assertEqual(result, "0.00019234")
 
     def test_xrp_volume_eight_dp(self):
-        result = _format_order_volume("XRPUSD", 47.26996223)
+        result = _format_order_volume("XXRPZUSD", 47.26996223)
         self.assertEqual(result, "47.26996223")
 
     def test_unknown_pair_falls_back_to_eight_dp(self):
@@ -180,15 +180,15 @@ class TestPrecisionDicts(unittest.TestCase):
 
     def test_all_spot_pairs_have_price_entry(self):
         """All Kraken spot pair symbols used by the bot have price entries."""
-        required = {"XBTUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
-                    "LINKUSD", "HBARUSD", "XRPUSD", "XLMUSD"}
+        required = {"XXBTZUSD", "XETHZUSD", "SOLUSD", "AVAXUSD",
+                    "LINKUSD", "HBARUSD", "XXRPZUSD", "XXLMZUSD"}
         for pair in required:
             self.assertIn(pair, KRAKEN_PRICE_DECIMALS,
                           f"Missing price precision entry for {pair}")
 
     def test_all_spot_pairs_have_volume_entry(self):
-        required = {"XBTUSD", "ETHUSD", "SOLUSD", "AVAXUSD",
-                    "LINKUSD", "HBARUSD", "XRPUSD", "XLMUSD"}
+        required = {"XXBTZUSD", "XETHZUSD", "SOLUSD", "AVAXUSD",
+                    "LINKUSD", "HBARUSD", "XXRPZUSD", "XXLMZUSD"}
         for pair in required:
             self.assertIn(pair, KRAKEN_VOLUME_DECIMALS,
                           f"Missing volume precision entry for {pair}")
@@ -198,7 +198,7 @@ class TestPrecisionDicts(unittest.TestCase):
         self.assertEqual(KRAKEN_PRICE_DECIMALS["SOLUSD"], 2)
 
     def test_btc_price_precision_is_one(self):
-        self.assertEqual(KRAKEN_PRICE_DECIMALS["XBTUSD"], 1)
+        self.assertEqual(KRAKEN_PRICE_DECIMALS["XXBTZUSD"], 1)
 
     def test_precision_values_are_positive_ints(self):
         for pair, dp in KRAKEN_PRICE_DECIMALS.items():

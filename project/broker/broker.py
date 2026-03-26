@@ -76,14 +76,15 @@ APPROVED_ASSETS: frozenset[str] = frozenset({
 # symbol, e.g. "SOLUSD") so the order-builder can look them up.
 # ===========================================================================
 KRAKEN_PRICE_DECIMALS: dict[str, int] = {
-    "XBTUSD":  1,   # BTC/USD  — e.g. 70713.1
-    "ETHUSD":  2,   # ETH/USD  — e.g. 2160.06
-    "SOLUSD":  2,   # SOL/USD  — Kraken explicitly rejects > 2 dp
-    "AVAXUSD": 2,   # AVAX/USD
-    "LINKUSD": 4,   # LINK/USD
-    "HBARUSD": 5,   # HBAR/USD
-    "XRPUSD":  5,   # XRP/USD
-    "XLMUSD":  6,   # XLM/USD
+    # Canonical Kraken spot USD pair symbols (use these exact strings for API calls)
+    "XXBTZUSD": 1,   # BTC/USD  — e.g. 70713.1
+    "XETHZUSD": 2,   # ETH/USD  — e.g. 2160.06
+    "SOLUSD":   2,   # SOL/USD  — Kraken explicitly rejects > 2 dp
+    "AVAXUSD":  2,   # AVAX/USD
+    "LINKUSD":  4,   # LINK/USD
+    "HBARUSD":  5,   # HBAR/USD
+    "XXRPZUSD": 5,   # XRP/USD
+    "XXLMZUSD": 6,   # XLM/USD
     # ETF / ETP leveraged tokens (Kraken ETP platform)
     "ETHUUSD": 2,   # ETHU — ETH 2× Long
     "ETHDUSD": 2,   # ETHD — ETH 2× Short
@@ -93,14 +94,15 @@ KRAKEN_PRICE_DECIMALS: dict[str, int] = {
 }
 
 KRAKEN_VOLUME_DECIMALS: dict[str, int] = {
-    "XBTUSD":  8,   # BTC supports 8 dp volume
-    "ETHUSD":  8,
-    "SOLUSD":  8,
-    "AVAXUSD": 8,
-    "LINKUSD": 8,
-    "HBARUSD": 8,
-    "XRPUSD":  8,
-    "XLMUSD":  8,
+    # Canonical Kraken spot USD pair symbols (use these exact strings for API calls)
+    "XXBTZUSD": 8,   # BTC supports 8 dp volume
+    "XETHZUSD": 8,
+    "SOLUSD":   8,
+    "AVAXUSD":  8,
+    "LINKUSD":  8,
+    "HBARUSD":  8,
+    "XXRPZUSD": 8,
+    "XXLMZUSD": 8,
     # ETF / ETP leveraged tokens
     "ETHUUSD": 8,
     "ETHDUSD": 8,
@@ -724,18 +726,19 @@ class LiveBroker(SimulatedBroker):
             print("[FUTURES] DISABLED — ENABLE_FUTURES=False. "
                   "All futures code paths are fully suppressed.")
 
-        # Map internal asset names → Kraken ticker symbols used for the
-        # public /0/public/Ticker price-feed batch request.
-        # Crypto spot pairs use Kraken's X-prefixed legacy names.
+        # Map internal asset names → canonical Kraken ticker symbols used for
+        # the public /0/public/Ticker price-feed batch request.
+        # NOTE: Use canonical Kraken pair codes — short aliases (e.g. XBTUSD,
+        # ETHUSD) are no longer accepted and return EQuery:Unknown asset pair.
         self.kraken_pairs = {
-            "BTC":  "XBTUSD",
-            "ETH":  "ETHUSD",
+            "BTC":  "XXBTZUSD",
+            "ETH":  "XETHZUSD",
             "SOL":  "SOLUSD",
             "AVAX": "AVAXUSD",
             "LINK": "LINKUSD",
             "HBAR": "HBARUSD",
-            "XRP":  "XRPUSD",
-            "XLM":  "XLMUSD",
+            "XRP":  "XXRPZUSD",
+            "XLM":  "XXLMZUSD",
             # ETF hedging instruments (spot-traded, Kraken Spot)
             "ETHD": "ETHD",      # ETF ticker symbol (USD-denominated, no suffix needed)
             "SETH": "SETH",      # ETF ticker symbol (USD-denominated, no suffix needed)
@@ -1122,17 +1125,18 @@ class LiveBroker(SimulatedBroker):
         ticker_data = data["result"]
         result      = {}
 
-        # Build a reverse map: Kraken-normalised-pair → internal asset name.
-        # Kraken normalises many pairs on the way out (e.g. XBTUSD → XXBTZUSD,
-        # ETHUSD → XETHZUSD, XRPUSD → XXRPZUSD, XLMUSD → XXLMZUSD).
+        # Build a reverse map: Kraken response key → internal asset name.
+        # kraken_pairs already uses canonical symbols (XXBTZUSD, XETHZUSD, etc.)
+        # so the primary map covers all expected response keys.  The aliases dict
+        # handles any legacy short-form keys Kraken might return in edge cases.
         _KRAKEN_ALIASES: dict = {
-            "XXBTZUSD": "BTC",   # Kraken normalises XBTUSD  → XXBTZUSD
-            "XETHZUSD": "ETH",   # Kraken normalises ETHUSD  → XETHZUSD
-            "XXRPZUSD": "XRP",   # Kraken normalises XRPUSD  → XXRPZUSD
-            "XXLMZUSD": "XLM",   # Kraken normalises XLMUSD  → XXLMZUSD
+            "XXBTZUSD": "BTC",
+            "XETHZUSD": "ETH",
+            "XXRPZUSD": "XRP",
+            "XXLMZUSD": "XLM",
         }
         pair_to_asset = {v.upper(): k for k, v in self.kraken_pairs.items()}
-        pair_to_asset.update(_KRAKEN_ALIASES)   # aliases override if there is a clash
+        pair_to_asset.update(_KRAKEN_ALIASES)   # ensure canonical keys are present even if kraken_pairs changes
 
         for kraken_key, ticker in ticker_data.items():
             asset = pair_to_asset.get(kraken_key.upper())
