@@ -58,13 +58,13 @@ try:
     import urllib.request, urllib.parse, json, time
 
     PAIRS = {
-        "BTC":  "XBTUSD",
-        "ETH":  "ETHUSD",
+        "BTC":  "XXBTZUSD",
+        "ETH":  "XETHZUSD",
         "SOL":  "SOLUSD",
-        "XRP":  "XRPUSD",
+        "XRP":  "XXRPZUSD",
         "HBAR": "HBARUSD",
         "LINK": "LINKUSD",
-        "XLM":  "XLMUSD",
+        "XLM":  "XXLMZUSD",
         "ETHD": "ETHDUSD",
         "SETH": "SETHUSD",
     }
