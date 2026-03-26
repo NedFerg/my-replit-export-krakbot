@@ -2706,6 +2706,22 @@ class PaperBroker(LiveBroker):
     # Account sync — skip Kraken balance API; fetch prices only
     # ------------------------------------------------------------------
 
+    def fetch_live_balances(self):
+        """
+        Paper override: return internal paper balances instead of calling
+        the authenticated Kraken Balance endpoint (which requires API
+        credentials and would trigger the kill switch in paper mode).
+
+        Mirrors the Kraken balance-key format so callers that inspect
+        self.live_balances or use the returned dict work unchanged.
+        """
+        pseudo = {"ZUSD": str(round(self.paper_cash, 4))}
+        for asset, qty in self.paper_positions.items():
+            bal_key = self.kraken_balance_keys.get(asset, asset)
+            pseudo[bal_key] = str(round(qty, 8))
+        self.live_balances = pseudo
+        return pseudo
+
     def sync_live_account_state(self):
         """
         Paper override: fetch live prices from Kraken (needed for PnL and
