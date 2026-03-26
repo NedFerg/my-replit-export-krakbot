@@ -645,6 +645,9 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBARUSD",
             "XRP":  "XRPUSD",
             "XLM":  "XLMUSD",
+            # ETF hedging instruments (spot-traded, Kraken Spot)
+            "ETHD": "ETHD",      # ETF ticker symbol (USD-denominated, no suffix needed)
+            "SETH": "SETH",      # ETF ticker symbol (USD-denominated, no suffix needed)
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
