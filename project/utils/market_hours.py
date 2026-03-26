@@ -181,3 +181,20 @@ def etf_trading_allowed(now: datetime.datetime | None = None) -> bool:
 def required_order_type(now: datetime.datetime | None = None) -> str:
     """Module-level convenience wrapper for MarketHours.required_order_type()."""
     return _market_hours.required_order_type(now)
+
+
+# Backward compatibility aliases for older broker code
+def is_etf_tradeable(now=None):
+    """Alias for etf_trading_allowed()."""
+    return etf_trading_allowed(now)
+
+
+def get_etf_order_type(now=None):
+    """Alias for required_order_type()."""
+    return required_order_type(now)
+
+
+# Older constant names
+MarketPeriod = MarketSession
+ORDER_TYPE_MARKET = "market"
+ORDER_TYPE_LIMIT = "limit"

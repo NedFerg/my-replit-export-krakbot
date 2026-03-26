@@ -636,8 +636,6 @@ class LiveBroker(SimulatedBroker):
         # Map internal asset names → Kraken ticker symbols used for the
         # public /0/public/Ticker price-feed batch request.
         # Crypto spot pairs use Kraken's X-prefixed legacy names.
-        # ETHD (2× Short ETH ETP) and SETH (1× Short ETH ETP) are available
-        # on Kraken's ETP/stock trading platform and use plain USD pairs.
         self.kraken_pairs = {
             "BTC":  "XBTUSD",
             "ETH":  "ETHUSD",
@@ -666,8 +664,7 @@ class LiveBroker(SimulatedBroker):
         }
 
         # Kraken balance-dict keys for each tracked asset
-        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names;
-        # ETP tickers ETHD/SETH use their plain ticker as the balance key)
+        # (Kraken prefixes some with X; LINK/HBAR/AVAX/SOL use bare names)
         self.kraken_balance_keys = {
             "BTC":  "XXBT",
             "ETH":  "XETH",
@@ -677,8 +674,6 @@ class LiveBroker(SimulatedBroker):
             "HBAR": "HBAR",
             "XRP":  "XXRP",
             "XLM":  "XXLM",
-            "ETHD": "ETHD",
-            "SETH": "SETH",
         }
 
         # --- ETF hedging layer -------------------------------------------
@@ -1056,8 +1051,7 @@ class LiveBroker(SimulatedBroker):
             # ---- Log every fetched price so the feed is fully auditable ----
             price_line = "  ".join(
                 f"{a}=${result[a]:,.2f}"
-                for a in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM",
-                           "ETHD", "SETH"]
+                for a in ["BTC", "ETH", "SOL", "XRP", "HBAR", "LINK", "XLM", "AVAX"]
                 if a in result
             )
             print(f"[PRICE FEED] {price_line}")
