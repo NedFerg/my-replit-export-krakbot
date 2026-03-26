@@ -546,6 +546,11 @@ class LiveBroker(SimulatedBroker):
 
     ENABLE_FUTURES: bool = False
 
+    # ETP pairs that are only available on Kraken's public Ticker endpoint
+    # during US market hours (Mon–Fri, including pre/after-market sessions).
+    # Outside those hours they return EQuery:Unknown asset pair.
+    _ETP_ASSETS: frozenset = frozenset({"ETHU", "SLON", "XXRP", "ETHD", "SETH"})
+
     def __init__(self, *args, dry_run=True, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -1010,8 +1015,18 @@ class LiveBroker(SimulatedBroker):
                      float(os.getenv("XLM_PRICE_MAX",  "5"))),
         }
 
+        # ETP pairs (ETHU, SLON, XXRP, ETHD, SETH) are only listed on Kraken's
+        # public Ticker endpoint during US market hours (Mon–Fri 09:30–16:30 ET,
+        # plus pre/after-market).  Requesting them outside those hours returns
+        # EQuery:Unknown asset pair.  Core crypto pairs are available 24/7.
+        if self._market_hours.etf_trading_allowed():
+            active_pairs = self.kraken_pairs
+        else:
+            active_pairs = {k: v for k, v in self.kraken_pairs.items()
+                            if k not in self._ETP_ASSETS}
+
         # Build comma-separated pair string once
-        pairs_str = ",".join(self.kraken_pairs.values())
+        pairs_str = ",".join(active_pairs.values())
         data = self._kraken_public("/0/public/Ticker", {"pair": pairs_str})
 
         if not data or "result" not in data:
@@ -1069,7 +1084,7 @@ class LiveBroker(SimulatedBroker):
                     f"real spot USD prices:\n  " + "\n  ".join(bad)
                 )
 
-            missing = [a for a in self.kraken_pairs if a not in result]
+            missing = [a for a in active_pairs if a not in result]
             if missing:
                 print(f"[PRICE FEED] Missing prices for: {missing}")
 
