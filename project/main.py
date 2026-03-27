@@ -249,9 +249,11 @@ def run_live():
             "[MAIN] Commands: 'S' + Enter = paper summary  |  'P' = phase status  |  Ctrl-C = stop"
         )
 
-        SUMMARY_INTERVAL_SEC = 900   # 15 minutes
-        _last_summary_ts     = time.time()
-        _tick                = 0
+        SUMMARY_INTERVAL_SEC      = 900    # 15 minutes
+        BALANCE_SYNC_INTERVAL_SEC = 7200   # 2 hours
+        _last_summary_ts          = time.time()
+        _last_balance_sync_ts     = time.time()
+        _tick                     = 0
 
         import queue, threading
 
@@ -314,6 +316,21 @@ def run_live():
                         broker.print_summary()
                     bull_bear_trader.print_status()
                     _last_summary_ts = _now
+
+                # Auto balance re-sync every 2 hours (live mode only — paper
+                # tracks its own synthetic cash and does not need this)
+                if not isinstance(broker, PaperBroker) and _now - _last_balance_sync_ts >= BALANCE_SYNC_INTERVAL_SEC:
+                    _ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                    try:
+                        _refreshed = broker.fetch_live_balances()
+                        if _refreshed is not None:
+                            _usd = float(_refreshed.get("ZUSD", 0.0))
+                            print(f"[MAIN] [{_ts}] Balance re-sync: USD available = ${_usd:,.2f}")
+                        else:
+                            print(f"[MAIN] [{_ts}] Balance re-sync failed — Kraken API unavailable, keeping previous balance")
+                    except Exception as _e:
+                        print(f"[MAIN] [{_ts}] Balance re-sync error: {_e} — continuing")
+                    _last_balance_sync_ts = _now
 
                 # Fetch live prices from Kraken public API
                 broker.fetch_live_prices()
