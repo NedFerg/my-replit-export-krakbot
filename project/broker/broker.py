@@ -3297,8 +3297,10 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
     _stdin_thread = threading.Thread(target=_stdin_reader, daemon=True, name="stdin-reader")
     _stdin_thread.start()
 
-    SUMMARY_INTERVAL_SEC = 900   # 15 minutes
-    _last_summary_ts     = time.time()
+    SUMMARY_INTERVAL_SEC      = 900    # 15 minutes
+    BALANCE_SYNC_INTERVAL_SEC = 7200   # 2 hours
+    _last_summary_ts          = time.time()
+    _last_balance_sync_ts     = time.time()
 
     def _print_summary_if_paper():
         if isinstance(broker, PaperBroker):
@@ -3344,6 +3346,22 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
                 print("[MAIN LOOP] 15-minute auto-summary:")
                 _print_summary_if_paper()
                 _last_summary_ts = _now
+
+            # -------------------------------------------------------
+            # Auto balance re-sync every 2 hours (live mode only)
+            # -------------------------------------------------------
+            if not isinstance(broker, PaperBroker) and _now - _last_balance_sync_ts >= BALANCE_SYNC_INTERVAL_SEC:
+                _ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                try:
+                    _refreshed = broker.fetch_live_balances()
+                    if _refreshed is not None:
+                        _usd = float(_refreshed.get("ZUSD", 0.0))
+                        print(f"[MAIN LOOP] [{_ts}] Balance re-sync: USD available = ${_usd:,.2f}")
+                    else:
+                        print(f"[MAIN LOOP] [{_ts}] Balance re-sync failed — Kraken API unavailable, keeping previous balance")
+                except Exception as _e:
+                    print(f"[MAIN LOOP] [{_ts}] Balance re-sync error: {_e} — continuing")
+                _last_balance_sync_ts = _now
 
             # Strategy step
             try:
