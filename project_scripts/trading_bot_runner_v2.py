@@ -176,6 +176,8 @@ class TradingBotRunnerV2:
         # Asset map
         # ----------------------------------------------------------------
         self.asset_map = {
+            "XXBT":  {"name": "BTC",  "pair": "XXBTZUSD"},
+            "XETH":  {"name": "ETH",  "pair": "XETHZUSD"},
             "XXRP":  {"name": "XRP",  "pair": "XXRPZUSD"},
             "XXLM":  {"name": "XLM",  "pair": "XXLMZUSD"},
             "SOL":   {"name": "SOL",  "pair": "SOLUSD"},

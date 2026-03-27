@@ -135,3 +135,34 @@ ENABLE_SHORT_ETF_TRADING=false \
 
 See `.env.example` for the full list of environment variables with example
 configurations for every capital level from $1 to $50 000+.
+
+---
+
+## ⚠️ Kraken Trading Pairs — Use Exact Canonical Symbols
+
+Kraken requires **exact canonical pair codes** for its API. Common short aliases
+such as `BTCUSD`, `ETHUSD`, `XRPUSD`, or `XLMUSD` are **not accepted** and will
+produce `[KRAKEN PUBLIC ERROR] ['EQuery:Unknown asset pair']` errors in live mode.
+
+**Always use the official Kraken symbols listed below:**
+
+| Coin | Correct Kraken Symbol | ❌ Do NOT use |
+|------|----------------------|--------------|
+| BTC/USD | `XXBTZUSD` | BTCUSD, XBTUSD |
+| ETH/USD | `XETHZUSD` | ETHUSD |
+| SOL/USD | `SOLUSD`   | — |
+| XRP/USD | `XXRPZUSD` | XRPUSD |
+| XLM/USD | `XXLMZUSD` | XLMUSD |
+| AVAX/USD | `AVAXUSD` | — |
+| HBAR/USD | `HBARUSD` | — |
+| LINK/USD | `LINKUSD`  | — |
+
+In `.env` (or when overriding via the shell):
+
+```bash
+TRADING_PAIRS=XXBTZUSD,XETHZUSD,SOLUSD,XXRPZUSD,XXLMZUSD,AVAXUSD,HBARUSD,LINKUSD
+```
+
+Copying `.env.example` already sets this correctly. If you have an existing `.env`
+from before this fix, update the `TRADING_PAIRS` line to match the list above.
+
