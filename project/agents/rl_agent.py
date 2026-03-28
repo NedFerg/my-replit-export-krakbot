@@ -1019,6 +1019,31 @@ class ReinforcementLearningTrader(TraderAgent):
         else:
             remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
+        # ----------------------------------------------------------------
+        # ETF-FIRST priority allocation (must happen BEFORE spot orders)
+        # ----------------------------------------------------------------
+        # Reserve up to 30 % of available cash for a single leveraged ETF
+        # trade so the ETF layer is never starved by spot-crypto spending.
+        # The regime is inferred from the agent's target exposures:
+        #   net_exposure > 0  → bullish   (expansion, phase 1 → ETHU long)
+        #   net_exposure <= 0 → cautious  (accumulation, phase 0 → small ETHU)
+        if hasattr(self.broker, "run_etf_priority_allocation"):
+            _net_exposure    = sum(self.target_exposures.values()) if self.target_exposures else 0.0
+            _cycle_phase     = 1 if _net_exposure > 0 else 0
+            _inferred_regime = {"cycle_phase": _cycle_phase}
+            _etf_allocated   = self.broker.run_etf_priority_allocation(
+                available_cash = remaining_usd,
+                regime         = _inferred_regime,
+            )
+            # Deduct ETF allocation from cash budget so spot orders use only
+            # the remaining ~70 % (or less).
+            if _etf_allocated > 0:
+                remaining_usd = max(0.0, remaining_usd - _etf_allocated)
+                print(
+                    f"  [ETF PRIORITY] ${_etf_allocated:.2f} reserved for ETF; "
+                    f"${remaining_usd:.2f} remaining for spot crypto"
+                )
+
         # Sync spot positions from broker/live balances.
         # In paper mode read paper_positions (coin qty keyed by asset name);
         # in live mode fall back to the live_balances snapshot.
