@@ -106,6 +106,17 @@ DEFAULT_MAX_ETF_ALLOCATION = float(os.getenv("MAX_ETF_ALLOCATION", "0.30"))
 # Minimum notional USD per order — skip dust trades
 MIN_ORDER_USD = float(os.getenv("ETF_MIN_ORDER_USD", "5.0"))
 
+# Minimum USD threshold for priority ETF allocation (30% of available cash
+# must exceed this value before attempting an ETF order).  Configurable via
+# ETF_MIN_ALLOCATION_USD env var; default $20 avoids rejected min-notional
+# orders and prevents stalling on trivially small accounts.
+ETF_MIN_ALLOCATION_USD = float(os.getenv("ETF_MIN_ALLOCATION_USD", "20.0"))
+
+# Timeout (seconds) after which a pending/unfilled ETF priority order is
+# considered stale and the lock is cleared so spot trading can proceed.
+# Default 30 minutes (1800 s); configurable via ETF_ORDER_TIMEOUT_SEC.
+ETF_ORDER_TIMEOUT_SEC = int(os.getenv("ETF_ORDER_TIMEOUT_SEC", "1800"))
+
 # Limit order tolerance: how far from mid the limit price is placed.
 # 0.1 % matches the spot limit_order_tolerance default in broker.py.
 DEFAULT_LIMIT_TOLERANCE = float(os.getenv("ETF_LIMIT_TOLERANCE", "0.001"))

@@ -9,7 +9,12 @@ import requests
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 from utils.market_hours import MarketHours, MarketSession
-from broker.etf_hedging import ETFHedger, ETF_ASSETS, select_priority_etf, MIN_ORDER_USD as _ETF_MIN_ORDER_USD
+from broker.etf_hedging import (
+    ETFHedger, ETF_ASSETS, select_priority_etf,
+    MIN_ORDER_USD as _ETF_MIN_ORDER_USD,
+    ETF_MIN_ALLOCATION_USD as _ETF_MIN_ALLOCATION_USD,
+    ETF_ORDER_TIMEOUT_SEC as _ETF_ORDER_TIMEOUT_SEC,
+)
 
 from utils.constants import (
     is_etf_tradeable,
@@ -804,6 +809,15 @@ class LiveBroker(SimulatedBroker):
         # ETF hedging/amplification layer — handles regime logic, order
         # sizing, market-hours awareness, and the 30% portfolio cap.
         self.etf_layer = ETFHedgingLayer()
+
+        # --- ETF priority-order pending state --------------------------------
+        # Used by run_etf_priority_allocation() to track whether an ETF order
+        # has been submitted but not yet confirmed as filled.  If the order
+        # remains pending beyond ETF_ORDER_TIMEOUT_SEC the lock is cleared and
+        # spot trading is allowed to resume so the loop never stalls.
+        self._etf_priority_pending    = False   # True while an unconfirmed ETF order exists
+        self._etf_priority_placed_at  = 0.0    # Unix timestamp of the last submitted order
+        self._etf_priority_asset      = None   # ticker of the pending ETF order
 
         # --- Automatic safety limits (first-night harness) ---------------
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
@@ -2696,6 +2710,40 @@ class LiveBroker(SimulatedBroker):
         if not getattr(self, "_market_hours", None):
             return 0.0
 
+        # --- Timeout recovery: clear stale pending ETF order lock --------
+        # If a prior ETF order was submitted but not confirmed as filled
+        # within ETF_ORDER_TIMEOUT_SEC, release the lock so the trading
+        # loop is never permanently stalled by a rejected/unfilled order.
+        if getattr(self, "_etf_priority_pending", False):
+            elapsed = time.time() - getattr(self, "_etf_priority_placed_at", 0.0)
+            if elapsed >= _ETF_ORDER_TIMEOUT_SEC:
+                pending_asset = getattr(self, "_etf_priority_asset", "unknown")
+                print(
+                    f"[ETF PRIORITY] RECOVERY — pending {pending_asset} order"
+                    f" unfilled for {elapsed/60:.1f} min"
+                    f" (timeout={_ETF_ORDER_TIMEOUT_SEC/60:.0f} min)."
+                    f" Clearing lock; spot allocation may proceed."
+                )
+                self._etf_priority_pending   = False
+                self._etf_priority_placed_at = 0.0
+                self._etf_priority_asset     = None
+            else:
+                print(
+                    f"[ETF PRIORITY] Order pending for"
+                    f" {getattr(self, '_etf_priority_asset', 'unknown')}"
+                    f" ({elapsed/60:.1f}/{_ETF_ORDER_TIMEOUT_SEC/60:.0f} min)"
+                    f" — skipping new ETF order until filled or timed out"
+                )
+                return 0.0
+
+        # --- Regime override: skip when market signal is neutral ----------
+        if regime.get("is_neutral", False):
+            print(
+                "[ETF PRIORITY] Neutral market regime — no directional signal;"
+                " skipping ETF allocation"
+            )
+            return 0.0
+
         # --- Select the best single ETF for current conditions -----------
         asset, target_frac = select_priority_etf(regime)
 
@@ -2722,9 +2770,23 @@ class LiveBroker(SimulatedBroker):
             )
             return 0.0
 
+        # Minimum allocation threshold: 30% of available cash must exceed
+        # ETF_MIN_ALLOCATION_USD (default $20) to avoid min-notional
+        # rejections and dust trades that stall the loop.
+        if allocation_usd < _ETF_MIN_ALLOCATION_USD:
+            print(
+                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f}"
+                f" (30% of ${available_cash:.2f}) is below the"
+                f" ${_ETF_MIN_ALLOCATION_USD:.2f} minimum threshold"
+                f" — skipping ETF allocation"
+            )
+            return 0.0
+
+        # Fallback dust guard (catches very small target fractions)
         if allocation_usd < _ETF_MIN_ORDER_USD:
             print(
-                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f} below minimum — skipping"
+                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f} below"
+                f" ${_ETF_MIN_ORDER_USD:.2f} dust threshold — skipping"
             )
             return 0.0
 
@@ -2745,11 +2807,15 @@ class LiveBroker(SimulatedBroker):
 
         # --- Safety gate (allowlist, rate limiter, caps) -----------------
         if not self._pre_trade_safety(asset, price, allocation_usd):
+            print(
+                f"[ETF PRIORITY] Pre-trade safety check failed for {asset}"
+                f" — skipping ETF allocation"
+            )
             return 0.0
 
         # --- Log the selection -------------------------------------------
         print(
-            f"[ETF PRIORITY] Selected ETF : {asset}"
+            f"[ETF PRIORITY] Attempting ETF order: {asset}"
             f"  session={session}"
             f"  order_type={order_type}"
             f"  allocation=${allocation_usd:.2f} ({target_frac:.1%} of ${available_cash:.2f})"
@@ -2786,6 +2852,10 @@ class LiveBroker(SimulatedBroker):
             }
 
         if payload is None:
+            print(
+                f"[ETF PRIORITY] Failed to build order payload for {asset}"
+                f" — skipping ETF allocation"
+            )
             return 0.0
 
         if self.dry_run:
@@ -2794,12 +2864,22 @@ class LiveBroker(SimulatedBroker):
                 f"  notional=${allocation_usd:.2f}  payload={payload}"
             )
         else:
-            self._submit_spot_order(payload)
+            result = self._submit_spot_order(payload)
+            if result is None:
+                print(
+                    f"[ETF PRIORITY] Order submission failed for {asset}"
+                    f"  notional=${allocation_usd:.2f}"
+                    f"  — skipping position update; spot allocation may proceed"
+                )
+                return 0.0
 
-        # Update internal ETF position tracking
+        # Update internal ETF position tracking and mark order as pending
         self.etf_positions[asset] = self.etf_positions.get(asset, 0.0) + coin_units
+        self._etf_priority_pending   = True
+        self._etf_priority_placed_at = time.time()
+        self._etf_priority_asset     = asset
         print(
-            f"  [ETF PRIORITY] BUY {coin_units:.6f} {asset}"
+            f"  [ETF PRIORITY] SUCCESS — BUY {coin_units:.6f} {asset}"
             f"  notional=${allocation_usd:.2f}"
             f"  order_type={order_type}"
             f"  pos_after={self.etf_positions[asset]:.6f}"
