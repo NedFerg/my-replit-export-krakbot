@@ -23,6 +23,7 @@ except ImportError:
 
 from agents.trader_agent import TraderAgent
 from agents.ma_strategy import MAStrategy
+from broker.etf_hedging import etf_regime_direction as _etf_regime_direction
 
 
 # ---------------------------------------------------------------------------
@@ -1020,29 +1021,56 @@ class ReinforcementLearningTrader(TraderAgent):
             remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
         # ----------------------------------------------------------------
+        # ETF regime — computed once, shared by both the priority
+        # allocation block below and the overlay call at the end.
+        # ----------------------------------------------------------------
+        _net_exposure = (
+            sum(self.target_exposures.values())
+            if self.target_exposures else 0.0
+        )
+        # Combine momentum-derived signals with the RL exposure signal.
+        _etf_base_regime = self._build_etf_regime(live_prices)
+        _etf_cycle_phase = 1 if _net_exposure > 0 else 0
+        _etf_base_regime["cycle_phase"] = _etf_cycle_phase
+        _etf_base_regime["is_neutral"]  = (
+            _etf_regime_direction(_etf_base_regime) == "neutral"
+        )
+
+        # ----------------------------------------------------------------
         # ETF-FIRST priority allocation (must happen BEFORE spot orders)
         # ----------------------------------------------------------------
         # Reserve up to 30 % of available cash for a single leveraged ETF
         # trade so the ETF layer is never starved by spot-crypto spending.
-        # The regime is inferred from the agent's target exposures:
-        #   net_exposure > 0  → bullish   (expansion, phase 1 → ETHU long)
-        #   net_exposure <= 0 → cautious  (accumulation, phase 0 → small ETHU)
+        #
+        # Regime detection:
+        #   net_exposure > 0  → bullish  (cycle_phase=1 → ETHU long)
+        #   net_exposure < 0  → cautious (cycle_phase=0 → small ETHU)
+        #   net_exposure ≈ 0  → neutral  → skip ETF allocation entirely
+        #     (holding existing ETF positions maximises profit by avoiding
+        #      the round-trip fee cost of closing and re-entering later)
         if hasattr(self.broker, "run_etf_priority_allocation"):
-            _net_exposure    = sum(self.target_exposures.values()) if self.target_exposures else 0.0
-            _cycle_phase     = 1 if _net_exposure > 0 else 0
-            _inferred_regime = {"cycle_phase": _cycle_phase}
-            _etf_allocated   = self.broker.run_etf_priority_allocation(
-                available_cash = remaining_usd,
-                regime         = _inferred_regime,
-            )
-            # Deduct ETF allocation from cash budget so spot orders use only
-            # the remaining ~70 % (or less).
-            if _etf_allocated > 0:
-                remaining_usd = max(0.0, remaining_usd - _etf_allocated)
+            if _etf_base_regime["is_neutral"]:
                 print(
-                    f"  [ETF PRIORITY] ${_etf_allocated:.2f} reserved for ETF; "
-                    f"${remaining_usd:.2f} remaining for spot crypto"
+                    f"[ETF PRIORITY] Neutral market regime"
+                    f"  (net_exposure={_net_exposure:+.4f}"
+                    f"  macro={_etf_base_regime.get('macro_regime', 0.0):+.1f}"
+                    f"  conf={_etf_base_regime.get('bullish_confidence', 0.0):.3f})"
+                    f"  — no directional signal; skipping ETF allocation"
+                    f"  (existing positions held to maximise profit)"
                 )
+            else:
+                _etf_allocated = self.broker.run_etf_priority_allocation(
+                    available_cash = remaining_usd,
+                    regime         = _etf_base_regime,
+                )
+                # Deduct ETF allocation from cash budget so spot orders use
+                # only the remaining ~70 % (or less).
+                if _etf_allocated > 0:
+                    remaining_usd = max(0.0, remaining_usd - _etf_allocated)
+                    print(
+                        f"  [ETF PRIORITY] ${_etf_allocated:.2f} reserved for ETF;"
+                        f" ${remaining_usd:.2f} remaining for spot crypto"
+                    )
 
         # Sync spot positions from broker/live balances.
         # In paper mode read paper_positions (coin qty keyed by asset name);
@@ -1171,9 +1199,10 @@ class ReinforcementLearningTrader(TraderAgent):
         # ETF hedging overlay (replaces futures for US users)
         # Always runs after spot crypto orders; gated by MarketHours inside
         # run_etf_overlay() so no additional check is needed here.
+        # Reuse the same regime dict computed above (no second build needed).
         # ----------------------------------------------------------------
         if hasattr(self.broker, "run_etf_overlay"):
-            self.broker.run_etf_overlay(self, live_prices)
+            self.broker.run_etf_overlay(self, live_prices, regime=_etf_base_regime)
 
     # ------------------------------------------------------------------
     # Order entry

@@ -9,7 +9,13 @@ import requests
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 from utils.market_hours import MarketHours, MarketSession
-from broker.etf_hedging import ETFHedger, ETF_ASSETS, select_priority_etf, MIN_ORDER_USD as _ETF_MIN_ORDER_USD
+from broker.etf_hedging import (
+    ETFHedger, ETF_ASSETS, select_priority_etf,
+    MIN_ORDER_USD as _ETF_MIN_ORDER_USD,
+    ETF_MIN_ALLOCATION_USD as _ETF_MIN_ALLOCATION_USD,
+    ETF_ORDER_TIMEOUT_SEC as _ETF_ORDER_TIMEOUT_SEC,
+    etf_regime_direction as _etf_regime_direction,
+)
 
 from utils.constants import (
     is_etf_tradeable,
@@ -25,6 +31,12 @@ from broker.etf_hedging import (
     ETF_KRAKEN_PAIRS,
     ETFMode,
 )
+
+# Minimum gain multiple (× round-trip fee) required before an ETF position
+# is closed or rotated in run_etf_overlay().  At 2.5× the taker round-trip
+# a regime wiggle must show at least 2 % benefit on a 0.40 % fee tier
+# account before we pay to rotate.  Configurable via ETF_FEE_HURDLE_FACTOR.
+_ETF_FEE_HURDLE_FACTOR = float(os.getenv("ETF_FEE_HURDLE_FACTOR", "2.5"))
 
 
 # ===========================================================================
@@ -804,6 +816,20 @@ class LiveBroker(SimulatedBroker):
         # ETF hedging/amplification layer — handles regime logic, order
         # sizing, market-hours awareness, and the 30% portfolio cap.
         self.etf_layer = ETFHedgingLayer()
+
+        # --- ETF priority-order pending state --------------------------------
+        # Used by run_etf_priority_allocation() to track whether an ETF order
+        # has been submitted but not yet confirmed as filled.  If the order
+        # remains pending beyond ETF_ORDER_TIMEOUT_SEC the lock is cleared and
+        # spot trading is allowed to resume so the loop never stalls.
+        self._etf_priority_pending    = False   # True while an unconfirmed ETF order exists
+        self._etf_priority_placed_at  = 0.0    # Unix timestamp of the last submitted order
+        self._etf_priority_asset      = None   # ticker of the pending ETF order
+
+        # Tracks the most recent *confirmed* ETF regime direction so the
+        # overlay can distinguish a neutral drift (hold existing positions
+        # for profit maximisation) from a true reversal (rotate positions).
+        self._prev_etf_regime_dir     = "neutral"  # "bull" | "bear" | "neutral"
 
         # --- Automatic safety limits (first-night harness) ---------------
         self.max_notional_per_asset = 50.0    # USD cap per single asset trade
@@ -2531,6 +2557,12 @@ class LiveBroker(SimulatedBroker):
         • Combined |ETHD| + |SETH| allocation ≤ 30 % of total equity.
         • ETF positions are stored in self.etf_positions (separate from
           self.spot_positions so the 24/7 crypto layer is unaffected).
+        • Profit-maximising exit gate on sell orders:
+            – Neutral regime  → hold existing positions (no forced exit).
+              Closing and re-entering later would incur two sets of fees
+              with no directional benefit.
+            – Clear reversal  → only rotate if expected gain ≥ 2.5×
+              round-trip fee, preventing churn on minor regime fluctuations.
 
         Parameters
         ----------
@@ -2539,7 +2571,9 @@ class LiveBroker(SimulatedBroker):
         prices : dict {asset: float} — live prices for all tracked assets
         regime : optional dict with keys:
                    cycle_phase (int 0-3), vol_scaler (float),
-                   panic_risk  (int 0-2), top_risk   (int 0-2)
+                   panic_risk  (int 0-2), top_risk   (int 0-2),
+                   macro_regime (float), bullish_confidence (float),
+                   bearish_drift (bool), is_neutral (bool)
                  If None, a neutral regime is assumed.
         """
         if not self.check_health():
@@ -2584,13 +2618,102 @@ class LiveBroker(SimulatedBroker):
             etf_positions = self.etf_positions,
         )
 
+        # Profit-maximising exit gate
+        # ----------------------------
+        # Primary goal is to maximise overall return, so positions are only
+        # closed or rotated when the expected gain clearly outweighs the
+        # round-trip transaction cost.  Holding through an ambiguous neutral
+        # signal avoids unnecessary fee drag and protects unrealised gains.
+        #
+        # Rules (applied per order, sells only):
+        #   1. Neutral signal  → HOLD.  No new ETF buys AND no forced exits.
+        #      The existing position is retained as-is; re-entry costs would
+        #      exceed the marginal benefit of a short-lived neutral rebalance.
+        #   2. Clear reversal  → allowed IF gain ≥ _ETF_FEE_HURDLE_FACTOR × round-trip.
+        #      This prevents rotation on tiny regime wiggles that do not
+        #      justify the fee drag (2 × taker fee per round-trip).
+        #   3. New buys are always allowed when the current direction is
+        #      directional (bull or bear) and capacity exists under the 30 % cap.
+        _curr_dir  = _etf_regime_direction(regime)
+        _prev_dir  = getattr(self, "_prev_etf_regime_dir", "neutral")
+        _taker_fee = getattr(self, "taker_fee", 0.004)
+
+        if not orders:
+            print(
+                f"[ETF OVERLAY] No rebalance orders needed"
+                f"  regime_dir={_curr_dir}  (was {_prev_dir})"
+            )
+            # Update direction even when no orders are needed so that the
+            # tracked direction stays current for the next cycle.
+            if _curr_dir != "neutral":
+                self._prev_etf_regime_dir = _curr_dir
+            return
+
         for order in orders:
-            asset   = order["asset"]
-            side    = order["side"]
-            units   = order["units"]
+            asset    = order["asset"]
+            side     = order["side"]
+            units    = order["units"]
             notional = order["notional"]
 
+            # ---- Profit-maximising exit gate (sell orders only) ----------
+            if side == "sell":
+                if _curr_dir == "neutral":
+                    # Signal is indeterminate — retain the position.
+                    # Closing now and re-entering later costs two sets of
+                    # fees with no directional advantage.
+                    current_usd = (
+                        self.etf_positions.get(asset, 0.0)
+                        * etf_prices.get(asset, 0.0)
+                    )
+                    print(
+                        f"  [ETF OVERLAY] HOLD {asset}"
+                        f"  position=${current_usd:.2f}"
+                        f"  — signal is neutral (was {_prev_dir})"
+                        f"  — retaining position to maximise profit; no forced exit"
+                    )
+                    continue
+
+                # Signal is directional — apply fee hurdle before rotating.
+                round_trip_cost = notional * 2.0 * _taker_fee
+                fee_hurdle      = round_trip_cost * _ETF_FEE_HURDLE_FACTOR
+                if notional < fee_hurdle:
+                    current_usd = (
+                        self.etf_positions.get(asset, 0.0)
+                        * etf_prices.get(asset, 0.0)
+                    )
+                    print(
+                        f"  [ETF OVERLAY] HOLD {asset}"
+                        f"  position=${current_usd:.2f}"
+                        f"  — exit gain ${notional:.2f} < fee hurdle ${fee_hurdle:.2f}"
+                        f"  ({_ETF_FEE_HURDLE_FACTOR}× round-trip=${round_trip_cost:.2f})"
+                        f"  — holding to maximise profit"
+                    )
+                    continue
+
+                # Fee hurdle cleared — log the exit/rotation event.
+                # A true reversal means _prev_dir was directional AND opposite
+                # to the current direction (bull→bear or bear→bull).
+                is_reversal = (_prev_dir != "neutral" and _prev_dir != _curr_dir)
+                if is_reversal:
+                    print(
+                        f"  [ETF OVERLAY] REGIME ROTATION {_prev_dir}→{_curr_dir}"
+                        f"  — closing {asset}"
+                        f"  notional=${notional:.2f}"
+                        f"  fee_hurdle=${fee_hurdle:.2f} cleared"
+                    )
+                else:
+                    print(
+                        f"  [ETF OVERLAY] EXIT {asset}"
+                        f"  notional=${notional:.2f}"
+                        f"  regime={_curr_dir} (was {_prev_dir})"
+                    )
+            # ---- End exit gate -------------------------------------------
+
             if not self._pre_trade_safety(asset, etf_prices.get(asset, 0.0), notional):
+                print(
+                    f"  [ETF OVERLAY] Pre-trade safety blocked {side.upper()} {asset}"
+                    f"  notional=${notional:.2f}"
+                )
                 continue
 
             payload = self._build_spot_order(
@@ -2600,13 +2723,24 @@ class LiveBroker(SimulatedBroker):
                 side       = side,
             )
             if payload is None:
+                print(
+                    f"  [ETF OVERLAY] Failed to build order for {side.upper()} {asset}"
+                    f"  notional=${notional:.2f}"
+                )
                 continue
 
             if self.dry_run:
                 print(f"  [ETF DRY-RUN] {side.upper()} {units:.6f} {asset}"
                       f"  notional=${notional:.2f}  payload={payload}")
             else:
-                self._submit_spot_order(payload)
+                result = self._submit_spot_order(payload)
+                if result is None:
+                    print(
+                        f"  [ETF OVERLAY] Order submission failed:"
+                        f" {side.upper()} {units:.6f} {asset}"
+                        f"  notional=${notional:.2f}"
+                    )
+                    continue
 
             # Update internal ETF position tracking
             if side == "buy":
@@ -2626,6 +2760,11 @@ class LiveBroker(SimulatedBroker):
                 f"  notional=${notional:.2f}"
                 f"  pos_after={self.etf_positions[asset]:.6f}"
             )
+
+        # Persist regime direction only when signal is directional so that a
+        # transient neutral period does not erase a prior confirmed direction.
+        if _curr_dir != "neutral":
+            self._prev_etf_regime_dir = _curr_dir
 
     # ------------------------------------------------------------------
     # ETF-first priority allocation on new funds
@@ -2696,6 +2835,40 @@ class LiveBroker(SimulatedBroker):
         if not getattr(self, "_market_hours", None):
             return 0.0
 
+        # --- Timeout recovery: clear stale pending ETF order lock --------
+        # If a prior ETF order was submitted but not confirmed as filled
+        # within ETF_ORDER_TIMEOUT_SEC, release the lock so the trading
+        # loop is never permanently stalled by a rejected/unfilled order.
+        if getattr(self, "_etf_priority_pending", False):
+            elapsed = time.time() - getattr(self, "_etf_priority_placed_at", 0.0)
+            if elapsed >= _ETF_ORDER_TIMEOUT_SEC:
+                pending_asset = getattr(self, "_etf_priority_asset", "unknown")
+                print(
+                    f"[ETF PRIORITY] RECOVERY — pending {pending_asset} order"
+                    f" unfilled for {elapsed/60:.1f} min"
+                    f" (timeout={_ETF_ORDER_TIMEOUT_SEC/60:.0f} min)."
+                    f" Clearing lock; spot allocation may proceed."
+                )
+                self._etf_priority_pending   = False
+                self._etf_priority_placed_at = 0.0
+                self._etf_priority_asset     = None
+            else:
+                print(
+                    f"[ETF PRIORITY] Order pending for"
+                    f" {getattr(self, '_etf_priority_asset', 'unknown')}"
+                    f" ({elapsed/60:.1f}/{_ETF_ORDER_TIMEOUT_SEC/60:.0f} min)"
+                    f" — skipping new ETF order until filled or timed out"
+                )
+                return 0.0
+
+        # --- Regime override: skip when market signal is neutral ----------
+        if regime.get("is_neutral", False):
+            print(
+                "[ETF PRIORITY] Neutral market regime — no directional signal;"
+                " skipping ETF allocation"
+            )
+            return 0.0
+
         # --- Select the best single ETF for current conditions -----------
         asset, target_frac = select_priority_etf(regime)
 
@@ -2722,9 +2895,23 @@ class LiveBroker(SimulatedBroker):
             )
             return 0.0
 
+        # Minimum allocation threshold: 30% of available cash must exceed
+        # ETF_MIN_ALLOCATION_USD (default $20) to avoid min-notional
+        # rejections and dust trades that stall the loop.
+        if allocation_usd < _ETF_MIN_ALLOCATION_USD:
+            print(
+                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f}"
+                f" (30% of ${available_cash:.2f}) is below the"
+                f" ${_ETF_MIN_ALLOCATION_USD:.2f} minimum threshold"
+                f" — skipping ETF allocation"
+            )
+            return 0.0
+
+        # Fallback dust guard (catches very small target fractions)
         if allocation_usd < _ETF_MIN_ORDER_USD:
             print(
-                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f} below minimum — skipping"
+                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f} below"
+                f" ${_ETF_MIN_ORDER_USD:.2f} dust threshold — skipping"
             )
             return 0.0
 
@@ -2745,11 +2932,15 @@ class LiveBroker(SimulatedBroker):
 
         # --- Safety gate (allowlist, rate limiter, caps) -----------------
         if not self._pre_trade_safety(asset, price, allocation_usd):
+            print(
+                f"[ETF PRIORITY] Pre-trade safety check failed for {asset}"
+                f" — skipping ETF allocation"
+            )
             return 0.0
 
         # --- Log the selection -------------------------------------------
         print(
-            f"[ETF PRIORITY] Selected ETF : {asset}"
+            f"[ETF PRIORITY] Attempting ETF order: {asset}"
             f"  session={session}"
             f"  order_type={order_type}"
             f"  allocation=${allocation_usd:.2f} ({target_frac:.1%} of ${available_cash:.2f})"
@@ -2786,6 +2977,10 @@ class LiveBroker(SimulatedBroker):
             }
 
         if payload is None:
+            print(
+                f"[ETF PRIORITY] Failed to build order payload for {asset}"
+                f" — skipping ETF allocation"
+            )
             return 0.0
 
         if self.dry_run:
@@ -2794,12 +2989,22 @@ class LiveBroker(SimulatedBroker):
                 f"  notional=${allocation_usd:.2f}  payload={payload}"
             )
         else:
-            self._submit_spot_order(payload)
+            result = self._submit_spot_order(payload)
+            if result is None:
+                print(
+                    f"[ETF PRIORITY] Order submission failed for {asset}"
+                    f"  notional=${allocation_usd:.2f}"
+                    f"  — skipping position update; spot allocation may proceed"
+                )
+                return 0.0
 
-        # Update internal ETF position tracking
+        # Update internal ETF position tracking and mark order as pending
         self.etf_positions[asset] = self.etf_positions.get(asset, 0.0) + coin_units
+        self._etf_priority_pending   = True
+        self._etf_priority_placed_at = time.time()
+        self._etf_priority_asset     = asset
         print(
-            f"  [ETF PRIORITY] BUY {coin_units:.6f} {asset}"
+            f"  [ETF PRIORITY] SUCCESS — BUY {coin_units:.6f} {asset}"
             f"  notional=${allocation_usd:.2f}"
             f"  order_type={order_type}"
             f"  pos_after={self.etf_positions[asset]:.6f}"

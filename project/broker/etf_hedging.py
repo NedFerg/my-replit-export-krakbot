@@ -106,9 +106,67 @@ DEFAULT_MAX_ETF_ALLOCATION = float(os.getenv("MAX_ETF_ALLOCATION", "0.30"))
 # Minimum notional USD per order — skip dust trades
 MIN_ORDER_USD = float(os.getenv("ETF_MIN_ORDER_USD", "5.0"))
 
+# Minimum USD threshold for priority ETF allocation (30% of available cash
+# must exceed this value before attempting an ETF order).  Configurable via
+# ETF_MIN_ALLOCATION_USD env var; default $20 avoids rejected min-notional
+# orders and prevents stalling on trivially small accounts.
+ETF_MIN_ALLOCATION_USD = float(os.getenv("ETF_MIN_ALLOCATION_USD", "20.0"))
+
+# Timeout (seconds) after which a pending/unfilled ETF priority order is
+# considered stale and the lock is cleared so spot trading can proceed.
+# Default 30 minutes (1800 s); configurable via ETF_ORDER_TIMEOUT_SEC.
+ETF_ORDER_TIMEOUT_SEC = int(os.getenv("ETF_ORDER_TIMEOUT_SEC", "1800"))
+
 # Limit order tolerance: how far from mid the limit price is placed.
 # 0.1 % matches the spot limit_order_tolerance default in broker.py.
 DEFAULT_LIMIT_TOLERANCE = float(os.getenv("ETF_LIMIT_TOLERANCE", "0.001"))
+
+
+# ---------------------------------------------------------------------------
+# Regime direction classifier
+# ---------------------------------------------------------------------------
+
+def etf_regime_direction(regime: dict) -> str:
+    """
+    Classify the current market regime as 'bull', 'bear', or 'neutral'.
+
+    Used by the ETF overlay to distinguish between:
+      • A **clear reversal** (bull→bear or bear→bull) — where exiting an
+        existing position and rotating to the opposite ETF is justified if
+        the expected gain clears the round-trip fee hurdle.
+      • A **neutral / indeterminate signal** — where the regime has not
+        yet committed to a new direction.  In this case existing ETF
+        positions are held rather than closed, because closing and
+        re-entering later incurs two sets of fees and risks missing the
+        recovery move (profit-maximizing hold).
+
+    Inputs (all optional — missing keys default to neutral):
+      panic_risk          int {0,1,2}  — 0 = calm, 1 = elevated, 2 = panic
+      macro_regime        float        — +1 = bull, 0 = neutral, -1 = bear
+      bullish_confidence  float [0,1]  — mean positive agent exposure
+      bearish_drift       bool         — True when ETH 20-bar momentum < -1 %
+      cycle_phase         int {0-3}    — 0/1 = bull phases, 2/3 = bear phases
+
+    Returns
+    -------
+    str — one of "bull", "bear", "neutral"
+    """
+    panic       = int(regime.get("panic_risk", 0))
+    macro       = float(regime.get("macro_regime", 0.0))
+    confidence  = float(regime.get("bullish_confidence", 0.0))
+    bearish     = bool(regime.get("bearish_drift", False))
+    cycle_phase = int(regime.get("cycle_phase", -1))
+
+    # Bear signals take priority (protect capital first)
+    if panic >= 1 or macro <= -0.5 or bearish:
+        return "bear"
+
+    # Bull signals: strong macro momentum OR high agent confidence OR
+    # accumulation/expansion cycle phase
+    if macro >= 0.5 or confidence >= 0.5 or cycle_phase in (0, 1):
+        return "bull"
+
+    return "neutral"
 
 
 # ---------------------------------------------------------------------------
