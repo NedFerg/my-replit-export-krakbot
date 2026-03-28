@@ -1058,6 +1058,18 @@ class ReinforcementLearningTrader(TraderAgent):
                     f"  — no directional signal; skipping ETF allocation"
                     f"  (existing positions held to maximise profit)"
                 )
+                # Log the skip as a valid strategy event (not an error or trade)
+                # so JSONL analytics and RL summaries can count it distinctly from
+                # risk blocks.  The event_type field distinguishes all categories.
+                self.log_trade({
+                    "event_type":     "etf_skip_neutral_regime",
+                    "status":         "strategy_skip",
+                    "net_exposure":   round(_net_exposure, 6),
+                    "macro_regime":   _etf_base_regime.get("macro_regime", 0.0),
+                    "bullish_conf":   _etf_base_regime.get("bullish_confidence", 0.0),
+                    "is_neutral":     True,
+                    "timestamp":      time.time(),
+                })
             else:
                 _etf_allocated = self.broker.run_etf_priority_allocation(
                     available_cash = remaining_usd,
