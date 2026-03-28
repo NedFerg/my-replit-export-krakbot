@@ -123,6 +123,53 @@ DEFAULT_LIMIT_TOLERANCE = float(os.getenv("ETF_LIMIT_TOLERANCE", "0.001"))
 
 
 # ---------------------------------------------------------------------------
+# Regime direction classifier
+# ---------------------------------------------------------------------------
+
+def etf_regime_direction(regime: dict) -> str:
+    """
+    Classify the current market regime as 'bull', 'bear', or 'neutral'.
+
+    Used by the ETF overlay to distinguish between:
+      • A **clear reversal** (bull→bear or bear→bull) — where exiting an
+        existing position and rotating to the opposite ETF is justified if
+        the expected gain clears the round-trip fee hurdle.
+      • A **neutral / indeterminate signal** — where the regime has not
+        yet committed to a new direction.  In this case existing ETF
+        positions are held rather than closed, because closing and
+        re-entering later incurs two sets of fees and risks missing the
+        recovery move (profit-maximizing hold).
+
+    Inputs (all optional — missing keys default to neutral):
+      panic_risk          int {0,1,2}  — 0 = calm, 1 = elevated, 2 = panic
+      macro_regime        float        — +1 = bull, 0 = neutral, -1 = bear
+      bullish_confidence  float [0,1]  — mean positive agent exposure
+      bearish_drift       bool         — True when ETH 20-bar momentum < -1 %
+      cycle_phase         int {0-3}    — 0/1 = bull phases, 2/3 = bear phases
+
+    Returns
+    -------
+    str — one of "bull", "bear", "neutral"
+    """
+    panic       = int(regime.get("panic_risk", 0))
+    macro       = float(regime.get("macro_regime", 0.0))
+    confidence  = float(regime.get("bullish_confidence", 0.0))
+    bearish     = bool(regime.get("bearish_drift", False))
+    cycle_phase = int(regime.get("cycle_phase", -1))
+
+    # Bear signals take priority (protect capital first)
+    if panic >= 1 or macro <= -0.5 or bearish:
+        return "bear"
+
+    # Bull signals: strong macro momentum OR high agent confidence OR
+    # accumulation/expansion cycle phase
+    if macro >= 0.5 or confidence >= 0.5 or cycle_phase in (0, 1):
+        return "bull"
+
+    return "neutral"
+
+
+# ---------------------------------------------------------------------------
 # Regime → target-exposure mapping
 # ---------------------------------------------------------------------------
 
