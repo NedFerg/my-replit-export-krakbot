@@ -832,8 +832,29 @@ class LiveBroker(SimulatedBroker):
         self._prev_etf_regime_dir     = "neutral"  # "bull" | "bear" | "neutral"
 
         # --- Automatic safety limits (first-night harness) ---------------
-        self.max_notional_per_asset = 50.0    # USD cap per single asset trade
-        self.max_total_notional     = 200.0   # USD cap across all open positions
+        # These defaults are deliberately conservative for a brand-new session.
+        # They are auto-scaled to a fraction of account equity once the real
+        # balance is known (see _sync_safety_caps_to_equity()), so small accounts
+        # stay safe while larger accounts are never wrongly blocked.
+        #
+        # Tuning note
+        # -----------
+        # MAX_NOTIONAL_PCT          (default 0.35) — per-order cap as % of equity
+        # MAX_TOTAL_NOTIONAL_PCT    (default 2.0)  — total open notional multiple
+        # MAX_NOTIONAL_PER_ASSET_USD / MAX_TOTAL_NOTIONAL_USD — hard USD overrides;
+        #   when either is set its auto-scaling is disabled so operators can enforce
+        #   a strict fixed position size regardless of account growth.  Caps whose
+        #   env var is NOT set continue to be auto-scaled independently.
+        _env_per_asset   = os.getenv("MAX_NOTIONAL_PER_ASSET_USD")
+        _env_total       = os.getenv("MAX_TOTAL_NOTIONAL_USD")
+        self.max_notional_per_asset  = float(_env_per_asset) if _env_per_asset else 50.0
+        self.max_total_notional      = float(_env_total)     if _env_total     else 200.0
+        self._max_notional_pct       = float(os.getenv("MAX_NOTIONAL_PCT",       "0.35"))
+        self._max_total_notional_pct = float(os.getenv("MAX_TOTAL_NOTIONAL_PCT", "2.0"))
+        # Independent fixed flags — each cap is only locked when its own env var is set.
+        self._per_asset_cap_fixed    = bool(_env_per_asset)
+        self._total_cap_fixed        = bool(_env_total)
+
         self.max_trades_per_hour    = 50      # 5-min cooldown × 4 orders/round = 48 max/hr
 
         # Daily loss cap expressed as a fraction of starting equity.
@@ -1302,6 +1323,13 @@ class LiveBroker(SimulatedBroker):
             if float(pos) != 0 and not positions:
                 print(f"[MISMATCH WARNING] Internal futures pos for {asset}={pos:.4f} "
                       f"but Kraken shows no open positions")
+
+        # Scale safety caps to real account equity now that live_balances is populated.
+        # This ensures ETF and spot orders are not wrongly blocked by the conservative
+        # first-night defaults ($50 per asset) on accounts where the real equity is
+        # meaningfully larger.  live_prices may still be empty here, so the cap is
+        # computed from ZUSD alone — a conservative but never-incorrect lower bound.
+        self._sync_safety_caps_to_equity()
 
         return balances, positions
 
@@ -1843,6 +1871,58 @@ class LiveBroker(SimulatedBroker):
             equity += abs(qty) * price   # abs: short-ETFs are held long on Kraken
         return equity
 
+    def _sync_safety_caps_to_equity(self) -> None:
+        """
+        Scale per-asset and total notional caps to current account equity.
+
+        Called after sync_live_account_state() successfully fetches a real
+        balance, and again when _starting_equity is anchored on the first
+        live-trade cycle.  This prevents the conservative first-night defaults
+        ($50 per asset, $200 total) from blocking legitimate ETF or spot orders
+        on accounts larger than ~$166 USD.
+
+        Each cap is scaled independently.  If an operator sets the corresponding
+        env var (MAX_NOTIONAL_PER_ASSET_USD / MAX_TOTAL_NOTIONAL_USD) only that
+        cap is kept fixed; the other continues to auto-scale with equity.
+
+        Tuning parameters
+        -----------------
+        MAX_NOTIONAL_PCT          (env, default 0.35) — per-order cap as % of equity.
+                                  Raise toward 0.5 for larger single trades; lower
+                                  toward 0.10 for very conservative per-trade sizing.
+        MAX_TOTAL_NOTIONAL_PCT    (env, default 2.0)  — maximum total open notional
+                                  as a multiple of equity.  2.0× allows full spot +
+                                  ETF overlay without triggering the portfolio cap.
+        """
+        equity = self.compute_total_equity()
+        if equity <= 0:
+            return
+
+        old_per_asset = self.max_notional_per_asset
+        old_total     = self.max_total_notional
+        changed       = False
+
+        if not self._per_asset_cap_fixed:
+            self.max_notional_per_asset = equity * self._max_notional_pct
+            if abs(self.max_notional_per_asset - old_per_asset) > 0.50:
+                changed = True
+
+        if not self._total_cap_fixed:
+            self.max_total_notional = equity * self._max_total_notional_pct
+            if abs(self.max_total_notional - old_total) > 1.0:
+                changed = True
+
+        if changed:
+            print(
+                f"[LiveBroker] Safety caps scaled to equity ${equity:.2f}: "
+                f"per_asset=${self.max_notional_per_asset:.2f} "
+                f"({self._max_notional_pct:.0%}"
+                + (" [fixed]" if self._per_asset_cap_fixed else "") + "), "
+                f"total=${self.max_total_notional:.2f} "
+                f"({self._max_total_notional_pct:.0%}"
+                + (" [fixed]" if self._total_cap_fixed else "") + ")"
+            )
+
     def _check_daily_loss(self) -> bool:
         """
         Compare current total portfolio value to the session-start value.
@@ -1863,6 +1943,8 @@ class LiveBroker(SimulatedBroker):
                 print(f"[LOSS CAP] Starting equity anchored at ${equity:.2f}  "
                       f"→ daily loss cap = ${self._max_daily_loss_usd:.2f} "
                       f"({self.max_daily_loss_pct:.0%})")
+                # Scale notional caps to real account size now that equity is known.
+                self._sync_safety_caps_to_equity()
             return True
 
         if equity <= 0:

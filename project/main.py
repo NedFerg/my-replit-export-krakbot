@@ -135,18 +135,28 @@ def print_risk_summary(risk_manager):
     rejected = summary["rejected_per_agent"]
     locked = summary["drawdown_locked"]
     gks = summary["global_kill_switch"]
+    etf_skips = summary.get("etf_skips_per_agent", {})
+    strategy_holds = summary.get("strategy_holds_per_agent", {})
 
+    # ---- Risk violations (blocks, locks, kill-switch) ----
     total_blocked = sum(rejected.values())
     if total_blocked == 0 and not locked and not gks:
         print("  [Risk] No limits hit this episode.")
-        return
+    else:
+        parts = [f"{name}={n}" for name, n in rejected.items() if n > 0]
+        print(f"  [Risk] Orders blocked: {', '.join(parts) if parts else 'none'}")
+        if locked:
+            print(f"  [Risk] Drawdown-locked: {', '.join(locked)}")
+        if gks:
+            print("  [Risk] *** GLOBAL KILL-SWITCH triggered ***")
 
-    parts = [f"{name}={n}" for name, n in rejected.items() if n > 0]
-    print(f"  [Risk] Orders blocked: {', '.join(parts) if parts else 'none'}")
-    if locked:
-        print(f"  [Risk] Drawdown-locked: {', '.join(locked)}")
-    if gks:
-        print("  [Risk] *** GLOBAL KILL-SWITCH triggered ***")
+    # ---- Valid strategy events (not risk violations) ----
+    if etf_skips:
+        parts = [f"{name}={n}" for name, n in etf_skips.items()]
+        print(f"  [Strategy] ETF skips (neutral/threshold/timeout): {', '.join(parts)}")
+    if strategy_holds:
+        parts = [f"{name}={n}" for name, n in strategy_holds.items()]
+        print(f"  [Strategy] Position holds (fee-hurdle/neutral):   {', '.join(parts)}")
 
 
 # ---------------------------------------------------------------------------
