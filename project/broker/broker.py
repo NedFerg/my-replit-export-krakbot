@@ -9,7 +9,7 @@ import requests
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
 from utils.market_hours import MarketHours, MarketSession
-from broker.etf_hedging import ETFHedger, ETF_ASSETS
+from broker.etf_hedging import ETFHedger, ETF_ASSETS, select_priority_etf, MIN_ORDER_USD as _ETF_MIN_ORDER_USD
 
 from utils.constants import (
     is_etf_tradeable,
@@ -742,6 +742,7 @@ class LiveBroker(SimulatedBroker):
             # ETF hedging instruments (spot-traded, Kraken Spot)
             "ETHD": "ETHD",      # ETF ticker symbol (USD-denominated, no suffix needed)
             "SETH": "SETH",      # ETF ticker symbol (USD-denominated, no suffix needed)
+            "ETHU": "ETHUUSD",   # ETH 2× Long ETP (Kraken Spot pair)
         }
 
         # Kraken Futures perpetual contract symbols (PF_ = linear / USD-settled).
@@ -2626,6 +2627,186 @@ class LiveBroker(SimulatedBroker):
                 f"  pos_after={self.etf_positions[asset]:.6f}"
             )
 
+    # ------------------------------------------------------------------
+    # ETF-first priority allocation on new funds
+    # ------------------------------------------------------------------
+
+    def run_etf_priority_allocation(
+        self,
+        available_cash: float,
+        regime: dict | None = None,
+    ) -> float:
+        """
+        ETF-first priority deployment of new or available cash.
+
+        Called BEFORE any spot crypto orders so that up to 30 % of the
+        available cash is reserved for a single leveraged ETF trade.  This
+        guarantees ETF exposure is always established first, regardless of
+        how aggressively the spot-trading layer would otherwise consume cash.
+
+        Behaviour
+        ---------
+        • OPEN market (Mon–Fri 09:30–16:00 ET):
+              Submit an immediate MARKET ORDER for the chosen ETF.
+        • CLOSED / pre-market / after-hours:
+              Submit a QUEUED LIMIT ORDER (resting at slightly above mid-price)
+              that will fill when the US equity market opens next.
+        • ETF selection: the regime-optimal single ETF is chosen via
+          select_priority_etf().  Long ETFs (ETHU) are chosen in bull
+          regimes; short ETFs (SETH) in bear / panic regimes.
+        • Combined ETF allocation is never allowed to exceed the 30 % cap
+          (max_etf_allocation).  If the cap is already breached, this
+          method returns 0.0 immediately.
+        • All existing safety checks (_pre_trade_safety, kill-switch, daily
+          loss cap) are respected — they are the same checks used by
+          run_etf_overlay().
+
+        Parameters
+        ----------
+        available_cash : float
+            USD cash available for trading (e.g. current ZUSD balance).
+        regime : dict, optional
+            Market regime snapshot with keys cycle_phase, panic_risk,
+            top_risk, vol_scaler.  If None a neutral bullish regime is
+            assumed (cycle_phase=1 → ETHU).
+
+        Returns
+        -------
+        float
+            USD notional actually allocated to the ETF order.  Callers
+            should subtract this from their remaining cash budget before
+            placing any spot crypto orders.
+        """
+        if not self.check_health():
+            return 0.0
+
+        if not self._check_daily_loss():
+            return 0.0
+
+        if available_cash <= 0:
+            return 0.0
+
+        regime = regime or {}
+
+        # Guard: etf_hedger must be initialised (it always is in LiveBroker.__init__)
+        if not getattr(self, "etf_hedger", None):
+            return 0.0
+
+        # Guard: market-hours helper must be available
+        if not getattr(self, "_market_hours", None):
+            return 0.0
+
+        # --- Select the best single ETF for current conditions -----------
+        asset, target_frac = select_priority_etf(regime)
+
+        # Cap at max_etf_allocation (default 30%)
+        target_frac = min(target_frac, self.etf_hedger.max_etf_allocation)
+
+        # --- Determine order type based on market session ----------------
+        session    = self._market_hours.get_session()
+        is_regular = (session == MarketSession.REGULAR)
+        order_type = "market" if is_regular else "limit"
+
+        # --- Compute notional --------------------------------------------
+        allocation_usd = target_frac * available_cash
+
+        # Enforce 30% portfolio cap against existing ETF positions
+        equity = self.compute_total_equity()
+        if equity > 0 and self.etf_hedger.cap_breached(
+            equity, self.etf_positions,
+            {a: self.live_prices.get(a, 0.0) for a in ETF_ASSETS},
+        ):
+            print(
+                f"[ETF PRIORITY] 30% cap already breached — skipping "
+                f"priority allocation for {asset}"
+            )
+            return 0.0
+
+        if allocation_usd < _ETF_MIN_ORDER_USD:
+            print(
+                f"[ETF PRIORITY] Allocation ${allocation_usd:.2f} below minimum — skipping"
+            )
+            return 0.0
+
+        # --- Fetch ETF price -------------------------------------------
+        price = self.live_prices.get(asset, 0.0)
+        if price <= 0:
+            # During closed hours ETF prices are not in live_prices.
+            # We cannot size the order without a price — skip silently.
+            print(
+                f"[ETF PRIORITY] No price for {asset} (market may be closed) "
+                f"— skipping priority allocation"
+            )
+            return 0.0
+
+        coin_units = allocation_usd / price
+        if coin_units <= 0:
+            return 0.0
+
+        # --- Safety gate (allowlist, rate limiter, caps) -----------------
+        if not self._pre_trade_safety(asset, price, allocation_usd):
+            return 0.0
+
+        # --- Log the selection -------------------------------------------
+        print(
+            f"[ETF PRIORITY] Selected ETF : {asset}"
+            f"  session={session}"
+            f"  order_type={order_type}"
+            f"  allocation=${allocation_usd:.2f} ({target_frac:.1%} of ${available_cash:.2f})"
+            f"  price=${price:.4f}"
+            f"  units={coin_units:.6f}"
+        )
+
+        # --- Build and submit the order ----------------------------------
+        if order_type == "market":
+            payload = self._build_spot_order(
+                asset      = asset,
+                price      = price,
+                coin_units = coin_units,
+                side       = "buy",
+            )
+        else:
+            # Limit order for queued/next-open execution
+            tol         = self.limit_order_tolerance
+            limit_price = price * (1.0 + tol)
+            pair        = self.kraken_pairs.get(asset, asset)
+            price_str   = _format_order_price(pair, limit_price)
+            volume_str  = _format_order_volume(pair, coin_units)
+            print(
+                f"[ETF PRIORITY] QUEUED LIMIT ORDER — BUY {asset} ({pair})"
+                f"  price={price_str}  volume={volume_str}"
+                f"  (resting order for next market open)"
+            )
+            payload = {
+                "pair":      pair,
+                "type":      "buy",
+                "ordertype": "limit",
+                "price":     price_str,
+                "volume":    volume_str,
+            }
+
+        if payload is None:
+            return 0.0
+
+        if self.dry_run:
+            print(
+                f"  [ETF PRIORITY DRY-RUN] BUY {coin_units:.6f} {asset}"
+                f"  notional=${allocation_usd:.2f}  payload={payload}"
+            )
+        else:
+            self._submit_spot_order(payload)
+
+        # Update internal ETF position tracking
+        self.etf_positions[asset] = self.etf_positions.get(asset, 0.0) + coin_units
+        print(
+            f"  [ETF PRIORITY] BUY {coin_units:.6f} {asset}"
+            f"  notional=${allocation_usd:.2f}"
+            f"  order_type={order_type}"
+            f"  pos_after={self.etf_positions[asset]:.6f}"
+        )
+
+        return allocation_usd
+
 
 
 # ---------------------------------------------------------------------------
@@ -3319,6 +3500,9 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
     print(f"[MAIN LOOP] Initial positions: {positions}")
     print("[MAIN LOOP] Type 'S' + Enter in the console to print a performance summary.")
 
+    # Track USD balance so we can detect fresh cash deposits
+    _known_usd = float(balances.get("ZUSD", 0.0))
+
     try:
         while True:
             # Hard stop if kill switch is active
@@ -3357,6 +3541,26 @@ def run_live_trading_loop(broker, agent, loop_sleep: float = 1.0):
                     if _refreshed is not None:
                         _usd = float(_refreshed.get("ZUSD", 0.0))
                         print(f"[MAIN LOOP] [{_ts}] Balance re-sync: USD available = ${_usd:,.2f}")
+
+                        # Detect fresh cash (deposit since last sync)
+                        _FRESH_CASH_THRESHOLD = 1.0   # $1 minimum to avoid float noise
+                        if _usd > _known_usd + _FRESH_CASH_THRESHOLD:
+                            _fresh = _usd - _known_usd
+                            print(
+                                f"[MAIN LOOP] [{_ts}] Fresh cash detected: +${_fresh:.2f} "
+                                f"(${_known_usd:.2f} → ${_usd:.2f})"
+                            )
+                            if hasattr(broker, "run_etf_priority_allocation"):
+                                print(
+                                    f"[MAIN LOOP] [{_ts}] Triggering ETF priority allocation "
+                                    f"on fresh cash: ${_usd:.2f}"
+                                )
+                                broker.run_etf_priority_allocation(
+                                    available_cash = _usd,
+                                    regime         = {},
+                                )
+
+                        _known_usd = _usd
                     else:
                         print(f"[MAIN LOOP] [{_ts}] Balance re-sync failed — Kraken API unavailable, keeping previous balance")
                 except Exception as _e:

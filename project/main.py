@@ -255,6 +255,33 @@ def run_live():
         _last_balance_sync_ts     = time.time()
         _tick                     = 0
 
+        # Track USD balance across re-syncs so fresh cash deposits are detected
+        _known_usd = float(balances.get("ZUSD", 0.0))
+
+        # ETF-first priority allocation on startup (if cash is available and
+        # the regime can be inferred from the bull_bear_trader's current phase)
+        if hasattr(broker, "run_etf_priority_allocation") and _known_usd > 0:
+            _startup_regime = {"cycle_phase": 1}  # neutral default (expansion/bull)
+            try:
+                _phase_map = {
+                    "accumulation":   {"cycle_phase": 0},
+                    "bull_alt_season":{"cycle_phase": 1},
+                    "alt_cascade":    {"cycle_phase": 2},
+                    "bear_market":    {"cycle_phase": 3},
+                }
+                _startup_regime = _phase_map.get(
+                    getattr(bull_bear_trader, "phase", "bull_alt_season"),
+                    {"cycle_phase": 1},
+                )
+            except Exception:
+                pass
+            _ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+            print(f"[MAIN] [{_ts}] Startup ETF priority allocation: cash=${_known_usd:.2f}  regime={_startup_regime}")
+            broker.run_etf_priority_allocation(
+                available_cash = _known_usd,
+                regime         = _startup_regime,
+            )
+
         import queue, threading
 
         _cmd_queue: queue.Queue = queue.Queue()
@@ -326,6 +353,37 @@ def run_live():
                         if _refreshed is not None:
                             _usd = float(_refreshed.get("ZUSD", 0.0))
                             print(f"[MAIN] [{_ts}] Balance re-sync: USD available = ${_usd:,.2f}")
+
+                            # Detect fresh cash (deposit since last sync)
+                            _FRESH_CASH_THRESHOLD = 1.0   # $1 minimum to avoid floating-point noise
+                            if _usd > _known_usd + _FRESH_CASH_THRESHOLD:
+                                _fresh = _usd - _known_usd
+                                print(
+                                    f"[MAIN] [{_ts}] Fresh cash detected: +${_fresh:.2f} "
+                                    f"(${_known_usd:.2f} → ${_usd:.2f})"
+                                )
+                                # ETF-first priority allocation on the new funds
+                                if hasattr(broker, "run_etf_priority_allocation"):
+                                    _phase_map = {
+                                        "accumulation":   {"cycle_phase": 0},
+                                        "bull_alt_season":{"cycle_phase": 1},
+                                        "alt_cascade":    {"cycle_phase": 2},
+                                        "bear_market":    {"cycle_phase": 3},
+                                    }
+                                    _current_regime = _phase_map.get(
+                                        getattr(bull_bear_trader, "phase", "bull_alt_season"),
+                                        {"cycle_phase": 1},
+                                    )
+                                    print(
+                                        f"[MAIN] [{_ts}] Triggering ETF priority allocation "
+                                        f"on fresh cash: ${_usd:.2f}  regime={_current_regime}"
+                                    )
+                                    broker.run_etf_priority_allocation(
+                                        available_cash = _usd,
+                                        regime         = _current_regime,
+                                    )
+
+                            _known_usd = _usd
                         else:
                             print(f"[MAIN] [{_ts}] Balance re-sync failed — Kraken API unavailable, keeping previous balance")
                     except Exception as _e:

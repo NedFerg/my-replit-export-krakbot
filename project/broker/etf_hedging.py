@@ -324,6 +324,65 @@ class ETFHedger:
 
 
 # ---------------------------------------------------------------------------
+# Priority ETF selector — used by broker.run_etf_priority_allocation()
+# ---------------------------------------------------------------------------
+
+def select_priority_etf(regime: dict) -> tuple:
+    """
+    Select the single best leveraged ETF for immediate priority deployment.
+
+    This is used when fresh cash is detected (startup or deposit) to
+    immediately allocate up to 30 % of available funds to one ETF before
+    any spot crypto trading begins.
+
+    Parameters
+    ----------
+    regime : dict with optional keys: cycle_phase (int 0-3), panic_risk
+             (int 0-2), top_risk (int 0-2), vol_scaler (float).
+
+    Returns
+    -------
+    (asset, target_fraction) : str × float
+        asset            — one of ETF_ASSETS
+        target_fraction  — fraction of available cash to deploy (0–0.30)
+
+    Selection logic (highest priority first)
+    ----------------------------------------
+    Severe panic (panic_risk=2)  → SETH  30 % short  (broad crypto crash hedge)
+    Severe top   (top_risk=2)    → SETH  20 % short  (blow-off top protection)
+    Moderate panic (panic_risk=1)→ SETH  15 % short
+    Moderate top  (top_risk=1)   → SETH  15 % short
+    Cycle phase 3 (bear/reset)   → SETH  25 % short
+    Cycle phase 2 (distribution) → SETH  10 % short  (trend turning)
+    Cycle phase 0 (accumulation) → ETHU  10 % long   (early bull)
+    Cycle phase 1 (expansion)    → ETHU  20 % long   (confirmed bull)
+    Default (neutral / unknown)  → ETHU  15 % long
+    """
+    cycle_phase = int(regime.get("cycle_phase", 1))
+    panic_risk  = int(regime.get("panic_risk",  0))
+    top_risk    = int(regime.get("top_risk",    0))
+
+    # Bearish / risk-off signals take highest priority
+    if panic_risk == 2:
+        return ("SETH", 0.30)
+    if top_risk == 2:
+        return ("SETH", 0.20)
+    if panic_risk == 1:
+        return ("SETH", 0.15)
+    if top_risk == 1:
+        return ("SETH", 0.15)
+
+    # Cycle-phase base selections (no extreme risk signals)
+    phase_map = {
+        0: ("ETHU", 0.10),   # accumulation — early bull, small long
+        1: ("ETHU", 0.20),   # expansion   — confirmed bull, moderate long
+        2: ("SETH", 0.10),   # distribution — trend turning, light short
+        3: ("SETH", 0.25),   # reset/crash  — bear market, heavy short
+    }
+    return phase_map.get(cycle_phase, ("ETHU", 0.15))
+
+
+# ---------------------------------------------------------------------------
 # Alias — broker.py imports ETFHedgingLayer; ETFHedger is the implementation.
 # ---------------------------------------------------------------------------
 
