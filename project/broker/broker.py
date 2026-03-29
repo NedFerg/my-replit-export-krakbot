@@ -1,4 +1,5 @@
 import os
+import csv
 import json
 import time
 import hmac
@@ -646,6 +647,12 @@ class LiveBroker(SimulatedBroker):
 
     ENABLE_FUTURES: bool = False
 
+    # Live trade log — written alongside paper_trades.csv so every live
+    # order has the same durable CSV audit trail as paper mode.
+    LIVE_LOG_PATH: str = os.path.join(
+        os.path.dirname(__file__), "..", "logs", "live_trades.csv"
+    )
+
     # ETP pairs that are only available on Kraken's public Ticker endpoint
     # during US market hours (Mon–Fri, including pre/after-market sessions).
     # Outside those hours they return EQuery:Unknown asset pair.
@@ -875,6 +882,25 @@ class LiveBroker(SimulatedBroker):
 
         self._trade_count_window = []   # timestamps of recent trades (rolling 1 h)
         self._starting_equity    = None # total equity at first live trade of the session
+
+        # --- Live trade CSV log setup ------------------------------------
+        # Audit the log file at startup (detect git conflict markers) and
+        # open it for append-mode writing so every live order has a durable
+        # CSV record exactly like paper mode.
+        live_log_path = os.path.abspath(self.LIVE_LOG_PATH)
+        os.makedirs(os.path.dirname(live_log_path), exist_ok=True)
+        _recover_csv_conflict_markers(live_log_path)
+        # Check for header AFTER recovery: if the file was rotated away it
+        # no longer exists and we must write the header into the fresh file.
+        _live_log_needs_header = not os.path.exists(live_log_path)
+        self._live_csv_file   = open(live_log_path, "a", newline="", buffering=1)
+        self._live_csv_writer = csv.writer(self._live_csv_file)
+        if _live_log_needs_header:
+            self._live_csv_writer.writerow([
+                "timestamp", "asset", "side", "size_coins", "fill_price",
+                "notional_usd", "fee_usd",
+            ])
+            self._live_csv_file.flush()
 
     # ------------------------------------------------------------------
     # Fee tier helpers
@@ -2092,7 +2118,55 @@ class LiveBroker(SimulatedBroker):
             print(f"[EXECUTE] {side.upper()} {size:.6f} {symbol} @ {price:.4f}"
                   f"  notional=${notional:.2f}  fee≈${fee_usd:.4f}"
                   f"  pos={self.spot_positions[symbol]:+.6f}")
+            # Record this live trade in the CSV log so no trade is lost.
+            self._write_live_trade_row(symbol, side, size, price, fee_usd)
         return result
+
+    def _write_live_trade_row(
+        self, symbol: str, side: str, size: float, price: float, fee_usd: float
+    ) -> None:
+        """Append one row to the live trade CSV log.
+
+        Called after every confirmed live order.  Errors are caught and
+        reported so a log write failure never interrupts order flow.
+        If the primary log is unavailable the row is written to a fallback
+        file (<LIVE_LOG_PATH>.fallback) so no trade is permanently lost.
+        """
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        row = [ts, symbol, side, round(size, 8), round(price, 6),
+               round(size * price, 4), round(fee_usd, 6)]
+        try:
+            self._live_csv_writer.writerow(row)
+        except Exception as _exc:  # noqa: BLE001
+            print(
+                f"[LiveBroker] WARNING: failed to write live trade row "
+                f"({_exc!r}) — writing to fallback log."
+            )
+            self._write_live_trade_to_fallback(row)
+
+    def _write_live_trade_to_fallback(self, row: list) -> None:
+        """Append a live trade row to the fallback CSV when the main log fails."""
+        fallback_path = os.path.abspath(self.LIVE_LOG_PATH) + ".fallback"
+        _HEADERS = [
+            "timestamp", "asset", "side", "size_coins", "fill_price",
+            "notional_usd", "fee_usd",
+        ]
+        try:
+            needs_header = not os.path.exists(fallback_path)
+            with open(fallback_path, "a", newline="", buffering=1) as fh:
+                writer = csv.writer(fh)
+                if needs_header:
+                    writer.writerow(_HEADERS)
+                writer.writerow(row)
+            print(
+                f"\n[LiveBroker] !! FALLBACK LOG !! trade written to {fallback_path}\n"
+                f"  Merge this file into {self.LIVE_LOG_PATH} once the primary log is healthy."
+            )
+        except Exception as _fb_exc:  # noqa: BLE001
+            print(
+                f"[LiveBroker] CRITICAL: could not write to fallback log "
+                f"{fallback_path!r}: {_fb_exc!r}. Trade is only in memory."
+            )
 
     # ------------------------------------------------------------------
     # Spot order submission (live path only — dry_run must be False)
@@ -3100,52 +3174,57 @@ class LiveBroker(SimulatedBroker):
 # CSV merge-conflict recovery helper
 # ---------------------------------------------------------------------------
 
-def _recover_csv_conflict_markers(path: str) -> bool:
+def _recover_csv_conflict_markers(path: str) -> "str | None":
     """Detect and recover from git merge conflict markers in a CSV log file.
 
     If *path* contains lines beginning with the git conflict markers
-    ``<<<<<<<``, ``=======``, or ``>>>>>>>``, the file is renamed to
-    ``<path>.bak`` and the caller should start a fresh log.  A prominent
-    warning is printed to stdout so operators are alerted to the recovery.
+    ``<<<<<<<``, ``=======``, or ``>>>>>>>``, the file is renamed to a
+    timestamped backup (``<path>.bak_YYYYMMDD_HHMMSS``) and the caller
+    should start a fresh log.  A prominent warning is printed to stdout so
+    operators are alerted to the recovery.
+
+    Using a timestamp in the backup name ensures that successive conflict
+    events never overwrite each other — every corrupted snapshot is kept.
 
     This prevents the bot from crashing or silently dropping trades when a
     ``git merge`` or ``git pull`` leaves conflict markers inside a live CSV
-    log (e.g. ``paper_trades.csv``).
+    log (e.g. ``paper_trades.csv`` or ``live_trades.csv``).
 
-    Returns True if conflict markers were found (file rotated to .bak),
-    False if the file was clean or does not exist.
+    Returns the backup file path (truthy) if conflict markers were found,
+    or None (falsy) if the file was clean or does not exist.
 
     # --- Conflict-recovery behaviour for future contributors ---------------
     # If the log file grows conflict markers from a git operation while the
-    # bot is offline, this helper is called at PaperBroker startup before the
-    # file is opened for writing.  The corrupted file is preserved as .bak so
-    # no trade history is permanently lost.  Operators should inspect the .bak
-    # file and merge data manually if needed.
+    # bot is offline, this helper is called at broker startup before the
+    # file is opened for writing.  The corrupted file is preserved as a
+    # timestamped .bak so no trade history is permanently lost.  Operators
+    # should inspect the backup file and merge data manually if needed.
     # -----------------------------------------------------------------------
     """
     _CONFLICT_PREFIXES = ("<<<<<<<", "=======", ">>>>>>>")
 
     if not os.path.exists(path):
-        return False
+        return None
 
     try:
         with open(path, "r", newline="", errors="replace") as fh:
             lines = fh.readlines()
     except OSError:
-        return False
+        return None
 
     if not any(ln.lstrip().startswith(_CONFLICT_PREFIXES) for ln in lines):
-        return False  # file is clean
+        return None  # file is clean
 
-    bak_path = path + ".bak"
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    bak_path = f"{path}.bak_{timestamp}"
     warning = (
         "\n"
         + "=" * 70 + "\n"
         + "  !! WARNING: git merge conflict markers found in CSV trade log !!\n"
         + f"     Corrupted file : {path}\n"
         + f"     Backup created : {bak_path}\n"
-        + "  A fresh log will be started.  Inspect the .bak file to recover\n"
-        + "  any trade rows that may have been lost in the conflict.\n"
+        + "  A fresh log will be started.  Inspect the backup file to\n"
+        + "  recover any trade rows that may have been lost in the conflict.\n"
         + "=" * 70 + "\n"
     )
     print(warning)
@@ -3154,11 +3233,12 @@ def _recover_csv_conflict_markers(path: str) -> bool:
         os.replace(path, bak_path)
     except OSError as exc:
         print(
-            f"[PaperBroker] WARNING: could not rotate conflicted log "
+            f"[TradeLog] WARNING: could not rotate conflicted log "
             f"{path!r} to {bak_path!r}: {exc}"
         )
+        return None
 
-    return True
+    return bak_path
 
 
 # ---------------------------------------------------------------------------
@@ -3241,15 +3321,15 @@ class PaperBroker(LiveBroker):
         self._current_strategy: str = ""
 
         # --- CSV log setup ------------------------------------------------
-        import csv as _csv
         log_path = os.path.abspath(self.LOG_PATH)
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         # Recover from any git merge conflict markers before opening the file.
-        # If conflicts are found the corrupted file is rotated to <path>.bak
-        # and a fresh log is started (see _recover_csv_conflict_markers).
+        # If conflicts are found the corrupted file is rotated to a timestamped
+        # backup (e.g. paper_trades.csv.bak_20260329_202133) and a fresh log
+        # is started (see _recover_csv_conflict_markers).
         _recover_csv_conflict_markers(log_path)
         self._csv_file   = open(log_path, "w", newline="", buffering=1)
-        self._csv_writer = _csv.writer(self._csv_file)
+        self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
             "timestamp", "asset", "side", "size_coins", "fill_price",
             "notional_usd", "fee_usd", "realized_pnl_usd", "position_after_trade",
@@ -3500,7 +3580,8 @@ class PaperBroker(LiveBroker):
         # CSV row (line-buffered — buffering=1 means each row flushes immediately)
         # Wrapped in try/except so a corrupt file or unexpected I/O error
         # never interrupts trade execution — the in-memory record is
-        # already appended above and the error is surfaced as a warning.
+        # already appended above.  On failure the row is written to a
+        # fallback CSV so no trade data is permanently lost.
         try:
             self._csv_writer.writerow([
                 record["timestamp"],   record["asset"],          record["side"],
@@ -3513,6 +3594,7 @@ class PaperBroker(LiveBroker):
                 f"({_csv_exc!r}). Trade is recorded in memory; CSV log may "
                 f"be corrupt — check {self.LOG_PATH}"
             )
+            self._write_trade_to_fallback(record)
 
         # SQLite archive (optional) — non-fatal if unavailable
         if self._trade_archive is not None:
@@ -3531,6 +3613,41 @@ class PaperBroker(LiveBroker):
             f"  cash=${self.paper_cash:.2f}  equity=${self.compute_total_equity():.2f}"
         )
         return fee_usd
+
+    # ------------------------------------------------------------------
+    # Fallback trade writer — used when the main CSV log is unavailable
+    # ------------------------------------------------------------------
+
+    def _write_trade_to_fallback(self, record: dict) -> None:
+        """Append a trade record to a fallback CSV when the main log fails.
+
+        This ensures no trade is permanently lost even if the primary log
+        file becomes corrupt or unwritable.  The fallback file is written
+        alongside the main log with a ``.fallback`` suffix and can be
+        merged back into the main log once the primary is healthy again.
+        Prints a prominent notice to stdout each time a row is written.
+        """
+        fallback_path = os.path.abspath(self.LOG_PATH) + ".fallback"
+        _HEADERS = [
+            "timestamp", "asset", "side", "size_coins", "fill_price",
+            "notional_usd", "fee_usd", "realized_pnl_usd", "position_after_trade",
+        ]
+        try:
+            needs_header = not os.path.exists(fallback_path)
+            with open(fallback_path, "a", newline="", buffering=1) as fh:
+                writer = csv.writer(fh)
+                if needs_header:
+                    writer.writerow(_HEADERS)
+                writer.writerow([record[h] for h in _HEADERS])
+            print(
+                f"\n[PaperBroker] !! FALLBACK LOG !! trade written to {fallback_path}\n"
+                f"  Merge this file into {self.LOG_PATH} once the primary log is healthy."
+            )
+        except Exception as _fb_exc:  # noqa: BLE001
+            print(
+                f"[PaperBroker] CRITICAL: could not write to fallback log "
+                f"{fallback_path!r}: {_fb_exc!r}. Trade is only in memory."
+            )
 
     # ------------------------------------------------------------------
     # Execution overrides — route to _paper_fill instead of Kraken HTTP

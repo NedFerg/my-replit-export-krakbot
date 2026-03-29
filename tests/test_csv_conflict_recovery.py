@@ -1,15 +1,17 @@
 """
-Unit tests for CSV merge-conflict recovery in the PaperBroker trade log.
+Unit tests for CSV merge-conflict recovery in the broker trade log.
 
 These tests verify that _recover_csv_conflict_markers() correctly detects
 git merge conflict markers in CSV log files and rotates the corrupted file
-to a .bak backup so a fresh log can be started — without losing the ability
-to record new trades.
+to a timestamped backup (``<path>.bak_YYYYMMDD_HHMMSS``) so a fresh log
+can be started — without losing the ability to record new trades and
+without overwriting a previous backup from an earlier incident.
 
 Background
 ----------
 If a ``git merge`` or ``git pull`` runs while the bot is offline and
-paper_trades.csv is tracked by git, conflict markers like::
+paper_trades.csv (or live_trades.csv) is tracked by git, conflict markers
+like::
 
     <<<<<<< HEAD
     2026-03-21T17:10:07Z,SOL,buy,...
@@ -18,8 +20,9 @@ paper_trades.csv is tracked by git, conflict markers like::
     >>>>>>> 6b4141565ff99c0d7ac34311105de14b02f71230
 
 can be injected into the CSV.  The bot must detect these at startup,
-rotate the bad file to ``paper_trades.csv.bak``, and continue normally.
+rotate the bad file to a timestamped backup, and continue normally.
 """
+import glob
 import os
 import sys
 import tempfile
@@ -65,14 +68,14 @@ class TestRecoverCsvConflictMarkers(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_clean_file_returns_false(self):
-        """A clean CSV returns False and leaves the file unchanged."""
+        """A clean CSV returns a falsy value and leaves the file unchanged."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_file(tmp, "paper_trades.csv", CLEAN_CSV)
             result = _recover_csv_conflict_markers(path)
             self.assertFalse(result)
             self.assertTrue(os.path.exists(path), "clean file must not be renamed")
-            bak = path + ".bak"
-            self.assertFalse(os.path.exists(bak), ".bak must not be created for clean file")
+            bak_files = glob.glob(path + ".bak_*")
+            self.assertEqual(len(bak_files), 0, "no backup files must be created for clean file")
 
     # ------------------------------------------------------------------
     # Non-existent file — must not crash
@@ -88,28 +91,33 @@ class TestRecoverCsvConflictMarkers(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_conflicted_file_returns_true(self):
-        """A file with conflict markers returns True."""
+        """A file with conflict markers returns a truthy backup path."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_file(tmp, "paper_trades.csv", CONFLICTED_CSV)
             result = _recover_csv_conflict_markers(path)
             self.assertTrue(result)
 
-    def test_conflicted_file_is_rotated_to_bak(self):
-        """The conflicted file is renamed to <path>.bak."""
+    def test_conflicted_file_is_rotated_to_timestamped_bak(self):
+        """The conflicted file is renamed to a timestamped backup."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_file(tmp, "paper_trades.csv", CONFLICTED_CSV)
-            _recover_csv_conflict_markers(path)
-            bak = path + ".bak"
-            self.assertTrue(os.path.exists(bak), ".bak file must be created")
+            bak_path = _recover_csv_conflict_markers(path)
+            self.assertIsNotNone(bak_path, "backup path must be returned")
+            self.assertTrue(os.path.exists(bak_path), "timestamped .bak file must be created")
             self.assertFalse(os.path.exists(path), "original file must be removed")
+            # Backup name must contain a timestamp suffix (.bak_YYYYMMDD_HHMMSS)
+            self.assertRegex(
+                os.path.basename(bak_path),
+                r"\.bak_\d{8}_\d{6}$",
+                "backup filename must end with .bak_YYYYMMDD_HHMMSS",
+            )
 
     def test_bak_preserves_original_content(self):
-        """The .bak file contains the exact original (conflicted) content."""
+        """The backup file contains the exact original (conflicted) content."""
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_file(tmp, "paper_trades.csv", CONFLICTED_CSV)
-            _recover_csv_conflict_markers(path)
-            bak = path + ".bak"
-            with open(bak) as fh:
+            bak_path = _recover_csv_conflict_markers(path)
+            with open(bak_path) as fh:
                 content = fh.read()
             self.assertEqual(content, CONFLICTED_CSV)
 
@@ -143,7 +151,7 @@ class TestRecoverCsvConflictMarkers(unittest.TestCase):
     # To test the full PaperBroker startup recovery path end-to-end,
     # instantiate PaperBroker with a pre-corrupted LOG_PATH (override
     # the class attribute or environment variable) and verify that:
-    #   1. paper_trades.csv.bak exists after __init__
+    #   1. paper_trades.csv.bak_<timestamp> exists after __init__
     #   2. paper_trades.csv is fresh (header only)
     #   3. Subsequent _paper_fill() calls write rows correctly
     # That integration test requires mocking the Kraken HTTP layer and
