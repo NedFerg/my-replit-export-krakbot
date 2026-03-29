@@ -138,6 +138,78 @@ configurations for every capital level from $1 to $50 000+.
 
 ---
 
+## 🐂 Bull Market Mode
+
+**Bull Market Mode** is an optional configuration that relaxes risk caps and expands
+positioning limits to maximise returns during a prolonged crypto bull market.
+
+### How to enable
+
+```bash
+# Enable bull mode (takes effect on next bot start)
+export BULL_MARKET_MODE=true
+
+# Disable when the market regime changes (takes effect on next bot start)
+export BULL_MARKET_MODE=false
+```
+
+The bot logs a startup warning whenever bull mode is active:
+
+```
+[BullBearTrader] ⚠️  Bull Market Mode enabled: risk and ETF allocation limits relaxed; see README.md for details.
+```
+
+### What changes
+
+| Parameter | Standard | Bull mode | Notes |
+|-----------|----------|-----------|-------|
+| `MAX_ETF_ALLOCATION` | 30% | **50%** | ETF cap raised; set `MAX_ETF_ALLOCATION` env var to override |
+| `LEVERAGE_ETF_MAX` (per ETF) | 20% | **35%** | Larger leveraged-ETF positions |
+| `SPOT_ALT_MAX` — core alts¹ | 15% | **25%** | BTC, ETH, SOL, XRP receive higher cap |
+| `SPOT_ALT_MAX` — other alts | 15% | 15% | HBAR, LINK, XLM, AVAX unchanged |
+| `RISK_MAX_DAILY_DRAWDOWN_PCT` | 10% | **18%** | Tolerates larger intra-day swings |
+| `REINVESTMENT_PROFIT_THRESHOLD_PCT` | 25% | **10%** | Compounds capital faster |
+| RSI exit threshold | 80 | **90** | More patience before trimming winners |
+| Trailing stop (≥50% gain) | — | **20% from local high** | Strong runners not prematurely stopped |
+| Exit confirmation | topping | topping + **overbought_score ≥ 0.5** | MACD/S/R confirmation required |
+
+¹ Core conviction alts are those with the deepest liquidity and clearest bull-cycle
+macro correlation: **BTC, ETH, SOL, XRP**.
+
+### What does NOT change
+
+- All existing safety checks (kill-switch, API fallback guards, minimum notional checks)
+- Paper trading mode / simulated fills
+- The bear-market short-ETF layer (ETHD / SETH)
+- The `ENABLE_SHORT_ETF_TRADING` flag
+- Kraken canonical pair symbols
+
+### Patient exit / rotation logic in bull mode
+
+1. **Trailing stop** — For positions with an unrealised gain ≥ 50%, the bot will not
+   exit until the current price drops ≥ 20% below the highest price recorded since
+   entry.  A position that is still rising is never stopped out early.
+
+2. **Momentum confirmation** — Even when the alt-pump detector fires a "topping" signal,
+   the bot also checks whether the hedge overlay's `overbought_score` is ≥ 0.5.  This
+   score combines RSI > 90, Bollinger Band upper-band breach, and resistance-level
+   proximity — equivalent to requiring a MACD reversal or support-level loss before
+   trimming.
+
+### Fine-tuning
+
+Individual env vars always override the bull-mode defaults:
+
+```bash
+# Override only the daily drawdown cap; keep all other bull-mode defaults
+export BULL_MARKET_MODE=true
+export RISK_MAX_DAILY_DRAWDOWN_PCT=0.15   # 15% instead of 18%
+```
+
+See `.env.example` for the full parameter reference.
+
+---
+
 ## ⚠️ Kraken Trading Pairs — Use Exact Canonical Symbols
 
 Kraken requires **exact canonical pair codes** for its API. Common short aliases
