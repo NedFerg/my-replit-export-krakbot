@@ -58,8 +58,9 @@ from utils.market_hours import MarketHours, MarketSession
 
 ETF_ASSETS = ("ETHU", "SLON", "XXRP", "ETHD", "SETH")
 
-# Alias used by broker.py for ETF position initialisation.
-ALL_ETFS = ETF_ASSETS
+# Supported ETFs for the regime-based ETF overlay logic.
+# ETHU and XXRP are 2x long ETFs; ETHD and SETH are approved short (inverse) ETFs.
+ALL_ETFS = ["ETHU", "XXRP", "ETHD", "SETH"]
 
 # Default Kraken trading pairs for each ETF ticker.
 # ETFs/ETPs on Kraken use bare ticker symbols (no currency suffix).
