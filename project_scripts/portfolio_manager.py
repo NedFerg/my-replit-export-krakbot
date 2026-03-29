@@ -25,6 +25,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# ---------------------------------------------------------------------------
+# Bull Market Mode — set BULL_MARKET_MODE=true in .env to enable
+# ---------------------------------------------------------------------------
+# When enabled, two risk defaults are relaxed to maximise compounding during a
+# sustained bull market.  Individual env-var overrides still take precedence.
+#
+#   RISK_MAX_DAILY_DRAWDOWN_PCT   0.10 → 0.18  (tolerate larger intra-day swings)
+#   REINVESTMENT_PROFIT_THRESHOLD_PCT  0.25 → 0.10  (faster compounding)
+#
+# Existing safety checks (kill-switch, position caps, API guards) are unchanged.
+BULL_MARKET_MODE: bool = os.getenv("BULL_MARKET_MODE", "false").lower() in ("1", "true", "yes")
+
 # Total capital the bot is allowed to deploy (can be ANY positive amount).
 # The bot will NEVER refuse to trade because this value is "too small".
 TOTAL_TRADING_CAPITAL: float = _env_float("TOTAL_TRADING_CAPITAL", 50.0)
@@ -39,12 +51,16 @@ _RAW_MAX_NOTIONAL: float = _env_float("RISK_MAX_NOTIONAL_USD", 0.0)
 RISK_MAX_NOTIONAL_USD: float = _RAW_MAX_NOTIONAL  # 0 means "no cap"
 
 # Max daily drawdown before trading is paused for the day (e.g. 0.10 = 10%).
-RISK_MAX_DAILY_DRAWDOWN_PCT: float = _env_float("RISK_MAX_DAILY_DRAWDOWN_PCT", 0.10)
+# Bull mode raises this to 0.18 (18%) to tolerate larger intra-day swings.
+_DEFAULT_DAILY_DD: float = 0.18 if BULL_MARKET_MODE else 0.10
+RISK_MAX_DAILY_DRAWDOWN_PCT: float = _env_float("RISK_MAX_DAILY_DRAWDOWN_PCT", _DEFAULT_DAILY_DD)
 
 # Reinvest when realised profits reach this fraction of starting capital
 # (e.g. 0.25 = reinvest after every 25% profit milestone).
+# Bull mode lowers this to 0.10 (10%) for faster compounding.
+_DEFAULT_REINVEST: float = 0.10 if BULL_MARKET_MODE else 0.25
 REINVESTMENT_PROFIT_THRESHOLD_PCT: float = _env_float(
-    "REINVESTMENT_PROFIT_THRESHOLD_PCT", 0.25
+    "REINVESTMENT_PROFIT_THRESHOLD_PCT", _DEFAULT_REINVEST
 )
 
 
@@ -112,6 +128,14 @@ class PortfolioManager:
             self.max_notional,
             self.max_daily_drawdown_pct * 100,
         )
+        if BULL_MARKET_MODE:
+            logger.warning(
+                "[PortfolioManager] ⚠️  Bull Market Mode enabled: risk and ETF allocation "
+                "limits relaxed; see README.md for details. "
+                "daily_dd_limit=%.0f%% reinvestment_threshold=%.0f%%",
+                self.max_daily_drawdown_pct * 100,
+                self.reinvestment_threshold_pct * 100,
+            )
 
     # ------------------------------------------------------------------
     # Capital sizing

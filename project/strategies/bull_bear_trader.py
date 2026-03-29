@@ -143,7 +143,32 @@ BREAKOUT_CONFIDENCE_MIN: float = float(os.getenv("BREAKOUT_CONFIDENCE_MIN",   "0
 # Set this below the current market price (e.g. $65 000 when BTC is at $74 K).
 BTC_BULL_RUN_FLOOR:     float = float(os.getenv("BTC_BULL_RUN_FLOOR",        "65000"))
 
-RSI_OVERBOUGHT:  int   = 80
+# ---------------------------------------------------------------------------
+# Bull Market Mode — set BULL_MARKET_MODE=true in .env to enable
+# ---------------------------------------------------------------------------
+# When enabled the following limits are relaxed to maximise returns during a
+# sustained bull market.  All existing safety checks (kill-switch, daily loss
+# cap API guards) remain active.  See README.md for the full parameter table.
+#
+#   RSI_OVERBOUGHT            80  →  90   (patience before exiting a winner)
+#   LEVERAGE_ETF_MAX          0.20 → 0.35  (larger leveraged-ETF positions)
+#   SPOT_ALT_MAX for core alts 0.15 → 0.25  (BTC, ETH, SOL, XRP)
+#   Daily drawdown limit       10% → 18%   (set in portfolio_manager)
+#   Reinvestment threshold     25% → 10%   (faster compounding)
+#   ETF allocation cap         30% → 50%   (set in etf_hedging)
+#
+# Disable at any time by setting BULL_MARKET_MODE=false (or unsetting the var).
+BULL_MARKET_MODE: bool = os.getenv("BULL_MARKET_MODE", "false").lower() in ("1", "true", "yes")
+
+# Core conviction alts — receive a higher position cap in bull mode.
+# BTC is the macro anchor; ETH, SOL, XRP are the highest-liquidity majors.
+BULL_CORE_ALTS: frozenset = frozenset({"BTC", "ETH", "SOL", "XRP"})
+
+# Trailing-stop parameters for bull mode (applied to positions with > 50% gain)
+BULL_TRAILING_STOP_TRIGGER: float = 0.50   # engage trailing stop after 50 % gain
+BULL_TRAILING_STOP_PCT:     float = 0.20   # exit if price drops 20 % from local high
+
+RSI_OVERBOUGHT:  int   = 90 if BULL_MARKET_MODE else 80
 RSI_UNDERBOUGHT: int   = 30
 MIN_VOLUME_SPIKE: float = 1.5
 CONSOLIDATION_DAYS: int = 5
@@ -151,11 +176,13 @@ CONSOLIDATION_DAYS: int = 5
 MIN_ROTATION_GAIN: float = 0.10   # 10 % gain before considering rotation exit
 
 # Position size bounds by phase (fraction of total portfolio)
-SPOT_ALT_MIN:     float = 0.02
-SPOT_ALT_MAX:     float = 0.15
+SPOT_ALT_MIN:       float = 0.02
+SPOT_ALT_MAX:       float = 0.15
+# In bull mode, core conviction alts (BTC, ETH, SOL, XRP) receive a higher cap.
+SPOT_ALT_MAX_CORE:  float = 0.25 if BULL_MARKET_MODE else SPOT_ALT_MAX
 SPOT_ALT_ACCUM_MAX: float = 0.08   # smaller cap during accumulation (conservative)
 LEVERAGE_ETF_MIN: float = 0.10
-LEVERAGE_ETF_MAX: float = 0.20
+LEVERAGE_ETF_MAX: float = 0.35 if BULL_MARKET_MODE else 0.20
 # ---- Bear market shorts: two-tier layered short ----------------------------
 # ETHD (2× short ETH ETP) — aggressive tier: captures amplified downside.
 # SETH (1× short ETH ETP) — conservative tier: softer hedge, lower volatility.
@@ -291,7 +318,6 @@ class BullBearRotationalTrader:
             rsi_overbought=RSI_OVERBOUGHT,
             min_overbought=5,
         )
-        self.recovery_detector = RecoveryDetector(assets=KEY_ALTS)
 
         # ---- Hedge overlay detectors ------------------------------------
         # One per tracked anchor asset (BTC + ETH).
@@ -317,6 +343,8 @@ class BullBearRotationalTrader:
         self._entry_prices: dict[str, float] = {}
         # Maps asset → timestamp of entry (for duration tracking)
         self._entry_times: dict[str, float] = {}
+        # Maps asset → highest price seen since entry (for trailing stop in bull mode)
+        self._position_highs: dict[str, float] = {}
 
         # ---- Signal cache (updated each step) ---------------------------
         self.last_signals: dict[str, Any] = {}
@@ -351,6 +379,16 @@ class BullBearRotationalTrader:
             f"  ETP/ETF trades          {_etp_status}\n"
             f"  Paper mode              ALL FILLS ARE SIMULATED (no real orders)"
         )
+        if BULL_MARKET_MODE:
+            print(
+                "[BullBearTrader] ⚠️  Bull Market Mode enabled: risk and ETF allocation "
+                "limits relaxed; see README.md for details.\n"
+                f"  RSI exit threshold      : {RSI_OVERBOUGHT} (standard: 80)\n"
+                f"  Leverage ETF max        : {LEVERAGE_ETF_MAX*100:.0f}% (standard: 20%)\n"
+                f"  Core alt max (BTC/ETH/SOL/XRP): {SPOT_ALT_MAX_CORE*100:.0f}% (standard: 15%)\n"
+                f"  Trailing stop (≥50% gain): 20% from local high\n"
+                f"  Exit confirmation       : hedge overbought_score ≥ 0.5 required"
+            )
 
     # ====================================================================
     # Main entry point
@@ -406,6 +444,15 @@ class BullBearRotationalTrader:
             "alt_scores":           dict(self.alt_detector.last_scores),
             "hedge_recommendations": dict(self.hedge_recommendations),
         }
+
+        # ---- Update local highs for trailing-stop tracking (bull mode) -
+        if BULL_MARKET_MODE:
+            for asset, _pos_size in list(self.positions.items()):
+                price = prices.get(asset, 0.0)
+                if price > 0:
+                    current_high = self._position_highs.get(asset, 0.0)
+                    if price > current_high:
+                        self._position_highs[asset] = price
 
         # ---- Phase transition logic ------------------------------------
         self._evaluate_phase_transition(prices, btc_confidence, market_topping, recovering)
@@ -606,15 +653,35 @@ class BullBearRotationalTrader:
         }
         for asset, score in sorted(scores.items(), key=lambda x: -x[1]):
             if score >= 0.40:
-                size = min(self._position_size_bull(score), SPOT_ALT_ACCUM_MAX)
+                size = min(self._position_size_bull(score, asset), SPOT_ALT_ACCUM_MAX)
                 self._open_position(asset, size, prices.get(asset, 0.0))
 
     def _phase_bull_alt_season(self, prices: dict[str, float]) -> None:
         """
         Bull alt season:
-        - Hold / build spot positions in KEY_ALTS (2–15 % each)
-        - Hold / build leveraged ETF positions (ETHU, SLON, XXRP) at 10–20 %
+        - Hold / build spot positions in KEY_ALTS (2–15 %, or up to 25 % for core
+          conviction alts in bull mode: BTC, ETH, SOL, XRP)
+        - Hold / build leveraged ETF positions (ETHU, SLON, XXRP) at 10–20 % (or
+          up to 35 % per position in bull mode)
         - Rotate: exit peaked alts, enter next-best candidate
+
+        Bull Mode exit guard
+        --------------------
+        When BULL_MARKET_MODE is active two additional conditions must both be
+        satisfied before a rotation exit fires:
+
+          1. Trailing stop (for positions with > 50 % unrealised gain):
+             The position is only trimmed once the current price has fallen at
+             least BULL_TRAILING_STOP_PCT (20 %) below the local high recorded
+             since entry.  This lets strong runners continue upward without
+             being stopped out prematurely.
+
+          2. Momentum confirmation:
+             The hedge overlay's overbought_score for the underlying asset (or
+             ETH as the macro anchor) must be ≥ 0.5.  The overbought_score
+             combines RSI > 90, Bollinger Band upper breach, and resistance-
+             level proximity — acting as a MACD-reversal / support-loss
+             confirmation gate that prevents exits on noise alone.
         """
         # --- Rotation check: exit alts that have topped -----------------
         for asset in list(self.positions.keys()):
@@ -625,6 +692,14 @@ class BullBearRotationalTrader:
                 current_price = prices.get(asset, 0.0)
                 gain = (current_price - entry) / max(entry, 1e-9) if entry > 0 else 0.0
                 if gain >= MIN_ROTATION_GAIN:
+                    if BULL_MARKET_MODE and not self._bull_exit_allowed(
+                        asset, current_price, gain
+                    ):
+                        self._log(
+                            f"[BULL MODE] Holding {asset} despite topping signal "
+                            f"(gain={gain*100:.1f}%): trailing stop / confirmation not met"
+                        )
+                        continue
                     self._rotate_out(asset, prices)
 
         # --- Entry: score remaining alts and enter best candidates ------
@@ -635,7 +710,7 @@ class BullBearRotationalTrader:
         }
         for asset, score in sorted(scores.items(), key=lambda x: -x[1]):
             if score >= 0.50:   # meaningful signal threshold
-                size = self._position_size_bull(score)
+                size = self._position_size_bull(score, asset)
                 self._open_position(asset, size, prices.get(asset, 0.0))
 
         # --- Leveraged ETFs: enter if not already held -----------------------
@@ -717,13 +792,65 @@ class BullBearRotationalTrader:
     # Position sizing
     # ====================================================================
 
-    def _position_size_bull(self, score: float) -> float:
-        """Scale spot alt size with signal confidence (2 %–15 %)."""
-        return SPOT_ALT_MIN + (SPOT_ALT_MAX - SPOT_ALT_MIN) * min(score, 1.0)
+    def _position_size_bull(self, score: float, asset: str = "") -> float:
+        """Scale spot alt size with signal confidence (2 %–15 %, or up to 25 %
+        for core conviction alts when BULL_MARKET_MODE is active).
+
+        Core conviction alts (BTC, ETH, SOL, XRP) receive the higher cap because
+        they have the deepest liquidity and clearest macro correlation in a bull
+        cycle.  All other alts remain capped at the standard SPOT_ALT_MAX (15 %).
+        Tune SPOT_ALT_MAX_CORE / SPOT_ALT_MAX at the top of this file.
+        """
+        max_size = SPOT_ALT_MAX_CORE if (BULL_MARKET_MODE and asset in BULL_CORE_ALTS) else SPOT_ALT_MAX
+        return SPOT_ALT_MIN + (max_size - SPOT_ALT_MIN) * min(score, 1.0)
 
     def _position_size_bull_etf(self, score: float) -> float:
-        """Scale leveraged ETF size with underlying alt score (10 %–20 %)."""
+        """Scale leveraged ETF size with underlying alt score (10 %–20 %, or up
+        to 35 % in bull mode).  LEVERAGE_ETF_MAX is raised to 0.35 when
+        BULL_MARKET_MODE is active; see module-level constants.
+        """
         return LEVERAGE_ETF_MIN + (LEVERAGE_ETF_MAX - LEVERAGE_ETF_MIN) * min(score, 1.0)
+
+    # ====================================================================
+    # Bull mode exit helpers
+    # ====================================================================
+
+    def _bull_exit_allowed(self, asset: str, current_price: float, gain: float) -> bool:
+        """
+        Return True when a bull-mode exit is permitted for *asset*.
+
+        Two conditions must both be satisfied:
+
+        1. Trailing stop (for positions with ≥ BULL_TRAILING_STOP_TRIGGER gain):
+           If the unrealised gain since entry is ≥ 50 %, the position is only
+           allowed to exit once the current price has fallen at least
+           BULL_TRAILING_STOP_PCT (20 %) below the highest price recorded since
+           entry.  A position that is still rising is not stopped out.
+
+        2. Momentum confirmation (MACD reversal / S/R loss):
+           The hedge overlay's ``overbought_score`` for the asset (or ETH as the
+           macro anchor) must be ≥ 0.5.  This score combines RSI > RSI_OVERBOUGHT
+           (90 in bull mode), Bollinger Band upper breach, and resistance proximity,
+           providing a multi-signal confirmation equivalent to a MACD reversal or
+           support-level loss signal.
+
+        Both conditions must pass for an exit to proceed.
+        """
+        # --- Condition 1: trailing stop for strong winners ---------------
+        if gain >= BULL_TRAILING_STOP_TRIGGER:
+            local_high = self._position_highs.get(asset, current_price)
+            trailing_stop_price = local_high * (1.0 - BULL_TRAILING_STOP_PCT)
+            if current_price > trailing_stop_price:
+                return False   # still above trailing stop — hold the position
+
+        # --- Condition 2: multi-signal momentum confirmation -------------
+        # Use the hedge overlay recommendation for the asset itself if available,
+        # otherwise fall back to ETH (the primary macro anchor).
+        rec = self.hedge_recommendations.get(asset) or self.hedge_recommendations.get("ETH")
+        if rec is not None and rec.overbought_score < 0.5:
+            return False   # insufficient confirmation — hold
+
+        return True
 
     # ====================================================================
     # Hedge overlay
@@ -893,6 +1020,7 @@ class BullBearRotationalTrader:
             self.positions.pop(asset, None)
             self._entry_prices.pop(asset, None)
             self._entry_times.pop(asset, None)
+            self._position_highs.pop(asset, None)
         else:
             self.positions[asset] = new_pos
 

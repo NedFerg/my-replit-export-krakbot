@@ -99,9 +99,19 @@ class ETFOrder(NamedTuple):
     price:      float
     notional:   float
 
+# ---------------------------------------------------------------------------
+# Bull Market Mode — reads the shared BULL_MARKET_MODE env var
+# ---------------------------------------------------------------------------
+# When enabled, the ETF allocation cap is raised from the default 30% to 50%.
+# The env var MAX_ETF_ALLOCATION always takes explicit precedence over both
+# the bull-mode default and the standard default.
+_BULL_MARKET_MODE: bool = os.getenv("BULL_MARKET_MODE", "false").lower() in ("1", "true", "yes")
+
 # Default allocation cap — overridden by MAX_ETF_ALLOCATION env var or the
 # max_etf_allocation constructor parameter.
-DEFAULT_MAX_ETF_ALLOCATION = float(os.getenv("MAX_ETF_ALLOCATION", "0.30"))
+# Bull mode default: 0.50 (50%).  Standard default: 0.30 (30%).
+_DEFAULT_ETF_CAP: float = 0.50 if _BULL_MARKET_MODE else 0.30
+DEFAULT_MAX_ETF_ALLOCATION = float(os.getenv("MAX_ETF_ALLOCATION", str(_DEFAULT_ETF_CAP)))
 
 # Minimum notional USD per order — skip dust trades
 MIN_ORDER_USD = float(os.getenv("ETF_MIN_ORDER_USD", "5.0"))
@@ -249,6 +259,12 @@ class ETFHedger:
         self.max_etf_allocation = max_etf_allocation
         self.limit_tolerance    = limit_tolerance
         self._market_hours      = MarketHours()
+        if _BULL_MARKET_MODE:
+            print(
+                f"[ETFHedger] ⚠️  Bull Market Mode enabled: ETF allocation cap raised "
+                f"to {self.max_etf_allocation*100:.0f}% (standard: 30%). "
+                "See README.md for details."
+            )
 
     # ------------------------------------------------------------------
     # Public API
