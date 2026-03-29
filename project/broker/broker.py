@@ -3097,6 +3097,71 @@ class LiveBroker(SimulatedBroker):
 
 
 # ---------------------------------------------------------------------------
+# CSV merge-conflict recovery helper
+# ---------------------------------------------------------------------------
+
+def _recover_csv_conflict_markers(path: str) -> bool:
+    """Detect and recover from git merge conflict markers in a CSV log file.
+
+    If *path* contains lines beginning with the git conflict markers
+    ``<<<<<<<``, ``=======``, or ``>>>>>>>``, the file is renamed to
+    ``<path>.bak`` and the caller should start a fresh log.  A prominent
+    warning is printed to stdout so operators are alerted to the recovery.
+
+    This prevents the bot from crashing or silently dropping trades when a
+    ``git merge`` or ``git pull`` leaves conflict markers inside a live CSV
+    log (e.g. ``paper_trades.csv``).
+
+    Returns True if conflict markers were found (file rotated to .bak),
+    False if the file was clean or does not exist.
+
+    # --- Conflict-recovery behaviour for future contributors ---------------
+    # If the log file grows conflict markers from a git operation while the
+    # bot is offline, this helper is called at PaperBroker startup before the
+    # file is opened for writing.  The corrupted file is preserved as .bak so
+    # no trade history is permanently lost.  Operators should inspect the .bak
+    # file and merge data manually if needed.
+    # -----------------------------------------------------------------------
+    """
+    _CONFLICT_PREFIXES = ("<<<<<<<", "=======", ">>>>>>>")
+
+    if not os.path.exists(path):
+        return False
+
+    try:
+        with open(path, "r", newline="", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return False
+
+    if not any(ln.lstrip().startswith(_CONFLICT_PREFIXES) for ln in lines):
+        return False  # file is clean
+
+    bak_path = path + ".bak"
+    warning = (
+        "\n"
+        + "=" * 70 + "\n"
+        + "  !! WARNING: git merge conflict markers found in CSV trade log !!\n"
+        + f"     Corrupted file : {path}\n"
+        + f"     Backup created : {bak_path}\n"
+        + "  A fresh log will be started.  Inspect the .bak file to recover\n"
+        + "  any trade rows that may have been lost in the conflict.\n"
+        + "=" * 70 + "\n"
+    )
+    print(warning)
+
+    try:
+        os.replace(path, bak_path)
+    except OSError as exc:
+        print(
+            f"[PaperBroker] WARNING: could not rotate conflicted log "
+            f"{path!r} to {bak_path!r}: {exc}"
+        )
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # PaperBroker — full synthetic execution layer for Krakbot sandbox mode
 # ---------------------------------------------------------------------------
 
@@ -3179,6 +3244,10 @@ class PaperBroker(LiveBroker):
         import csv as _csv
         log_path = os.path.abspath(self.LOG_PATH)
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        # Recover from any git merge conflict markers before opening the file.
+        # If conflicts are found the corrupted file is rotated to <path>.bak
+        # and a fresh log is started (see _recover_csv_conflict_markers).
+        _recover_csv_conflict_markers(log_path)
         self._csv_file   = open(log_path, "w", newline="", buffering=1)
         self._csv_writer = _csv.writer(self._csv_file)
         self._csv_writer.writerow([
@@ -3429,11 +3498,21 @@ class PaperBroker(LiveBroker):
         self.paper_trade_history.append(record)
 
         # CSV row (line-buffered — buffering=1 means each row flushes immediately)
-        self._csv_writer.writerow([
-            record["timestamp"],   record["asset"],          record["side"],
-            record["size_coins"],  record["fill_price"],     record["notional_usd"],
-            record["fee_usd"],     record["realized_pnl_usd"], record["position_after_trade"],
-        ])
+        # Wrapped in try/except so a corrupt file or unexpected I/O error
+        # never interrupts trade execution — the in-memory record is
+        # already appended above and the error is surfaced as a warning.
+        try:
+            self._csv_writer.writerow([
+                record["timestamp"],   record["asset"],          record["side"],
+                record["size_coins"],  record["fill_price"],     record["notional_usd"],
+                record["fee_usd"],     record["realized_pnl_usd"], record["position_after_trade"],
+            ])
+        except Exception as _csv_exc:  # noqa: BLE001
+            print(
+                f"[PaperBroker] WARNING: failed to write CSV trade row "
+                f"({_csv_exc!r}). Trade is recorded in memory; CSV log may "
+                f"be corrupt — check {self.LOG_PATH}"
+            )
 
         # SQLite archive (optional) — non-fatal if unavailable
         if self._trade_archive is not None:
