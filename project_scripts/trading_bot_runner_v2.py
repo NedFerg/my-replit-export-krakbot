@@ -38,6 +38,7 @@ from project.utils.market_hours import MarketHours, MarketSession
 from project_scripts.trading_bot_live import KrakenAPI
 from project_scripts.trading_bot_live_v2 import EnhancedTradeBot
 from project_scripts.portfolio_manager import PortfolioManager
+from project.broker.etf_hedging import ALL_ETFS, LONG_ETFS, SHORT_ETFS
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -314,6 +315,11 @@ class TradingBotRunnerV2:
                 feed_data = self.feed.fetch_all_pairs(interval=60)
                 capital_per_trade = self.portfolio.capital_per_trade()
                 etf_short_now = self._etf_short_allowed()
+                mkt_line = _market_hours.status_line()
+
+                # ETF attempt tracking — reset each cycle, populated below
+                # Keys: ETF ticker from ALL_ETFS; values: (status_tag, reason_str)
+                _etf_cycle_status: dict[str, tuple[str, str]] = {}
 
                 logger.info("")
                 logger.info("[SIGNAL ANALYSIS] capital_per_trade=$%.2f", capital_per_trade)
@@ -372,11 +378,28 @@ class TradingBotRunnerV2:
                         # Optionally rotate into SETH/ETHD if market hours allow
                         if is_bearish and etf_short_now:
                             self._rotate_to_etf_short(asset_name, capital_per_trade)
+                            # Record short-ETF attempt for the status report
+                            for _etf in ("ETHD", "SETH"):
+                                _prev = _etf_cycle_status.get(_etf)
+                                _entry = (
+                                    "ATTEMPTED",
+                                    f"bear signal from {asset_name}"
+                                    f" — ETF short rotation triggered",
+                                )
+                                if _prev is None or _prev[0] != "ATTEMPTED":
+                                    _etf_cycle_status[_etf] = _entry
                         elif is_bearish and ENABLE_SHORT_ETF_TRADING and not etf_short_now:
                             logger.info(
                                 "  [%s] Bear signal — ETF rotation deferred (outside market hours)",
                                 asset_name,
                             )
+                            for _etf in ("ETHD", "SETH"):
+                                if _etf not in _etf_cycle_status:
+                                    _etf_cycle_status[_etf] = (
+                                        "DEFERRED",
+                                        f"bear signal from {asset_name}"
+                                        f" — outside ETF market hours ({mkt_line})",
+                                    )
 
                     # Collect unrealized PnL
                     summary = bot.get_summary()
@@ -413,6 +436,47 @@ class TradingBotRunnerV2:
                 logger.info("Available Cash:       $%.2f", self.available_balance)
                 self.portfolio.log_summary()
                 self.risk_manager.log_summary()
+                logger.info("=" * 80)
+
+                # ---- ETF STATUS REPORT ----
+                # Shows what the ETF overlay logic attempted or decided for
+                # every ETF in ALL_ETFS this cycle.
+                logger.info("")
+                logger.info(
+                    "=" * 80)
+                logger.info("[ETF STATUS REPORT]")
+                logger.info("=" * 80)
+                logger.info("  Market  : %s", mkt_line)
+                _etf_short_status = (
+                    "ENABLED"
+                    if ENABLE_SHORT_ETF_TRADING
+                    else "DISABLED (set ENABLE_SHORT_ETF_TRADING=true to activate)"
+                )
+                logger.info("  Short ETF trading : %s", _etf_short_status)
+                logger.info("")
+
+                for _etf in ALL_ETFS:
+                    if _etf in _etf_cycle_status:
+                        _tag, _why = _etf_cycle_status[_etf]
+                    elif _etf in LONG_ETFS:
+                        _tag = "SKIPPED"
+                        _why = (
+                            "long ETF allocation not triggered this cycle"
+                            " — no bullish spot signal produced an ETF entry"
+                            " (long ETF rotation uses the RL/overlay path)"
+                        )
+                    elif _etf in SHORT_ETFS and not ENABLE_SHORT_ETF_TRADING:
+                        _tag = "DISABLED"
+                        _why = "ENABLE_SHORT_ETF_TRADING=false — short ETF trading is turned off"
+                    elif _etf in SHORT_ETFS and not etf_short_now:
+                        _tag = "DEFERRED"
+                        _why = f"no bear signal triggered ETF rotation this cycle | market: {mkt_line}"
+                    else:
+                        _tag = "NO ACTION"
+                        _why = "no bearish signal triggered an ETF short rotation this cycle"
+
+                    logger.info("  %-6s: [%-8s] %s", _etf, _tag, _why)
+
                 logger.info("=" * 80)
 
                 # Wait for next cycle

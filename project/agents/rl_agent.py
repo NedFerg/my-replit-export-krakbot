@@ -1020,6 +1020,9 @@ class ReinforcementLearningTrader(TraderAgent):
         else:
             remaining_usd = float(live_balances.get("ZUSD", "0") or 0)
 
+        # Save initial cash for the ETF status report emitted at cycle end.
+        _initial_cash = remaining_usd
+
         # ----------------------------------------------------------------
         # ETF regime — computed once, shared by both the priority
         # allocation block below and the overlay call at the end.
@@ -1215,6 +1218,17 @@ class ReinforcementLearningTrader(TraderAgent):
         # ----------------------------------------------------------------
         if hasattr(self.broker, "run_etf_overlay"):
             self.broker.run_etf_overlay(self, live_prices, regime=_etf_base_regime)
+
+        # ----------------------------------------------------------------
+        # ETF status report — emitted every ~300 s (coinciding with the
+        # rebalance cooldown) so the operator can see exactly what the
+        # overlay logic did or skipped for every ETF this cycle.
+        # ----------------------------------------------------------------
+        if hasattr(self.broker, "log_etf_status_report"):
+            self.broker.log_etf_status_report(
+                regime         = _etf_base_regime,
+                available_cash = _initial_cash,
+            )
 
     # ------------------------------------------------------------------
     # Order entry

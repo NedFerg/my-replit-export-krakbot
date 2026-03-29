@@ -29,6 +29,8 @@ from broker.etf_hedging import (
     ETFHedgingLayer,
     ETFOrder,
     ALL_ETFS,
+    LONG_ETFS,
+    SHORT_ETFS,
     ETF_KRAKEN_PAIRS,
     ETFMode,
 )
@@ -3168,6 +3170,214 @@ class LiveBroker(SimulatedBroker):
 
         return allocation_usd
 
+    def log_etf_status_report(
+        self,
+        regime: dict | None = None,
+        available_cash: float = 0.0,
+    ) -> None:
+        """
+        Log a comprehensive ETF STATUS REPORT for every ETF in ALL_ETFS.
+
+        Called every ~300 seconds alongside the portfolio status report so
+        the operator can see exactly what the ETF overlay logic attempted or
+        decided for each ETF this cycle — whether an order was placed, held,
+        skipped, deferred, or blocked, and why.
+
+        Parameters
+        ----------
+        regime : dict, optional
+            Market regime dict (same format used by run_etf_priority_allocation
+            and run_etf_overlay).  Defaults to empty (neutral).
+        available_cash : float
+            USD cash available at the start of the cycle (before any ETF or
+            spot allocations were made this round).
+        """
+        regime = regime or {}
+
+        # --- Global gating conditions ----------------------------------------
+        health_ok    = self.check_health()
+        daily_ok     = self._check_daily_loss() if health_ok else False
+        mkt_allowed  = (
+            self._market_hours.etf_trading_allowed() if health_ok else False
+        )
+        mkt_line     = self._market_hours.status_line()
+        session      = self._market_hours.get_session()
+        order_type   = (
+            "market" if session == MarketSession.REGULAR else "limit"
+        )
+
+        # Regime analysis
+        regime_dir  = _etf_regime_direction(regime)
+        is_neutral  = regime.get("is_neutral", False)
+        cycle_phase = regime.get("cycle_phase", "?")
+        macro       = regime.get("macro_regime", 0.0)
+        confidence  = regime.get("bullish_confidence", 0.0)
+        panic       = regime.get("panic_risk", 0)
+
+        # Portfolio cap
+        equity     = self.compute_total_equity()
+        etf_prices = {a: self.live_prices.get(a, 0.0) for a in ETF_ASSETS}
+        cap_frac   = (
+            self.etf_hedger.etf_portfolio_fraction(
+                equity, self.etf_positions, etf_prices
+            )
+            if equity > 0
+            else 0.0
+        )
+        cap_breached = cap_frac > self.etf_hedger.max_etf_allocation
+        cap_limit    = self.etf_hedger.max_etf_allocation
+
+        # Priority allocation selection
+        selected_etf, target_frac = select_priority_etf(regime)
+        allocation_usd = target_frac * available_cash
+
+        # Pending order state
+        pending         = getattr(self, "_etf_priority_pending", False)
+        pending_asset   = getattr(self, "_etf_priority_asset", None)
+        pending_elapsed = (
+            (time.time() - getattr(self, "_etf_priority_placed_at", 0.0)) / 60.0
+            if pending
+            else 0.0
+        )
+
+        # ETF classification (imported from etf_hedging)
+        # LONG_ETFS  = {"ETHU", "SLON", "XXRP"}
+        # SHORT_ETFS = {"ETHD", "SETH"}
+
+        # Header
+        print("")
+        print("=" * 80)
+        print("[ETF STATUS REPORT]")
+        print("=" * 80)
+        print(
+            f"  Market   : {mkt_line}"
+            + (f"  ({order_type} orders)" if mkt_allowed else "")
+        )
+        print(
+            f"  Regime   : {regime_dir.upper()}"
+            f"  (is_neutral={is_neutral}"
+            f"  phase={cycle_phase}"
+            f"  macro={macro:+.2f}"
+            f"  conf={confidence:.3f}"
+            f"  panic={panic})"
+        )
+        print(
+            f"  ETF cap  : {cap_frac:.1%} used of {cap_limit:.0%} limit"
+            + ("  ⚠ CAP BREACHED" if cap_breached else "")
+        )
+        print(
+            f"  Cash     : ${available_cash:.2f} available"
+            f"  → regime selects {selected_etf}"
+            f" @ {target_frac:.1%} = ${allocation_usd:.2f}"
+        )
+        if pending:
+            print(
+                f"  Pending  : {pending_asset} order in progress"
+                f" ({pending_elapsed:.1f} min elapsed)"
+            )
+        print("")
+
+        # Per-ETF status rows
+        for etf in ALL_ETFS:
+            price        = self.live_prices.get(etf, 0.0)
+            position     = self.etf_positions.get(etf, 0.0)
+            position_usd = position * price if price > 0 else 0.0
+            pos_str      = (
+                f"{position:.6f} units (${position_usd:.2f})"
+                if price > 0
+                else f"{position:.6f} units (no live price)"
+            )
+
+            # Determine status tag and reason
+            if not health_ok:
+                status = "BLOCKED"
+                reason = "broker health check failed — all ETF trading suspended"
+            elif not daily_ok:
+                status = "BLOCKED"
+                reason = "daily loss limit reached — ETF trading suspended for the day"
+            elif is_neutral:
+                status = "HELD"
+                reason = (
+                    "neutral regime — no directional signal; "
+                    "existing position held to avoid round-trip fee drag"
+                )
+            elif cap_breached:
+                status = "SKIPPED"
+                reason = (
+                    f"ETF portfolio cap breached"
+                    f" ({cap_frac:.1%} allocated vs {cap_limit:.0%} limit)"
+                )
+            elif not mkt_allowed:
+                status = "DEFERRED"
+                reason = f"outside ETF market hours — {mkt_line}"
+            elif etf in LONG_ETFS and regime_dir == "bear":
+                status = "SKIPPED"
+                reason = (
+                    f"long ETF not appropriate for {regime_dir} regime"
+                    f" — regime favors {selected_etf}"
+                )
+            elif etf in SHORT_ETFS and regime_dir == "bull":
+                status = "SKIPPED"
+                reason = (
+                    f"short ETF not appropriate for {regime_dir} regime"
+                    f" — regime favors {selected_etf}"
+                )
+            elif pending and pending_asset != etf:
+                status = "SKIPPED"
+                reason = (
+                    f"another ETF order is pending"
+                    f" ({pending_asset}, {pending_elapsed:.1f} min elapsed)"
+                    f" — one order at a time"
+                )
+            elif pending and pending_asset == etf:
+                status = "PENDING"
+                reason = (
+                    f"order submitted and awaiting fill"
+                    f" ({pending_elapsed:.1f} min elapsed)"
+                )
+            elif etf != selected_etf:
+                status = "SKIPPED"
+                reason = (
+                    f"regime logic selected {selected_etf} instead"
+                    f" ({regime_dir} signal, phase={cycle_phase})"
+                )
+            elif price <= 0:
+                status = "SKIPPED"
+                reason = (
+                    "no live price available — ETF market may be closed"
+                    " or ticker not in price feed"
+                )
+            elif allocation_usd < _ETF_MIN_ALLOCATION_USD:
+                status = "SKIPPED"
+                reason = (
+                    f"allocation ${allocation_usd:.2f}"
+                    f" ({target_frac:.1%} × ${available_cash:.2f})"
+                    f" is below the ${_ETF_MIN_ALLOCATION_USD:.2f} minimum threshold"
+                )
+            elif allocation_usd < _ETF_MIN_ORDER_USD:
+                status = "SKIPPED"
+                reason = (
+                    f"allocation ${allocation_usd:.2f}"
+                    f" is below the ${_ETF_MIN_ORDER_USD:.2f} dust threshold"
+                )
+            else:
+                # This ETF was selected and conditions appear met
+                units = allocation_usd / price if price > 0 else 0.0
+                status = "ATTEMPTED"
+                reason = (
+                    f"BUY {units:.6f} units @ ${price:.4f}"
+                    f" = ${allocation_usd:.2f}"
+                    f" ({target_frac:.1%} of available cash,"
+                    f" {order_type} order)"
+                )
+
+            print(
+                f"  {etf:<6}: [{status:8}]"
+                f" {reason}"
+                f" | pos: {pos_str}"
+            )
+
+        print("=" * 80)
 
 
 # ---------------------------------------------------------------------------
