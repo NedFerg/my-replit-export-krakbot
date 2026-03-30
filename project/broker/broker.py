@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
+import logging
 import requests
 from abc import ABC, abstractmethod
 from exchange.exchange import Exchange
@@ -40,6 +41,8 @@ from broker.etf_hedging import (
 # a regime wiggle must show at least 2 % benefit on a 0.40 % fee tier
 # account before we pay to rotate.  Configurable via ETF_FEE_HURDLE_FACTOR.
 _ETF_FEE_HURDLE_FACTOR = float(os.getenv("ETF_FEE_HURDLE_FACTOR", "2.5"))
+
+logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
@@ -3245,37 +3248,44 @@ class LiveBroker(SimulatedBroker):
         # SHORT_ETFS = {"ETHD", "SETH"}
 
         # Header
-        print("")
-        print("=" * 80)
-        print("[ETF STATUS REPORT]")
-        print("=" * 80)
-        print(
-            f"  Market   : {mkt_line}"
-            + (f"  ({order_type} orders)" if mkt_allowed else "")
+        logger.info("")
+        logger.info("=" * 80)
+        logger.info("[ETF STATUS REPORT]")
+        logger.info("=" * 80)
+        logger.info(
+            "  Market   : %s%s",
+            mkt_line,
+            f"  ({order_type} orders)" if mkt_allowed else "",
         )
-        print(
-            f"  Regime   : {regime_dir.upper()}"
-            f"  (is_neutral={is_neutral}"
-            f"  phase={cycle_phase}"
-            f"  macro={macro:+.2f}"
-            f"  conf={confidence:.3f}"
-            f"  panic={panic})"
+        logger.info(
+            "  Regime   : %s  (is_neutral=%s  phase=%s  macro=%+.2f  conf=%.3f  panic=%s)",
+            regime_dir.upper(),
+            is_neutral,
+            cycle_phase,
+            macro,
+            confidence,
+            panic,
         )
-        print(
-            f"  ETF cap  : {cap_frac:.1%} used of {cap_limit:.0%} limit"
-            + ("  ⚠ CAP BREACHED" if cap_breached else "")
+        logger.info(
+            "  ETF cap  : %.1f%% used of %.0f%% limit%s",
+            cap_frac * 100,
+            cap_limit * 100,
+            "  ⚠ CAP BREACHED" if cap_breached else "",
         )
-        print(
-            f"  Cash     : ${available_cash:.2f} available"
-            f"  → regime selects {selected_etf}"
-            f" @ {target_frac:.1%} = ${allocation_usd:.2f}"
+        logger.info(
+            "  Cash     : $%.2f available  → regime selects %s @ %.1f%% = $%.2f",
+            available_cash,
+            selected_etf,
+            target_frac * 100,
+            allocation_usd,
         )
         if pending:
-            print(
-                f"  Pending  : {pending_asset} order in progress"
-                f" ({pending_elapsed:.1f} min elapsed)"
+            logger.info(
+                "  Pending  : %s order in progress (%.1f min elapsed)",
+                pending_asset,
+                pending_elapsed,
             )
-        print("")
+        logger.info("")
 
         # Per-ETF status rows
         for etf in ALL_ETFS:
@@ -3371,13 +3381,15 @@ class LiveBroker(SimulatedBroker):
                     f" {order_type} order)"
                 )
 
-            print(
-                f"  {etf:<6}: [{status:8}]"
-                f" {reason}"
-                f" | pos: {pos_str}"
+            logger.info(
+                "  %-6s: [%-8s] %s | pos: %s",
+                etf,
+                status,
+                reason,
+                pos_str,
             )
 
-        print("=" * 80)
+        logger.info("=" * 80)
 
 
 # ---------------------------------------------------------------------------
