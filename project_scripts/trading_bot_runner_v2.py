@@ -442,8 +442,7 @@ class TradingBotRunnerV2:
                 # Shows what the ETF overlay logic attempted or decided for
                 # every ETF in ALL_ETFS this cycle.
                 logger.info("")
-                logger.info(
-                    "=" * 80)
+                logger.info("=" * 80)
                 logger.info("[ETF STATUS REPORT]")
                 logger.info("=" * 80)
                 logger.info("  Market  : %s", mkt_line)
