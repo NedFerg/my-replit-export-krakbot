@@ -62,6 +62,10 @@ ETF_ASSETS = ("ETHU", "SLON", "XXRP", "ETHD", "SETH")
 # ETHU, SLON (2x long), and XXRP are bullish ETFs; ETHD and SETH are approved short ETFs.
 ALL_ETFS = ["ETHU", "SLON", "XXRP", "ETHD", "SETH"]
 
+# Directional classification used by regime logic and status reporting.
+LONG_ETFS  = frozenset({"ETHU", "SLON", "XXRP"})   # bullish / leveraged-long
+SHORT_ETFS = frozenset({"ETHD", "SETH"})            # inverse / short
+
 # Default Kraken trading pairs for each ETF ticker.
 # ETFs/ETPs on Kraken use bare ticker symbols (no currency suffix).
 ETF_KRAKEN_PAIRS: dict = {
